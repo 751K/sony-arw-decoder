@@ -1,5 +1,7 @@
 # Sony ARW Decoder
 
+English | [中文](README.zh-CN.md)
+
 A standalone complete Sony RAW decoder based on the Imaging Edge Edit development pipeline. NumPy is the reference implementation, with separate Rust and Metal acceleration for the later processing stages.
 
 ## Pipeline
@@ -24,6 +26,21 @@ The current implementation uses A7 V samples and development settings as its ini
 | Metal | macOS | Xcode Command Line Tools, a Metal-capable Mac |
 
 Rust and Metal are optional and may be combined. NumPy always serves as the reference for stage-by-stage and whole-image validation.
+
+## Speed
+
+Benchmark environment: Mac mini with Apple M6, 16 GB memory, macOS 27.2, arm64. Input: `chart/SonyChart.ARW`; output: a full-resolution 7008 × 4672 image.
+
+Each backend was run once to initialise caches and Metal shaders, then the second full-image decode was timed in the same process.
+
+| Backend | Time | Speed-up vs NumPy |
+| --- | ---: | ---: |
+| NumPy | 24.92 s | 1.0× |
+| Rust | 1.79 s | 13.9× |
+| Metal | 0.35 s | 71.2× |
+| Rust + Metal | 0.22 s | 113.3× |
+
+All four paths produced identical full-image hashes. The first decode in a new process is slower because it includes initialisation, table construction and Metal shader compilation. These figures describe one synthetic ARW and should not be treated as a general benchmark across all camera models or development settings.
 
 ## Install
 

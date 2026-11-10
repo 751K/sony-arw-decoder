@@ -1,5 +1,7 @@
 # Sony ARW Decoder
 
+[English](README.md) | 中文
+
 本仓库为 Sony RAW 完整解码器，基于 Imaging Edge Edit 的显影管线构建。NumPy 是参考实现，并另提供基于 Rust 与 Metal 的加速后段。
 
 ## 处理管线
@@ -26,6 +28,21 @@ Edge Edit 4.0 / 4.1 的 RGGB 传感器结果进行验证。
 | Metal | macOS | Xcode Command Line Tools、支持 Metal 的 Mac |
 
 Rust 与 Metal 可选，也可以组合使用。NumPy 始终作为逐阶段和整图验证的参考。
+
+## 速度
+
+测试环境：Mac mini，Apple M6，16 GB 内存，macOS 27.2，arm64。输入为 `chart/SonyChart.ARW`，输出为完整的 7008 × 4672 图像。
+
+每个后端先运行一次以初始化缓存和 Metal 着色器，再在同一进程中测量第二次完整解码。
+
+| 后端 | 耗时 | 相对 NumPy 加速 |
+| --- | ---: | ---: |
+| NumPy | 24.92 秒 | 1.0× |
+| Rust | 1.79 秒 | 13.9× |
+| Metal | 0.35 秒 | 71.2× |
+| Rust + Metal | 0.22 秒 | 113.3× |
+
+四种路径的整图输出哈希完全一致。新进程中的首次解码还会包含初始化、表构建和 Metal 着色器编译，因此耗时更高。以上数据基于一张合成 ARW，不代表所有相机型号或显影设置下的通用性能。
 
 ## 安装
 
