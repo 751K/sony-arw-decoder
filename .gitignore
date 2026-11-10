@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+render_output/
+*.ARW
+*.arw
+!chart/SonyChart.ARW
+*.tif
+*.TIF
+*.tiff
+chart/measure_*.json
+chart/*.npy
+rust/sonylook_core/target/
+metal/libsonylook_metal.dylib
