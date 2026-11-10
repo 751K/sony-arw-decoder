@@ -75,8 +75,9 @@ inline uint marble_blend(int nv,int ov,float f) {
     float o=float(ov),v=clamp(fma(float(nv)-o,f,o),0.0f,65535.0f);return uint(int(trunc(v)))&0xffffu;
 }
 // x8 bilinear upsample, detail gain, chroma blend, YCbCr -> RGB and the final
-// colour conversion inside the 16-px valid region.
-kernel void marble_out(device const ushort *y [[buffer(0)]],device const ushort *cb [[buffer(1)]],device const ushort *cr [[buffer(2)]],device const int *q [[buffer(3)]],device const ushort *r0 [[buffer(4)]],device const ushort *g0 [[buffer(5)]],device const ushort *b0 [[buffer(6)]],device const short *dec [[buffer(7)]],device const short *enc [[buffer(8)]],device ushort *ro [[buffer(9)]],device ushort *go [[buffer(10)]],device ushort *bo [[buffer(11)]],device const ushort *hcb [[buffer(12)]],device const ushort *hcr [[buffer(13)]],constant MarbleArgs &a [[buffer(14)]],uint2 p [[thread_position_in_grid]]) {
+// colour conversion inside the 16-px valid region. post.metal also calls this
+// helper from the fused Marble + Post kernel.
+inline void marble_pixel(device const ushort *y,device const ushort *cb,device const ushort *cr,device const int *q,device const ushort *r0,device const ushort *g0,device const ushort *b0,device const short *dec,device const short *enc,device const ushort *hcb,device const ushort *hcr,constant MarbleArgs &a,uint2 p,thread ushort *rgb) {
     int w=int(a.width),h=int(a.height);if(int(p.x)>=w||int(p.y)>=h)return;
     int x=int(p.x),yy=int(p.y);uint row=uint(yy*w),i=row+uint(x);
     uint hrow=uint(yy)*(a.w4/2)+uint(x>>1);
@@ -104,16 +105,19 @@ kernel void marble_out(device const ushort *y [[buffer(0)]],device const ushort 
     long cbv=marble_blend(int(hcb[hrow]),int(cb[i]),a.f);
     long crv=marble_blend(int(hcr[hrow]),int(cr[i]),a.f);
     long Y=ylum-0x1000,U=cbv-0x8000,V=crv-0x8000;
-    ushort rgb[3];
     rgb[0]=ushort(clamp(wrap32(Y*0x2546+V*0x1526+U*-0x59e)>>15,0,0x3fff));
     rgb[1]=ushort(clamp(wrap32(Y*0x254b+V*-0x1118+U*-0x5b3)>>15,0,0x3fff));
     rgb[2]=ushort(clamp(wrap32(Y*0x2542+V*-0x136+U*0x3a10)>>15,0,0x3fff));
     if(x>=16&&x<w-16&&yy>=16&&yy<h-16) {
         long s0=dec[rgb[0]],s1=dec[rgb[1]],s2=dec[rgb[2]];
         for(int c=0;c<3;c++){long o=(long(a.m_inv[3*c])*s0+long(a.m_inv[3*c+1])*s1+long(a.m_inv[3*c+2])*s2)>>13;rgb[c]=ushort(enc[clamp(o,0L,0x3fffL)]);}
-        ro[i]=rgb[0];go[i]=rgb[1];bo[i]=rgb[2];
-    } else if(a.inset) { ro[i]=r0[i];go[i]=g0[i];bo[i]=b0[i]; }
-    else { ro[i]=rgb[0];go[i]=rgb[1];bo[i]=rgb[2]; }
+    } else if(a.inset) { rgb[0]=r0[i];rgb[1]=g0[i];rgb[2]=b0[i]; }
+}
+kernel void marble_out(device const ushort *y [[buffer(0)]],device const ushort *cb [[buffer(1)]],device const ushort *cr [[buffer(2)]],device const int *q [[buffer(3)]],device const ushort *r0 [[buffer(4)]],device const ushort *g0 [[buffer(5)]],device const ushort *b0 [[buffer(6)]],device const short *dec [[buffer(7)]],device const short *enc [[buffer(8)]],device ushort *ro [[buffer(9)]],device ushort *go [[buffer(10)]],device ushort *bo [[buffer(11)]],device const ushort *hcb [[buffer(12)]],device const ushort *hcr [[buffer(13)]],constant MarbleArgs &a [[buffer(14)]],uint2 p [[thread_position_in_grid]]) {
+    ushort rgb[3];
+    marble_pixel(y,cb,cr,q,r0,g0,b0,dec,enc,hcb,hcr,a,p,rgb);
+    if(p.x>=a.width||p.y>=a.height)return;
+    uint i=p.y*a.width+p.x;ro[i]=rgb[0];go[i]=rgb[1];bo[i]=rgb[2];
 }
 
 // Half-width chroma (FUN_10012672c): pairs averaged; past the last pair the

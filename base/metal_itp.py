@@ -3,8 +3,7 @@
 Direction-map accumulation uses float32 on Metal, while the Rust reference
 uses float64 for some sums. Individual output values can therefore differ.
 
-Build with: clang -O2 -fobjc-arc -dynamiclib -framework Foundation -framework Metal \
-    metal/bridge.m -o metal/libsonylook_metal.dylib
+Build with: ./metal/build.sh
 SONYLOOK_METAL_LIB selects a different library path.
 """
 from __future__ import annotations
@@ -34,12 +33,21 @@ def _load():
         lib.sonylook_metal_itp_image.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
                                                  ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int32,
                                                  ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
+                                                 ctypes.c_void_p, ctypes.c_void_p,
                                                  ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
         lib.sonylook_metal_alloc.argtypes = [ctypes.c_size_t]
         lib.sonylook_metal_alloc.restype = ctypes.c_void_p
         lib.sonylook_metal_free.argtypes = [ctypes.c_void_p]
         lib.sonylook_metal_trim.argtypes = []
         lib.sonylook_metal_pool_bytes.restype = ctypes.c_size_t
+        lib.sonylook_metal_begin.argtypes = []
+        lib.sonylook_metal_begin.restype = ctypes.c_int
+        lib.sonylook_metal_end.argtypes = []
+        lib.sonylook_metal_end.restype = ctypes.c_int
+        lib.sonylook_metal_abort.argtypes = []
+        lib.sonylook_metal_abort.restype = ctypes.c_int
+        lib.sonylook_metal_is_active.argtypes = []
+        lib.sonylook_metal_is_active.restype = ctypes.c_int
         if lib.sonylook_metal_init(str(_DIR / "shaders").encode()):
             raise RuntimeError(lib.sonylook_metal_error().decode())
         _lib = lib
@@ -68,6 +76,30 @@ def empty(shape, dtype=np.uint16):
 def trim():
     """Release the idle buffers held by the Metal buffer pool."""
     _load().sonylook_metal_trim()
+
+
+def begin():
+    """Start a command buffer shared by successive Metal stage calls."""
+    lib = _load()
+    if lib.sonylook_metal_begin():
+        raise RuntimeError(lib.sonylook_metal_error().decode())
+
+
+def end():
+    """Submit the shared command buffer once and wait for all stages."""
+    lib = _load()
+    if lib.sonylook_metal_end():
+        raise RuntimeError(lib.sonylook_metal_error().decode())
+
+
+def abort():
+    """Discard a shared command buffer without submitting it."""
+    _load().sonylook_metal_abort()
+
+
+def active():
+    """True while a shared command buffer is open."""
+    return bool(_load().sonylook_metal_is_active())
 
 
 def debug_stage(raw, black, gains, scale, params, stage):
@@ -109,7 +141,8 @@ def process_tile(raw, black, gains, scale, params):
     return tuple(out)
 
 
-def full_image(raw, black, gains, scale, params, tile=1024, halo=12):
+def full_image(raw, black, gains, scale, params, tile=384, halo=12,
+               nr_args=None, nr_thresholds=None):
     """Run experimental Metal ITP over an RGGB image with Sony's tile edges."""
     raw = np.ascontiguousarray(raw, dtype=np.uint16)
     if raw.ndim != 2 or min(raw.shape) < 12 or tile <= 0 or halo < 10:
@@ -122,10 +155,18 @@ def full_image(raw, black, gains, scale, params, tile=1024, halo=12):
         raise ValueError("black and gains must each contain four values")
     p = np.array([params.blend_k, params.blend_lo, params.blend_hi, params.blend_half,
                   params.k1, params.k2, params.k3, params.k4, params.k5, params.k6], dtype=np.float32)
+    if (nr_args is None) != (nr_thresholds is None):
+        raise ValueError("nr_args and nr_thresholds must be provided together")
+    if nr_thresholds is not None:
+        nr_thresholds = np.ascontiguousarray(nr_thresholds, dtype=np.int32)
+        if nr_thresholds.shape != (3, 0x8000):
+            raise ValueError("nr_thresholds must have shape (3, 0x8000)")
     out = [empty(raw.shape) for _ in range(3)]
     lib = _load()
     rc = lib.sonylook_metal_itp_image(raw.ctypes.data, raw.shape[1], raw.shape[0], black.ctypes.data,
                                      gains.ctypes.data, int(scale), p.ctypes.data, tile, halo,
+                                     ctypes.byref(nr_args) if nr_args is not None else None,
+                                     nr_thresholds.ctypes.data if nr_thresholds is not None else None,
                                      *(x.ctypes.data for x in out))
     if rc:
         raise RuntimeError(lib.sonylook_metal_error().decode())

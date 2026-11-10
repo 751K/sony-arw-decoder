@@ -283,7 +283,8 @@ class Look:
 
     def render(self, lin, detail=None, pointwise=False, marble=None, sscs=None,
                marble_inset=None, timings=None, strip=512, metal_look=False,
-               metal_spatial=False, metal_marble=False, metal_post=False):
+               metal_spatial=False, metal_marble=False, metal_post=False,
+               output_bits=14):
         """sscs: None, or sony_sscs.params_from_tags(...) to run ZcTaskSSCS first (Edit always runs it, right
         after GeoCorrection). Integer input uses Sony's u16 path, float input its float32 path.
         detail: None, or dict(sharp=sony_detail.sharpness_params(...), spica=(table, params)) to run
@@ -301,7 +302,9 @@ class Look:
         Sharpness needs 3 rows of context and Spica another 3; Sharpness itself also
         shrinks its task region by 2, so each band runs the pointwise chain on [y-8, y+8)
         and the spatial stages on their exact sub-bands.  Marble runs on slabs with a
-        12-block halo.  The result is identical to processing the whole array."""
+        12-block halo.  The result is identical to processing the whole array.
+        output_bits=16 makes the final Metal interleave write value << 2 directly;
+        other paths apply the same conversion after assembly."""
         atan, _ = SL.load_static_tables()
         tim = timings if timings is not None else {}
         mark_lock = Lock()
@@ -312,6 +315,8 @@ class Look:
         sscs = self.sscs if sscs is None else sscs
         lin = np.asarray(lin)
         H, W = lin.shape[:2]
+        if output_bits not in (14, 16):
+            raise ValueError("output_bits must be 14 or 16")
         # pointwise=True: LM16 hue index from the pixel itself instead of the 3-tap row blur
         # (identical on flat areas; needed when the input is a list of colours, e.g. a LUT grid)
         ctl = dict(blur_luma=0, blur_chroma=0, scale=0, quadratic=1,
@@ -346,12 +351,29 @@ class Look:
         metal_spatial = bool(metal_spatial and detail and detail.get("sharp") is not None
                              and detail.get("spica") is not None
                              and not self.hue and not self.saturation and H >= 7 and W >= 7)
+        import metal_itp as MI
+        metal_batch = MI.active()
+
+        def close_metal_batch():
+            nonlocal metal_batch
+            if metal_batch:
+                import metal_itp
+                metal_itp.end()
+                metal_batch = False
+
+        # Only the front/spatial -> Marble/Post chain stays in the batch. Every
+        # other path reads lin (or GPU front planes) on the CPU, or submits
+        # its own command buffer, so the RAW chain must complete first.
+        if not metal_spatial:
+            close_metal_batch()
+
         if metal_look:
             if pointwise or not np.issubdtype(lin.dtype, np.integer):
                 raise ValueError("Metal look requires full-resolution integer RGB input")
             # SSCS is normally interleaved with the CPU band render. It must
             # precede the whole-image GPU look when the two paths are combined.
             if sscs is not None:
+                close_metal_batch()            # the CPU SSCS pass reads lin
                 t = time.perf_counter()
                 pre_sscs = np.empty_like(lin, dtype=np.uint16)
                 for y0 in range(0, H, strip or H):
@@ -405,6 +427,16 @@ class Look:
         def finish(pre):
             """Marble + Effect on the assembled pre-Marble planes; returns the int32 stack."""
             r, g, b = pre
+            post = None
+            if metal_post:
+                import metal_look as ML
+                post = ML.Post(self, W, H)
+            metal_marble_post = False
+            gpu_packed = None
+            # Stages the CPU branch below would run when Metal Post is off.
+            cpu_post_needed = post is None and (self.look_id & ~1 == 0x10 or
+                                                self.tone_luts is not None or
+                                                self.shade is not None)
             if marble is not None:
                 import sony_marble as MB
                 rust_mb = None
@@ -425,10 +457,29 @@ class Look:
                 metal_mb = None
                 if metal_marble and H >= 10 and W >= 10:
                     import metal_look as ML
-                    metal_mb = ML.marble(*pre, look, marble["dev"], marble["dec"],
-                                         mode=self.output_mode, inset=bool(marble_inset))
+                    if post is not None and post.active:
+                        close_metal_batch()
+                        # Marble+Post writes the final interleaved image directly.
+                        metal_mb = ML.marble(
+                            *pre, look, marble["dev"], marble["dec"],
+                            mode=self.output_mode, inset=bool(marble_inset), post=post,
+                            packed=True, output_bits=output_bits)
+                        metal_marble_post = metal_mb is not None
+                    if metal_mb is None:
+                        metal_mb = ML.marble(
+                            *pre, look, marble["dev"], marble["dec"],
+                            mode=self.output_mode, inset=bool(marble_inset),
+                            # Packed output returns straight from finish(): only
+                            # valid when no Effect/ToneCurve/Shade stage remains.
+                            packed=not cpu_post_needed and (post is None or not post.active),
+                            output_bits=output_bits)
+                if metal_mb is None:
+                    close_metal_batch()        # CPU / Rust Marble reads pre
                 if metal_mb is not None:
-                    r, g, b = metal_mb
+                    if isinstance(metal_mb, np.ndarray):
+                        gpu_packed = metal_mb
+                    else:
+                        r, g, b = metal_mb
                 elif marble_inset and step and H > step + 2 * halo and W > 32:
                     pre0, pre1, pre2 = pre
                     # Write Marble's valid regions into fresh planes and take only
@@ -513,16 +564,19 @@ class Look:
                         r, g, b = (np.where(keep, p, q).astype(np.uint16) for p, q in zip(pre, (mr, mg, mb)))
                     else:
                         r, g, b = mr, mg, mb
-                mark("marble", t)
-            post = None
-            if metal_post:
-                import metal_look as ML
-                post = ML.Post(self, W, H)
-            if post is not None and post.active:   # Effect, ToneCurve, ShadeCorrection on Metal
-                t = time.perf_counter()
-                r, g, b = ML.post(r, g, b, post)
-                mark("metal_post", t)
+                mark("marble+post" if metal_marble_post else "marble", t)
+            if gpu_packed is not None:
+                close_metal_batch()
+                return gpu_packed
+            if post is not None and post.active:
+                if not metal_marble_post:
+                    # Effect, ToneCurve, ShadeCorrection on Metal
+                    close_metal_batch()
+                    t = time.perf_counter()
+                    r, g, b = ML.post(r, g, b, post)
+                    mark("metal_post", t)
             else:
+                close_metal_batch()
                 if self.look_id & ~1 == 0x10:      # render+0x44 = 0 sRGB, 1 AdobeRGB
                     t = time.perf_counter()
                     r, g, b = EF.effect_apply(*(np.asarray(c, np.uint16) for c in (r, g, b)),
@@ -540,14 +594,22 @@ class Look:
                     mark("shade", t)
             if metal_post or metal_marble:      # planes are GPU-resident: interleave on the GPU
                 import metal_look as ML
-                return ML.interleave(r, g, b)
+                out = ML.interleave(r, g, b, output_bits=output_bits)
+                close_metal_batch()
+                return out
+            close_metal_batch()
             out = np.empty((H, W, 3), np.uint16)
             out[..., 0] = r
             out[..., 1] = g
             out[..., 2] = b
+            if output_bits == 16:
+                out = out << 2
             return out
 
         if metal_spatial:
+            if not metal_batch and os.environ.get("SONYLOOK_METAL_BATCH", "1") != "0":
+                MI.begin()
+                metal_batch = True
             t = time.perf_counter()
             pre = ML.front_spatial(lin, self, atan, ML.Spatial(self, detail))
             mark("metal_front_spatial", t)

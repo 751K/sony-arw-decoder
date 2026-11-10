@@ -36,6 +36,18 @@ def check_math():
             if bad.size:
                 raise AssertionError(f'exp2 differs at {a[bad[:4]]}: {e2[bad[:4]]} vs {ref[bad[:4]]}')
             total += a.size
+    # Every float with |e| < 24 (DRO's range): covers the fast exp2 path, its
+    # rounding-boundary rejections and the integer-exponent shortcut.
+    limit = int(np.float32(24.0).view(np.uint32))
+    for sign in (0, 0x80000000):
+        for start in range(0, limit, 1 << 24):
+            a = (np.arange(start, min(start + (1 << 24), limit), dtype=np.uint32) | np.uint32(sign)).view(np.float32)
+            e2, _ = run(a, np.ones_like(a))
+            ref = np.exp2(a.astype(np.float64)).astype(np.float32)
+            bad = np.flatnonzero(e2.view(np.uint32) != ref.view(np.uint32))
+            if bad.size:
+                raise AssertionError(f'exp2 differs at {a[bad[:4]]}: {e2[bad[:4]]} vs {ref[bad[:4]]}')
+            total += a.size
     tiny = np.array([0.0, -0.0, 1e-30, -1e-30, 1e-40, -1e-40, -2.0 ** -25, 1 - 2.0 ** -24, -126.5, 127.5], np.float32)
     e2, _ = run(tiny, np.ones_like(tiny))
     if not np.array_equal(e2.view(np.uint32), np.exp2(tiny.astype(np.float64)).astype(np.float32).view(np.uint32)):

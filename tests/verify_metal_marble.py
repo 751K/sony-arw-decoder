@@ -108,6 +108,7 @@ def main(path):
             same(f'render rust={rust}', np.moveaxis(expected, -1, 0), np.moveaxis(actual, -1, 0))
     print('band render with Marble slabs and inset, rust=False/True: identical')
 
+    check_fused_post(with_tab, path)
     check_chroma(with_tab, blk8, path)
 
     # Full-resolution timing: Rust as one slab vs Metal.
@@ -126,6 +127,52 @@ def main(path):
 
     if len(sys.argv) > 2:
         full_chroma(sys.argv[2])
+
+
+def check_fused_post(mlook, path):
+    """Marble's final pixel -> Effect -> ToneCurve -> Shade must equal separate passes."""
+    curves = [((0, 128, 384, 511), (0, 170, 350, 511))] * 4
+    shade = dict(amount=60, radius=70, strength=30, flag=1, angle=45000)
+    dev = dict(d218=0, d224=20, d2c0=40)
+    dec = dict(iso=400, f0=1, d14c=0, f22780=1.0, f22784=1.0, d1b0=0)
+    looks_by_name = sony_render.load_looks(path)
+    for i, name in enumerate(('Standard', 'BW', 'Sepia')):
+        render_look = sony_render.Look(name, looks_by_name, tone_curves=curves, shade=shade)
+        pp = metal_look.Post(render_look, 256, 192)
+        r, g, b = image(192, 256, 2000 + i)
+        separate = metal_look.post(
+            *metal_look.marble(r, g, b, mlook, dev, dec, inset=True), pp)
+        stats = {}
+        fused = metal_look.marble(
+            r, g, b, mlook, dev, dec, inset=True, post=pp, stats=stats)
+        same(f'{name} fused Marble + Post', separate, fused)
+
+        packed14 = metal_look.interleave(*fused)
+        packed16 = metal_look.interleave(*fused, output_bits=16)
+        if not np.array_equal(packed16, packed14 << 2):
+            raise AssertionError(f'{name}: direct 16-bit interleave differs from value << 2')
+        # Marble + Post writing the interleaved image directly, including the
+        # CPU-settled pixels patched in packed form.
+        for bits, want in ((14, packed14), (16, packed16)):
+            direct = metal_look.marble(r, g, b, mlook, dev, dec, inset=True, post=pp,
+                                       packed=True, output_bits=bits)
+            if not np.array_equal(direct, want):
+                raise AssertionError(f'{name}: packed {bits}-bit Marble + Post differs')
+
+        cfg = dict(look=mlook, dev=dev, dec=dec)
+        rgb = np.random.default_rng(2100 + i).integers(0, 16384, (192, 256, 3), dtype=np.uint16)
+        expected = render_look.render(rgb, marble=cfg, marble_inset=16, strip=32)
+        actual = render_look.render(
+            rgb, marble=cfg, marble_inset=16, strip=32,
+            metal_marble=True, metal_post=True)
+        same(f'{name} render fused Marble + Post',
+             np.moveaxis(expected, -1, 0), np.moveaxis(actual, -1, 0))
+        actual16 = render_look.render(
+            rgb, marble=cfg, marble_inset=16, strip=32,
+            metal_marble=True, metal_post=True, output_bits=16)
+        if not np.array_equal(actual16, actual << 2):
+            raise AssertionError(f'{name}: render direct 16-bit output differs')
+        print(f'{name}: fused Marble + Post identical ({stats["fixed"]} CPU-settled pixels)')
 
 
 def check_chroma(blk4, blk8, path):

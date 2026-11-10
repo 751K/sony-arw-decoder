@@ -22,6 +22,7 @@ their defaults.  read_settings_pair() returns (camera, edit).
 from __future__ import annotations
 
 import struct
+from functools import lru_cache
 from pathlib import Path
 
 _SIG = (struct.pack("<H", 3) + struct.pack("<HHII", 0xD000, 4, 1, 1)
@@ -109,7 +110,14 @@ def read_settings_pair(arw) -> tuple[dict, dict]:
     is the later Edit session and matches what the export used.
     """
     import sr2
-    data = sr2.file_bytes(arw)
+    return _settings_pair(sr2.file_key(arw))
+
+
+@lru_cache(maxsize=8)
+def _settings_pair(key) -> tuple[dict, dict]:
+    """Parsed camera/edit snapshots, cached by the file version key."""
+    import sr2
+    data = sr2._file_bytes(key)
     base = _block_base(data)
     if base is None:
         return {}, {}

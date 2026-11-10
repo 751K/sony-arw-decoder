@@ -13,3 +13,4 @@ chart/measure_*.json
 chart/*.npy
 rust/sonylook_core/target/
 metal/libsonylook_metal.dylib
+metal/shaders/shaders.metallib

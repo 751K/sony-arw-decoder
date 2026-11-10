@@ -24,6 +24,16 @@ kernel void scale_raw(device const ushort *raw [[buffer(0)]], device float *out 
     float k = (float(a.scale)*3.0517578e-05f)*a.gains[b];
     out[i] = (k*0.0625f)*float(int(raw[i])-a.black[b]);
 }
+kernel void load_scale_tile(device const ushort *image [[buffer(0)]],device float *out [[buffer(1)]],constant Args &a [[buffer(2)]],uint2 p [[thread_position_in_grid]]) {
+    if(p.x>=a.width||p.y>=a.height)return;
+    int x=int(a.tile_x)+int(p.x)-int(a.halo), y=int(a.tile_y)+int(p.y)-int(a.halo);
+    int w=int(a.image_width),h=int(a.image_height);
+    x=x<0?(x&1):(x>=w?(w-1)-((w-1^x)&1):x);
+    y=y<0?(y&1):(y>=h?(h-1)-((h-1^y)&1):y);
+    uint b=(p.x&1)|((p.y&1)<<1),i=p.y*a.width+p.x;
+    float k=(float(a.scale)*3.0517578e-05f)*a.gains[b];
+    out[i]=(k*0.0625f)*float(int(image[uint(y)*uint(w)+uint(x)])-a.black[b]);
+}
 kernel void differences(device const float *src [[buffer(0)]], device float *ah [[buffer(1)]], device float *av [[buffer(2)]], constant Args &a [[buffer(3)]], uint2 p [[thread_position_in_grid]]) {
     uint x=p.x,y=p.y,w=a.width,h=a.height; if (x>=w || y>=h) return;
     uint i=y*w+x; float par=float((x^y)&1);
@@ -53,6 +63,24 @@ kernel void weights(device const float *a0 [[buffer(0)]], device const float *b0
     float inv=ratio>1.0f ? 1.0f/ratio : ratio;
     float v=a.blend_lo+(inv-a.blend_lo)*a.blend_half;
     blend[i]=a.blend_lo<=ratio ? min(v,1.0f) : a.blend_hi;
+}
+inline float candidate_value(device const float *src,int x,int y,int w,int h) {
+    float v=0.0f;
+    bool valid_y=y>=2&&((y&1)?y<h-1:y<h-2),valid_x=x>=2&&((x&1)?x<w-1:x<w-2);
+    if(valid_y&&valid_x){int dx=((x^y)&1)?2:0;v=weighted(src,x,y,w,h,dx)*((y&1)?as_type<float>(0x3c3a2e8cu):0.03125f);}
+    if(valid_y&&x<2)v=src[y*w+x];
+    int xend=w>4?2+2*((w-3)/2):2;
+    if(valid_y&&xend+1<w&&(x==xend||x==xend+1))v=src[y*w+2+(x-xend)];
+    return v;
+}
+kernel void weights_candidates(device const float *a0 [[buffer(0)]],device const float *b0 [[buffer(1)]],device float *dir [[buffer(2)]],device float *blend [[buffer(3)]],constant Args &a [[buffer(4)]],uint2 p [[thread_position_in_grid]]) {
+    int x=int(p.x),y=int(p.y),w=int(a.width),h=int(a.height);if(x>=w||y>=h)return;
+    uint i=y*w+x;float av=candidate_value(a0,x,y,w,h),bv=candidate_value(b0,x,y,w,h);
+    float t1=max(av-1.0f,0.0f)+0.125f,t2=max(bv-1.0f,0.0f),den=(t1+0.125f)+t2;
+    dir[i]=den>0.0f?t1/den:0.5f;
+    float ratio=(a.blend_k+av*8.0f)/(a.blend_k+bv*8.0f),inv=ratio>1.0f?1.0f/ratio:ratio;
+    float v=a.blend_lo+(inv-a.blend_lo)*a.blend_half;
+    blend[i]=a.blend_lo<=ratio?min(v,1.0f):a.blend_hi;
 }
 kernel void green_inputs(device const float *s [[buffer(0)]], device float *mosaic [[buffer(1)]], device float *mix_a [[buffer(2)]], device float *mix_b [[buffer(3)]], device float *tap_a [[buffer(4)]], device float *tap_b [[buffer(5)]], constant Args &a [[buffer(6)]], uint2 p [[thread_position_in_grid]]) {
     int x=int(p.x), y=int(p.y), w=int(a.width), h=int(a.height); if(x>=w || y>=h) return;
@@ -89,7 +117,7 @@ kernel void green_five(device const float *s [[buffer(0)]], device float *out [[
         } else {
             float corners=(P(2,-2)+P(-2,-2))+(P(-2,2)+P(2,2));
             float axial=(P(-2,0)+P(0,-2))+(P(2,0)+P(0,2));
-            float diag=(P(1,-1)+P(-1,-1))+(P(-1,1)+P(1,1));
+            float diag=(P(1,-1)+P(-1,-1))+P(-1,1)+P(1,1);
             v=corners*-0.015625f; v=fma(axial,-0.03125f,v); v=fma(diag,0.125f,v); v=fma(P(0,0),0.6875f,v);
         }
 #undef P
@@ -180,4 +208,55 @@ kernel void store_tile(device const ushort *r [[buffer(0)]],device const ushort 
  if(p.x>=a.tile_width||p.y>=a.tile_height)return;
  uint src=(p.y+a.halo)*a.width+p.x+a.halo,dst=(p.y+a.tile_y)*a.image_width+p.x+a.tile_x;
  R[dst]=r[src];G[dst]=g[src];B[dst]=b[src];
+}
+
+// Fused variants used by the tiled encoder. The same per-pixel formulas are
+// used, with outputs written only after the corresponding source values are
+// available, so results remain bit-identical.
+kernel void candidates_both(device const float *a0 [[buffer(0)]],device const float *b0 [[buffer(1)]],device float *oa [[buffer(2)]],device float *ob [[buffer(3)]],constant Args &a [[buffer(4)]],uint2 p [[thread_position_in_grid]]) {
+    int x=int(p.x),y=int(p.y),w=int(a.width),h=int(a.height);if(x>=w||y>=h)return;
+    uint i=y*w+x;oa[i]=candidate_value(a0,x,y,w,h);ob[i]=candidate_value(b0,x,y,w,h);
+}
+kernel void green_inputs_five(device const float *s [[buffer(0)]],device float *mosaic [[buffer(1)]],device float *mix_a [[buffer(2)]],device float *mix_b [[buffer(3)]],device float *tap_a [[buffer(4)]],device float *tap_b [[buffer(5)]],device float *five [[buffer(6)]],constant Args &a [[buffer(7)]],uint2 p [[thread_position_in_grid]]) {
+    int x=int(p.x), y=int(p.y), w=int(a.width), h=int(a.height); if(x>=w || y>=h) return;
+    int i=y*w+x; mosaic[i]=((x^y)&1) ? s[i] : 0.0f;
+    float ma=0,mb=0,ta=0,tb=0;
+    bool mx=x>=2 && ((x&1) ? x<w-1 : x<w-2);
+    bool my=y>=2 && ((y&1) ? y<h-2 : y<h-3);
+    if(mx && my) {
+        if((x^y)&1) { ma=fma(s[i],6.0f,s[i+2]+s[i-2])*0.125f; mb=fma(s[i],6.0f,s[i+2*w]+s[i-2*w])*0.125f; }
+        else { ma=(s[i-1]+s[i+1])*0.5f; mb=(s[i-w]+s[i+w])*0.5f; }
+    }
+    bool tx=x>=4 && ((x&1) ? x<w-3 : x<w-4);
+    bool ty=y>=4 && ((y&1) ? y<h-3 : y<h-4);
+    if(tx && ty) {
+        constexpr float k1[9]={-0.0625f,0.0f,0.25f,0.0f,0.625f,0.0f,0.25f,0.0f,-0.0625f};
+        constexpr float k2[9]={0.0f,-0.0556640625f,0.0f,0.5556640625f,0.0f,0.5556640625f,0.0f,-0.0556640625f,0.0f};
+        bool odd=(x^y)&1; ta=(odd?k1[0]:k2[0])*get(s,x-4,y,w,h); tb=(odd?k1[0]:k2[0])*get(s,x,y-4,w,h);
+        for(int j=1;j<9;j++) { float k=odd?k1[j]:k2[j]; ta=fma(k,get(s,x-4+j,y,w,h),ta); tb=fma(k,get(s,x,y-4+j,w,h),tb); }
+    }
+    mix_a[i]=ma; mix_b[i]=mb; tap_a[i]=ta; tap_b[i]=tb;
+    bool vx=x>=2 && ((x&1) ? x<w-1 : x<w-2);
+    bool vy=y>=2 && ((y&1) ? y<h-1 : y<h-2);
+    float v=0.0f;
+    if(vx && vy) {
+#define P(dx,dy) get(s,x+(dx),y+(dy),w,h)
+        if(!((x^y)&1)) {
+            float e0=P(1,-2),e1=P(-1,-2),e2=P(-2,-1),e3=P(2,-1),e4=P(-2,1),e5=P(2,1),e6=P(-1,2),e7=P(1,2);
+            float sum=(((e0+e1)+(e2+e3))+((e4+e5)+e6))+e7;
+            float c=(P(-1,0)+P(0,-1))+(P(1,0)+P(0,1));
+            v=fma(c,0.3125f,sum*-0.03125f);
+        } else {
+            float corners=(P(2,-2)+P(-2,-2))+(P(-2,2)+P(2,2));
+            float axial=(P(-2,0)+P(0,-2))+(P(2,0)+P(0,2));
+            float diag=(P(1,-1)+P(-1,-1))+P(-1,1)+P(1,1);
+            v=corners*-0.015625f; v=fma(axial,-0.03125f,v); v=fma(diag,0.125f,v); v=fma(P(0,0),0.6875f,v);
+        }
+#undef P
+    }
+    five[i]=v;
+}
+kernel void green_finish_fused(device const float *ma [[buffer(0)]],device const float *mb [[buffer(1)]],device const float *ta [[buffer(2)]],device const float *tb [[buffer(3)]],device const float *dir [[buffer(4)]],device const float *bw [[buffer(5)]],device const float *five [[buffer(6)]],device const float *dm [[buffer(7)]],device float *out [[buffer(8)]],constant Args &a [[buffer(9)]],uint2 p [[thread_position_in_grid]]) {
+    uint x=p.x,y=p.y,w=a.width,h=a.height;if(x>=w||y>=h)return;uint i=y*w+x;float aa=(ta[i]+ma[i])*0.5f,ab=(tb[i]+mb[i])*0.5f,g0=0;
+    if(y>=4&&y<h-4&&x<w-8)g0=fma(dir[i],ab-aa,aa);float weight=max(bw[i],dm[i]);out[i]=fma(weight,five[i]-g0,g0);
 }

@@ -33,6 +33,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+from functools import wraps
 from pathlib import Path
 
 import numpy as np
@@ -72,11 +73,28 @@ def _sr2_tags(arw):
             for k, v in sr2.sr2_subifd(str(arw)).items()}
 
 
+def _abort_metal_batch_on_error(fn):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except BaseException:
+            try:
+                import metal_itp
+                metal_itp.abort()
+            except Exception:
+                pass
+            raise
+    return wrapped
+
+
+@_abort_metal_batch_on_error
 def decode(arw, look=None, *, output="srgb", raw=None, nr=None, dro=None, marble=None,
            detail=True, lens=True, sscs=True, pad=32, strip=512, verbose=False,
            rust=None, metal=False, metal_itp=False, metal_dro=False, metal_geo=False, metal_sscs=False, metal_look=False,
-           metal_spatial=False, metal_marble=False, metal_post=False, metal_nr=False):
-    """Decode an ARW to the exported image (H, W, 3) uint16 0..16383.
+           metal_spatial=False, metal_marble=False, metal_post=False, metal_nr=False,
+           output_bits=14):
+    """Decode an ARW to the encoded image (H, W, 3) uint16.
 
     output: "srgb" or "adobe" (AdobeRGB).  The look's LinearMatrix16 table is built
             with output_mode 0/1, param8 0: the working space stays sRGB (the look
@@ -93,21 +111,31 @@ def decode(arw, look=None, *, output="srgb", raw=None, nr=None, dro=None, marble
             (default 32).  Marble writes only its 16-px-inset region; the rest of
             the image keeps the pre-Marble (YCC2RGB) render.
     metal:  True runs every stage that has a Metal implementation on the GPU (macOS);
-            the same as setting all metal_* options below.
+            the same as setting all metal_* options below. If rust is left as None,
+            enabling Metal also uses the Rust RAW reader and table builders when available.
     metal_itp / metal_dro / metal_geo / metal_sscs / metal_look / metal_spatial / metal_marble /
     metal_post (Effect, ToneCurve, ShadeCorrection) / metal_nr (RawNR):
             use individual Metal stages; metal_spatial needs metal_look.
+    output_bits: 14 (default, values 0..16383) or 16 (Edit's TIFF encoding,
+            exactly value << 2). On the Metal render path the shift happens in
+            the final interleave kernel.
     strip:  row-band height for the look chain, Sharpness/Spica and Marble
             (0 = whole array, higher peak memory).
     """
     if metal:
         metal_itp = metal_dro = metal_geo = metal_sscs = metal_look = True
         metal_spatial = metal_marble = metal_post = metal_nr = True
+    if output_bits not in (14, 16):
+        raise ValueError("output_bits must be 14 or 16")
     t0 = time.perf_counter()
     timings = {}
     arw = Path(arw)
     output = EXP.normalize_space(output)
     use_rust = (os.environ.get("SONYLOOK_RUST", "0") == "1") if rust is None else bool(rust)
+    if metal and rust is None:
+        # Feed the GPU path with Rust RAW reading and table construction when
+        # available; absent Rust support falls back through the existing paths.
+        use_rust = True
 
     main = AL.main_tags(str(arw))
     tags = _sr2_tags(arw)
@@ -149,6 +177,16 @@ def decode(arw, look=None, *, output="srgb", raw=None, nr=None, dro=None, marble
         raw = arw_raw.read_raw(arw, rust=use_rust)
     raw = np.asarray(raw)
     timings["raw_read"] = time.perf_counter() - t
+    metal_batch = bool(metal_nr or metal_itp or metal_dro or metal_geo or
+                       metal_sscs) and os.environ.get("SONYLOOK_METAL_BATCH", "1") != "0"
+    if metal_batch:
+        import metal_itp as MI_BATCH
+        MI_BATCH.begin()
+
+    def metal_sync():
+        """Submit the open Metal batch before the CPU reads a GPU stage's output."""
+        if metal_batch and MI_BATCH.active():
+            MI_BATCH.end()
 
     # --- white balance (mode 3 samples the full decoder image) -----------------
     t = time.perf_counter()
@@ -183,47 +221,66 @@ def decode(arw, look=None, *, output="srgb", raw=None, nr=None, dro=None, marble
     else:
         raw = np.ascontiguousarray(raw[ey0:ey1, ex0:ex1])
 
+    # DRO's analysis grid depends on the raw crop only. Start it on the
+    # auxiliary GPU queue while RawNR and ITP run on the main queue.
+    if dro is None:
+        dro = int(st.get(DS.DRO_ON, 0)) == 1
+    dro_pts = dro_grid = dro_curve = None
+    dro_black = (black[0], black[1], black[3])
+    if dro:
+        dro_pts = DRO.curve_points_from_arw(arw)
+        if dro_pts is None:
+            raise NotImplementedError("DRO on but the ARW has no camera curve (0x781b/0x781c)")
+        dro_curve = DRO.curve_table(*dro_pts)
+        if metal_dro:
+            import metal_dro as MD
+            dro_grid = MD.prepare(raw_crop, dro_black, dro_curve, origin=(ox, oy))
+
     # --- RawNR (dev+0x218 / 0x801e) -------------------------------------------
     t = time.perf_counter()
+    nr_args = nr_thresholds = None
     if nr is None:
         nr = int(st.get(DS.NR_ON, 0)) == 1
     if nr:
         nr_look = N.look_from_sr2(sr2.sr2_subifd(str(arw)))
         if metal_nr:
             import metal_rawnr as MN
-            raw = MN.apply(raw, nr_look, iso=iso)
+            nr_args, nr_thresholds = MN.prepare(raw, nr_look, iso=iso)
+            if not metal_itp:
+                raw = MN.apply_prepared(raw, nr_args, nr_thresholds)
+                nr_args = nr_thresholds = None
         elif use_rust and FR.available():
             raw = FR.rawnr(raw, nr_look, iso=iso)
         else:
             raw = N.rawnr(raw, nr_look, iso=iso)
     timings["rawnr"] = time.perf_counter() - t
 
-    # --- ITP (1024 tiling, 12 px halo) ----------------------------------------
+    # --- ITP (384 tiling, 12 px halo) -----------------------------------------
     t = time.perf_counter()
     if metal_itp:
         import metal_itp as MI
-        planes = list(MI.full_image(raw, black, gains, s7311, FR.itp_config().params))
+        planes = list(MI.full_image(raw, black, gains, s7311, FR.itp_config().params,
+                                    nr_args=nr_args, nr_thresholds=nr_thresholds))
     else:
+        metal_sync()                           # raw may be Metal RawNR output
         planes = list(ITP.itp_full_image(raw, black, gains, s7311, rust=use_rust))
     timings["itp"] = time.perf_counter() - t
 
     # --- DRO / Vatr (dev+0x238 / 0x8022) --------------------------------------
     t = time.perf_counter()
-    if dro is None:
-        dro = int(st.get(DS.DRO_ON, 0)) == 1
     if dro:
-        pts = DRO.curve_points_from_arw(arw)
-        if pts is None:
-            raise NotImplementedError("DRO on but the ARW has no camera curve (0x781b/0x781c)")
-        dro_black = (black[0], black[1], black[3])
         if metal_dro:
             import metal_dro as MD
-            planes = list(MD.apply(raw_crop, planes, dro_black, DRO.curve_table(*pts), origin=(ox, oy)))
+            planes = list(MD.apply_prepared(
+                planes, dro_grid, dro_black, dro_curve,
+                origin=(ox, oy), raw_size=raw_crop.shape[::-1]))
         elif use_rust and FR.available():
-            G = DRO.build_grid(raw_crop, *pts, black=dro_black)
+            metal_sync()
+            G = DRO.build_grid(raw_crop, *dro_pts, black=dro_black)
             planes = FR.dro_vatr(planes, (ox, oy), G)
         else:
-            G = DRO.build_grid(raw_crop, *pts, black=dro_black)
+            metal_sync()
+            G = DRO.build_grid(raw_crop, *dro_pts, black=dro_black)
             H, W = planes[0].shape
             out = [np.empty((H, W), np.uint16) for _ in range(3)]
             for ya in range(0, H, DRO_STRIP):
@@ -236,16 +293,24 @@ def decode(arw, look=None, *, output="srgb", raw=None, nr=None, dro=None, marble
             planes = out
     timings["dro"] = time.perf_counter() - t
 
-    # --- GeoCorr (distortion + lateral CA), in strips -------------------------
+    # --- GeoCorr (distortion + lateral CA), optionally fused with SSCS -------
     t = time.perf_counter()
+    sscs_params = SC.params_from_tags(tags) if sscs else None
+    fused_geo_sscs = False
     if lens:
         L = LN.lens_from_arw(arw, dist_setting=int(st.get(DS.DISTORTION, -1)),
                              ca_setting=int(st.get(DS.CA_CORRECTION, 1)))
         H, W = planes[0].shape
         if metal_geo:
             import metal_geo as MG
-            planes = list(MG.apply(planes, (ox, oy), (ox, oy, ox + W, oy + H), L))
+            region = (ox, oy, ox + W, oy + H)
+            if metal_sscs and sscs_params is not None:
+                lin = MG.apply_sscs(planes, (ox, oy), region, L, sscs_params)
+                fused_geo_sscs = True
+            else:
+                planes = list(MG.apply(planes, (ox, oy), region, L))
         else:
+            metal_sync()
             rust_geo, rust_lens = None, None
             if use_rust:
                 if FR.available():
@@ -261,19 +326,21 @@ def decode(arw, look=None, *, output="srgb", raw=None, nr=None, dro=None, marble
                 for k in range(3):
                     out[k][ya:yb] = ch[k]
             planes = out
-    timings["geocorr"] = time.perf_counter() - t
+    timings["geocorr+sscs" if fused_geo_sscs else "geocorr"] = time.perf_counter() - t
 
     # --- SSCS (the builder always inserts it, right after GeoCorr) ------------
     # The CPU path runs band-by-band inside render. Metal can operate on the
     # three whole-image planes and directly produce the interleaved render input.
-    sscs_params = SC.params_from_tags(tags) if sscs else None
-    if metal_sscs and sscs_params is not None:
+    if fused_geo_sscs:
+        sscs_params = None
+    elif metal_sscs and sscs_params is not None:
         import metal_sscs as MS
         t = time.perf_counter()
         lin = MS.apply(planes, sscs_params)
         timings["sscs"] = time.perf_counter() - t
         sscs_params = None
     else:
+        metal_sync()
         lin = np.stack(planes, -1).astype(np.uint16)
     del planes
 
@@ -326,11 +393,13 @@ def decode(arw, look=None, *, output="srgb", raw=None, nr=None, dro=None, marble
         img = lk.render(lin, detail=detail_cfg, marble=marble_cfg,
                         sscs=sscs_params, marble_inset=16, timings=rt,
                         strip=strip, metal_look=metal_look, metal_spatial=metal_spatial,
-                        metal_marble=metal_marble, metal_post=metal_post)
+                        metal_marble=metal_marble, metal_post=metal_post,
+                        output_bits=output_bits)
     else:
         img = lk.render(lin, detail=detail_cfg, marble=None,
                         sscs=sscs_params, timings=rt, strip=strip, metal_look=metal_look, metal_spatial=metal_spatial,
-                        metal_marble=metal_marble, metal_post=metal_post)
+                        metal_marble=metal_marble, metal_post=metal_post,
+                        output_bits=output_bits)
     # crop back to the decoder rectangle
     ty, tx = y0 - ey0, x0 - ex0
     img = img[ty:ty + (y1 - y0), tx:tx + (x1 - x0)]
@@ -386,17 +455,21 @@ def main():
     ap.add_argument("--metal-nr", action="store_true",
                     help="run RawNR (noise reduction on the raw) on Metal")
     a = ap.parse_args()
+    output_bits = 16 if a.bits == 16 else 14
+    if a.out and a.bits is None:
+        output_bits = 16 if Path(a.out).suffix.lower() in (".tif", ".tiff") else 14
     img = decode(a.arw, a.look, output=a.color_space,
                  nr=False if a.no_nr else None, dro=False if a.no_dro else None,
                  marble=False if a.no_marble else None, detail=not a.no_detail,
                  lens=not a.no_lens, sscs=not a.no_sscs, pad=a.pad, strip=a.strip, verbose=True,
                  rust=True if a.rust else None, metal=a.metal, metal_itp=a.metal_itp, metal_dro=a.metal_dro, metal_geo=a.metal_geo, metal_sscs=a.metal_sscs, metal_look=a.metal_look,
                  metal_spatial=a.metal_spatial, metal_marble=a.metal_marble,
-                 metal_post=a.metal_post, metal_nr=a.metal_nr)
+                 metal_post=a.metal_post, metal_nr=a.metal_nr,
+                 output_bits=output_bits)
     print(img.shape, img.dtype, int(img.min()), int(img.max()))
     if a.out:
         out = EXP.write_image(img, a.out, color_space=a.color_space,
-                              bits=a.bits, quality=a.quality)
+                              bits=a.bits, quality=a.quality, input_bits=output_bits)
         print("->", out)
 
 

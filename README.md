@@ -37,10 +37,10 @@ Each backend was run once to initialise caches and Metal shaders, then the secon
 | --- | ---: | ---: |
 | NumPy | 24.92 s | 1.0× |
 | Rust | 1.79 s | 13.9× |
-| Metal | 0.35 s | 71.2× |
-| Rust + Metal | 0.22 s | 113.3× |
+| Metal | 0.203 s | 122.8× |
+| Rust + Metal | 0.203 s | 122.8× |
 
-All four paths produced identical full-image hashes. The first decode in a new process is slower because it includes initialisation, table construction and Metal shader compilation. These figures describe one synthetic ARW and should not be treated as a general benchmark across all camera models or development settings.
+`--metal` automatically uses the Rust RAW reader and table builders when the Rust library is available. GPU stages are submitted in two command buffers: the RAW chain and the render chain. GeoCorr with SSCS, and Marble with Effect/ToneCurve/ShadeCorrection, run in fused kernels. Set `SONYLOOK_METAL_BATCH=0` to restore independent stage submission. All four paths produced identical full-image hashes. The first decode in a new process is slower because it includes initialisation, table construction and Metal shader compilation. These figures describe one synthetic ARW and should not be treated as a general benchmark across all camera models or development settings.
 
 ## Install
 
@@ -59,9 +59,10 @@ cargo build --release --manifest-path rust/sonylook_core/Cargo.toml
 Build the Metal bridge on macOS:
 
 ```bash
-clang -O2 -fobjc-arc -dynamiclib -framework Foundation -framework Metal \
-  metal/bridge.m -o metal/libsonylook_metal.dylib
+./metal/build.sh
 ```
+
+When the full Metal toolchain is available, the script precompiles `metal/shaders/shaders.metallib`; otherwise it builds the bridge and the runtime compiles the shader sources.
 
 ## Decode
 
@@ -79,9 +80,10 @@ from base.sony_decode import decode
 
 image = decode("photo.ARW")
 fast_image = decode("photo.ARW", rust=True, metal=True)
+export_image = decode("photo.ARW", metal=True, output_bits=16)
 ```
 
-`decode()` returns a `uint16` array shaped `(height, width, 3)`.
+`decode()` returns a `uint16` array shaped `(height, width, 3)` with values 0–16383 by default. `output_bits=16` returns Edit's 16-bit TIFF encoding, exactly the 14-bit result shifted left by two; the Metal path performs that shift in the final interleave kernel. Command-line 16-bit TIFF export selects this path automatically.
 
 ## Verification
 
@@ -90,6 +92,9 @@ python3 tests/verify_raw_decode.py photo.ARW
 python3 tests/verify_rust_nr_dro.py photo.ARW
 python3 tests/verify_metal_itp.py photo.ARW
 python3 tests/verify_metal_geo.py photo.ARW
+python3 tests/verify_metal_geo_sscs.py photo.ARW
+python3 tests/verify_metal_batch.py photo.ARW
+python3 tests/verify_metal_export.py photo.ARW
 python3 tests/verify_metal_sscs.py photo.ARW
 python3 tests/verify_metal_look.py photo.ARW
 python3 tests/verify_metal_spatial.py photo.ARW

@@ -7,8 +7,7 @@ import numpy as np
 import metal_itp
 
 
-def apply(planes, origin, region, lens):
-    """Correct three uint16 planes for a region in decoder-image coordinates."""
+def _prepare(planes, origin, region, lens):
     planes = tuple(np.ascontiguousarray(p, dtype=np.uint16) for p in planes)
     if len(planes) != 3 or planes[0].ndim != 2 or min(planes[0].shape) == 0 or any(p.shape != planes[0].shape for p in planes):
         raise ValueError("expected three identically shaped nonempty 2D planes")
@@ -25,6 +24,13 @@ def apply(planes, origin, region, lens):
                        *(v for pair in lens['off'] for v in pair)], dtype=np.float32)
     if params.shape != (11,) or params[4] <= 0:
         raise ValueError("lens offsets or knot spacing are invalid")
+    return planes, params, tables, n, (x0, y0, x1, y1)
+
+
+def apply(planes, origin, region, lens):
+    """Correct three uint16 planes for a region in decoder-image coordinates."""
+    planes, params, tables, n, region = _prepare(planes, origin, region, lens)
+    x0, y0, x1, y1 = region
     out = [metal_itp.empty((y1-y0, x1-x0)) for _ in range(3)]
     lib = metal_itp._load()
     lib.sonylook_metal_geo.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
@@ -37,3 +43,31 @@ def apply(planes, origin, region, lens):
     if rc:
         raise RuntimeError(lib.sonylook_metal_error().decode())
     return tuple(out)
+
+
+def apply_sscs(planes, origin, region, lens, params):
+    """Fused GeoCorr and SSCS, returning interleaved RGB in one GPU pass."""
+    planes, lens_params, tables, n, region = _prepare(planes, origin, region, lens)
+    x0, y0, x1, y1 = region
+    sscs = np.asarray([params['T'], params['tR'], params['tG'], params['tB'],
+                       *params['w']], dtype=np.int32)
+    if sscs.shape != (7,):
+        raise ValueError("SSCS parameters must include three channel weights")
+    out = metal_itp.empty((y1-y0, x1-x0, 3))
+    lib = metal_itp._load()
+    lib.sonylook_metal_geo_sscs.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_uint32, ctypes.c_uint32,
+        ctypes.c_int32, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32,
+        ctypes.c_uint32, ctypes.c_uint32,
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p,
+    ]
+    rc = lib.sonylook_metal_geo_sscs(
+        *(p.ctypes.data for p in planes), planes[0].shape[1], planes[0].shape[0],
+        int(origin[0]), int(origin[1]), x0, y0, x1-x0, y1-y0,
+        lens_params.ctypes.data, *(t.ctypes.data for t in tables), n,
+        sscs.ctypes.data, out.ctypes.data)
+    if rc:
+        raise RuntimeError(lib.sonylook_metal_error().decode())
+    return out

@@ -1,15 +1,24 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 typedef struct { uint32_t width,height; int32_t black[4]; float gains[4]; int32_t scale; float blend_k,blend_lo,blend_hi,blend_half; float k1,k2,k3,k4,k5,k6; uint32_t image_width,image_height,tile_x,tile_y,tile_width,tile_height,halo; } Args;
+typedef struct { uint32_t width,height; int32_t off[3],gain[3],lim[3],wm[3]; float s; } NrArgs;
 static id<MTLDevice> device;
 static id<MTLCommandQueue> queue;
-#define NPIPE 41
+static id<MTLCommandQueue> aux_queue;
+static id<MTLSharedEvent> grid_event;
+static id<MTLCommandBuffer> batch_cmd;
+static uint64_t grid_event_value;
+static uint64_t pending_grid_value;
+#define NPIPE 53
 static id<MTLComputePipelineState> pipelines[NPIPE];
 static char error_text[2048];
 const char *sonylook_metal_error(void) { return error_text; }
 static int fail(NSString *s) { snprintf(error_text,sizeof(error_text),"%s",s.UTF8String); return -1; }
+static void encode_grid(id<MTLCommandBuffer> cmd,int kernel,NSArray *buffers,const void *args,size_t len,uint32_t w,uint32_t h);
+static NSArray *new_buffers(size_t count,size_t length,MTLResourceOptions options);
 
 // ---------------------------------------------------------------------------
 // Buffer management.
@@ -58,9 +67,44 @@ static id<MTLBuffer> acquire(size_t len,MTLResourceOptions mode) {
 }
 // Return this call's temporaries to the pool (the command buffer has completed).
 static int done(int rc) {
+    if(batch_cmd)return rc;
     @synchronized(buf_lock){for(id<MTLBuffer> b in call_bufs)pool_put(b);[call_bufs removeAllObjects];}
     return rc;
 }
+static id<MTLCommandBuffer> command_buffer(void) {
+    return batch_cmd ? batch_cmd : [queue commandBuffer];
+}
+// For calls that must commit and read back immediately: refuse to run while a
+// batch is open, since their buffer would execute ahead of the batched work.
+static id<MTLCommandBuffer> own_command_buffer(void) {
+    if(batch_cmd){fail(@"This Metal call cannot run inside a command batch; call sonylook_metal_end() first");return nil;}
+    return [queue commandBuffer];
+}
+static int submit_command(id<MTLCommandBuffer> cmd) {
+    if(batch_cmd)return 0;
+    [cmd commit];[cmd waitUntilCompleted];
+    return cmd.error ? fail(cmd.error.description) : 0;
+}
+int sonylook_metal_begin(void) {
+    if(!device)return fail(@"Metal device unavailable");
+    if(batch_cmd)return fail(@"Metal command batch already active");
+    batch_cmd=[queue commandBuffer];
+    return batch_cmd ? 0 : fail(@"Cannot create Metal command buffer");
+}
+int sonylook_metal_end(void) {
+    if(!batch_cmd)return fail(@"No Metal command batch is active");
+    id<MTLCommandBuffer> cmd=batch_cmd;
+    batch_cmd=nil;
+    int rc=submit_command(cmd);
+    done(0);
+    return rc;
+}
+int sonylook_metal_abort(void) {
+    batch_cmd=nil;
+    done(0);
+    return 0;
+}
+int sonylook_metal_is_active(void) { return batch_cmd != nil; }
 static SLBuf *find_resident(const void *p,size_t len) {
     @synchronized(buf_lock) {
         for(NSNumber *k in resident){id<MTLBuffer> b=resident[k];uintptr_t s=(uintptr_t)b.contents,q=(uintptr_t)p;
@@ -79,7 +123,10 @@ static id out_buf(void *p,size_t len) {
     SLBuf *r=find_resident(p,len);if(r)return r;
     return acquire(len,MTLResourceStorageModeShared);
 }
-static void copy_back(id o,void *p,size_t len) { if(![o isKindOfClass:[SLBuf class]])memcpy(p,[o contents],len); }
+static void copy_back(id o,void *p,size_t len) {
+    if(batch_cmd)return;
+    if(![o isKindOfClass:[SLBuf class]])memcpy(p,[o contents],len);
+}
 static void bind(id<MTLComputeCommandEncoder> e,id o,NSUInteger i) {
     if([o isKindOfClass:[SLBuf class]])[e setBuffer:((SLBuf *)o).buf offset:((SLBuf *)o).off atIndex:i];
     else [e setBuffer:o offset:0 atIndex:i];
@@ -102,29 +149,40 @@ int sonylook_metal_init(const char *path) { @autoreleasepool {
     if (device) return 0;
     buf_lock=[NSObject new];
     id<MTLDevice> d=MTLCreateSystemDefaultDevice(); if(!d) return fail(@"Metal device unavailable");
-    // path: the shaders directory; the files are concatenated into one library.
+    // path: the shaders directory. Prefer the precompiled metallib, then fall
+    // back to concatenating the individual .metal sources.
     NSError *err=nil; NSMutableString *source=[NSMutableString string];
     NSString *dir=[NSString stringWithUTF8String:path];
-    for(NSString *name in @[@"itp",@"dro",@"geo",@"sscs",@"look",@"spatial",@"marble",@"post",@"nr"]){
-        NSString *src=[NSString stringWithContentsOfFile:[dir stringByAppendingPathComponent:[name stringByAppendingString:@".metal"]] encoding:NSUTF8StringEncoding error:&err];
-        if(!src) return fail(err.description);
-        [source appendString:src];
+    NSString *compiled=[dir stringByAppendingPathComponent:@"shaders.metallib"];
+    id<MTLLibrary> library=nil;
+    if([[NSFileManager defaultManager] fileExistsAtPath:compiled]) {
+        library=[d newLibraryWithURL:[NSURL fileURLWithPath:compiled] error:&err];
+        if(!library)return fail(err.description);
     }
-    MTLCompileOptions *opts=[MTLCompileOptions new];
-    // Exact IEEE float semantics: the shaders reproduce the reference's float32 rounding.
-    if(@available(macOS 15.0,*)){opts.mathMode=MTLMathModeSafe;opts.mathFloatingPointFunctions=MTLMathFloatingPointFunctionsPrecise;}
-    else {
+    if(!library) {
+        for(NSString *name in @[@"itp",@"dro",@"geo",@"sscs",@"look",@"spatial",@"marble",@"post",@"nr"]){
+            NSString *src=[NSString stringWithContentsOfFile:[dir stringByAppendingPathComponent:[name stringByAppendingString:@".metal"]] encoding:NSUTF8StringEncoding error:&err];
+            if(!src) return fail(err.description);
+            [source appendString:src];
+        }
+        MTLCompileOptions *opts=[MTLCompileOptions new];
+        // Exact IEEE float semantics: the shaders reproduce the reference's float32 rounding.
+        if(@available(macOS 15.0,*)){opts.mathMode=MTLMathModeSafe;opts.mathFloatingPointFunctions=MTLMathFloatingPointFunctionsPrecise;}
+        else {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        opts.fastMathEnabled=NO;
+            opts.fastMathEnabled=NO;
 #pragma clang diagnostic pop
+        }
+        library=[d newLibraryWithSource:source options:opts error:&err]; if(!library) return fail(err.description);
     }
-    id<MTLLibrary> library=[d newLibraryWithSource:source options:opts error:&err]; if(!library) return fail(err.description);
-    NSArray *names=@[@"scale_raw",@"differences",@"candidates",@"weights",@"green_inputs",@"green_five",@"average_pairs",@"direction_errors",@"direction",@"green_finish",@"chroma_inputs",@"chroma_finish",@"load_tile",@"store_tile",@"dro_subcells",@"dro_histogram",@"dro_smooth",@"dro_weights",@"dro_apply",@"geo_apply",@"sscs_apply",@"look_lm_gamma",@"look_front",@"encoded_front",@"sharp_hblur",@"sharp_apply",@"spica_ycc",@"marble_in",@"marble_blocks",@"marble_sigma",@"marble_binom",@"marble_out",@"post_apply",@"nr_split",@"nr_filter",@"marble_halfc",@"marble_cblocks",@"marble_csigma",@"marble_cup",@"dro_math_test",@"interleave3"];
+    NSArray *names=@[@"scale_raw",@"differences",@"candidates",@"weights",@"green_inputs",@"green_five",@"average_pairs",@"direction_errors",@"direction",@"green_finish",@"chroma_inputs",@"chroma_finish",@"load_tile",@"store_tile",@"dro_subcells",@"dro_histogram",@"dro_smooth",@"dro_weights",@"dro_apply",@"geo_apply",@"sscs_apply",@"look_lm_gamma",@"look_front",@"encoded_front",@"sharp_hblur",@"sharp_apply",@"spica_ycc",@"marble_in",@"marble_blocks",@"marble_sigma",@"marble_binom",@"marble_out",@"post_apply",@"nr_split",@"nr_filter",@"marble_halfc",@"marble_cblocks",@"marble_csigma",@"marble_cup",@"dro_math_test",@"interleave3",@"geo_sscs_apply",@"candidates_both",@"green_inputs_five",@"green_finish_fused",@"dro_smooth_weights",@"marble_out_post",@"load_scale_tile",@"weights_candidates",@"marble_out_packed",@"dro_fix_args",@"dro_apply_fix",@"dro_apply_exact"];
     if(names.count!=NPIPE) return fail(@"Metal kernel table size mismatch");
     id<MTLComputePipelineState> ps[NPIPE];
     for(int i=0;i<NPIPE;i++) { id<MTLFunction> f=[library newFunctionWithName:names[i]]; if(!f) return fail(@"Missing Metal function"); ps[i]=[d newComputePipelineStateWithFunction:f error:&err]; if(!ps[i]) return fail(err.description); }
     queue=[d newCommandQueue]; if(!queue) return fail(@"Cannot create Metal command queue");
+    aux_queue=[d newCommandQueue];if(!aux_queue)return fail(@"Cannot create Metal auxiliary queue");
+    grid_event=[d newSharedEvent];if(!grid_event)return fail(@"Cannot create Metal shared event");
     for(int i=0;i<NPIPE;i++) pipelines[i]=ps[i]; device=d; return 0;
 }}
 static void dispatch(id<MTLCommandBuffer> cmd,int kernel,NSArray *buffers,Args *args) {
@@ -147,7 +205,7 @@ int sonylook_metal_itp_debug(const uint16_t *raw, uint32_t w, uint32_t h, const 
         mosaic=acquire(n*4,MTLResourceStorageModeShared); ma=acquire(n*4,MTLResourceStorageModeShared); mb=acquire(n*4,MTLResourceStorageModeShared); ta=acquire(n*4,MTLResourceStorageModeShared); tb=acquire(n*4,MTLResourceStorageModeShared); five=acquire(n*4,MTLResourceStorageModeShared); aa=acquire(n*4,MTLResourceStorageModeShared); ab=acquire(n*4,MTLResourceStorageModeShared);
         if(!mosaic || !ma || !mb || !ta || !tb || !five || !aa || !ab) return fail(@"Metal buffer allocation failed");
     }
-    id<MTLCommandBuffer> cmd=[queue commandBuffer]; dispatch(cmd,0,@[input,src],&a);
+    id<MTLCommandBuffer> cmd=own_command_buffer();if(!cmd)return -1; dispatch(cmd,0,@[input,src],&a);
     if(stage>=1 && stage<=6) dispatch(cmd,1,@[src,ah,av],&a);
     if(stage>=3 && stage<=6) { dispatch(cmd,2,@[ah,ch],&a); dispatch(cmd,2,@[av,cv],&a); }
     if(stage>=4 && stage<=6) dispatch(cmd,3,@[ch,cv,dir,bw],&a);
@@ -161,11 +219,30 @@ int sonylook_metal_itp_debug(const uint16_t *raw, uint32_t w, uint32_t h, const 
 }}
 static void encode_tile(id<MTLCommandBuffer> cmd, id<MTLBuffer> input, NSArray *v, Args *a) {
     dispatch(cmd,0,@[input,v[0]],a);dispatch(cmd,1,@[v[0],v[1],v[2]],a);
-    dispatch(cmd,2,@[v[1],v[3]],a);dispatch(cmd,2,@[v[2],v[4]],a);dispatch(cmd,3,@[v[3],v[4],v[5],v[6]],a);
-    dispatch(cmd,4,@[v[0],v[7],v[8],v[9],v[10],v[11]],a);dispatch(cmd,5,@[v[7],v[12]],a);dispatch(cmd,6,@[v[8],v[9],v[10],v[11],v[13],v[14]],a);
+    dispatch(cmd,42,@[v[1],v[2],v[3],v[4]],a);dispatch(cmd,3,@[v[3],v[4],v[5],v[6]],a);
+    dispatch(cmd,43,@[v[0],v[7],v[8],v[9],v[10],v[11],v[12]],a);
     dispatch(cmd,7,@[v[7],v[1],v[2],v[3],v[4]],a);dispatch(cmd,8,@[v[1],v[2],v[3],v[4],v[15]],a);
-    dispatch(cmd,9,@[v[13],v[14],v[5],v[6],v[12],v[15],v[16]],a);
+    dispatch(cmd,44,@[v[8],v[9],v[10],v[11],v[5],v[6],v[12],v[15],v[16]],a);
     dispatch(cmd,10,@[v[0],v[17],v[18],v[19],v[20]],a);dispatch(cmd,11,@[v[17],v[18],v[19],v[20],v[5],v[16],v[22],v[23],v[24]],a);
+}
+static void itp_dispatch_encoder(id<MTLComputeCommandEncoder> e,int kernel,NSArray *buffers,Args *a) {
+    [e setComputePipelineState:pipelines[kernel]];NSArray *__b=buffers;
+    for(NSUInteger __i=0;__i<__b.count;__i++)bind(e,__b[__i],__i);
+    [e setBytes:a length:sizeof(*a) atIndex:__b.count];
+    [e dispatchThreads:MTLSizeMake(a->width,a->height,1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];
+}
+static void encode_tile_scaled(id<MTLCommandBuffer> cmd, id source, NSArray *v, Args *a) {
+    id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];
+    if(source){itp_dispatch_encoder(e,47,@[source,v[0]],a);[e memoryBarrierWithScope:MTLBarrierScopeBuffers];}
+    itp_dispatch_encoder(e,1,@[v[0],v[1],v[2]],a);[e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    itp_dispatch_encoder(e,48,@[v[1],v[2],v[5],v[6]],a);[e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    itp_dispatch_encoder(e,43,@[v[0],v[7],v[8],v[9],v[10],v[11],v[12]],a);[e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    itp_dispatch_encoder(e,7,@[v[7],v[1],v[2],v[3],v[4]],a);[e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    itp_dispatch_encoder(e,8,@[v[1],v[2],v[3],v[4],v[15]],a);[e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    itp_dispatch_encoder(e,44,@[v[8],v[9],v[10],v[11],v[5],v[6],v[12],v[15],v[16]],a);[e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    itp_dispatch_encoder(e,10,@[v[0],v[17],v[18],v[19],v[20]],a);[e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    itp_dispatch_encoder(e,11,@[v[17],v[18],v[19],v[20],v[5],v[16],v[22],v[23],v[24]],a);
+    [e endEncoding];
 }
 int sonylook_metal_itp_tile(const uint16_t *raw, uint32_t w, uint32_t h, const int32_t *black, const float *gains, int32_t scale, const float *params, uint16_t *r, uint16_t *g, uint16_t *b) { @autoreleasepool {
     if(!device || !raw || !r || !g || !b || w<12 || h<12) return fail(@"Invalid Metal ITP arguments");
@@ -175,35 +252,58 @@ int sonylook_metal_itp_tile(const uint16_t *raw, uint32_t w, uint32_t h, const i
     NSMutableArray *v=[NSMutableArray arrayWithCapacity:25];
     for(int i=0;i<25;i++){id<MTLBuffer> buf=acquire(n*(i>=22?2:4),MTLResourceStorageModeShared);if(!buf)return fail(@"Metal buffer allocation failed");[v addObject:buf];}
     if(!input)return fail(@"Metal input allocation failed");
-    id<MTLCommandBuffer> cmd=[queue commandBuffer];
+    id<MTLCommandBuffer> cmd=own_command_buffer();if(!cmd)return -1;
     encode_tile(cmd,input,v,&a);
     [cmd commit];[cmd waitUntilCompleted];if(cmd.error)return fail(cmd.error.description);
     memcpy(r,((id<MTLBuffer>)v[22]).contents,n*2);memcpy(g,((id<MTLBuffer>)v[23]).contents,n*2);memcpy(b,((id<MTLBuffer>)v[24]).contents,n*2);return done(0);
 }}
 
 // Whole image: scratch planes are allocated once and reused in GPU command order.
-int sonylook_metal_itp_image(const uint16_t *raw, uint32_t w, uint32_t h, const int32_t *black, const float *gains, int32_t scale, const float *params, uint32_t tile, uint32_t halo, uint16_t *r, uint16_t *g, uint16_t *b) { @autoreleasepool {
+int sonylook_metal_itp_image(const uint16_t *raw, uint32_t w, uint32_t h, const int32_t *black, const float *gains, int32_t scale, const float *params, uint32_t tile, uint32_t halo, const NrArgs *nr_args, const int32_t *nr_thr, uint16_t *r, uint16_t *g, uint16_t *b) { @autoreleasepool {
     if(!device || !raw || !r || !g || !b || w<12 || h<12 || tile==0 || halo<10) return fail(@"Invalid Metal ITP image arguments");
     size_t count=(size_t)w*h;
     uint32_t maxw=MIN(w,tile)+2*halo, maxh=MIN(h,tile)+2*halo;
     size_t tilecount=(size_t)maxw*maxh;
     id<MTLBuffer> image=in_buf(raw,count*2);
     id<MTLBuffer> input=acquire(tilecount*2,MTLResourceStorageModePrivate);
+    id<MTLBuffer> nr_image=nil,nr_hp=nil,nr_base=nil,nr_thr_buf=nil;
+    NrArgs nr_local={0};
     id red=out_buf(r,count*2),green=out_buf(g,count*2),blue=out_buf(b,count*2);
     if(!image || !input || !red || !green || !blue) return fail(@"Metal image buffer allocation failed");
     NSMutableArray *v=[NSMutableArray arrayWithCapacity:25];
     for(int i=0;i<25;i++){id<MTLBuffer> buf=acquire(tilecount*(i>=22?2:4),MTLResourceStorageModePrivate);if(!buf)return fail(@"Metal scratch allocation failed");[v addObject:buf];}
+    if(nr_args) {
+        nr_image=acquire(count*2,MTLResourceStorageModePrivate);
+        nr_hp=acquire(count*2,MTLResourceStorageModePrivate);
+        nr_base=acquire(count*2,MTLResourceStorageModePrivate);
+        nr_thr_buf=in_buf(nr_thr,3*0x8000*4);
+        nr_local=*nr_args;nr_local.width=w;nr_local.height=h;
+        if(!nr_image||!nr_hp||!nr_base||!nr_thr_buf)return fail(@"Metal fused RawNR buffers failed");
+    }
     Args a={.image_width=w,.image_height=h,.halo=halo,.scale=scale};memcpy(a.black,black,sizeof(a.black));memcpy(a.gains,gains,sizeof(a.gains));
     a.blend_k=params[0];a.blend_lo=params[1];a.blend_hi=params[2];a.blend_half=params[3];a.k1=params[4];a.k2=params[5];a.k3=params[6];a.k4=params[7];a.k5=params[8];a.k6=params[9];
-    id<MTLCommandBuffer> cmd=[queue commandBuffer];
+    id<MTLCommandBuffer> cmd=command_buffer();
+    int fused_itp=getenv("SONYLOOK_ITP_FUSED")==NULL||strcmp(getenv("SONYLOOK_ITP_FUSED"),"0")!=0;
+    if(nr_args) {
+        encode_grid(cmd,33,@[image,nr_hp,nr_base],&nr_local,sizeof(nr_local),w,h);
+        encode_grid(cmd,34,@[image,nr_hp,nr_base,nr_thr_buf,nr_image],&nr_local,sizeof(nr_local),w,h);
+    }
     for(uint32_t y=0;y<h;y+=tile) for(uint32_t x=0;x<w;x+=tile) {
         a.tile_x=x;a.tile_y=y;a.tile_width=MIN(tile,w-x);a.tile_height=MIN(tile,h-y);
         a.width=a.tile_width+2*halo;a.height=a.tile_height+2*halo;
-        dispatch(cmd,12,@[image,input],&a);
-        encode_tile(cmd,input,v,&a);
-        dispatch(cmd,13,@[v[22],v[23],v[24],red,green,blue],&a);
+        id<MTLCommandBuffer> tile_cmd=cmd;
+        if(nr_args) {
+            encode_tile_scaled(tile_cmd,nr_image,v,&a);
+        } else if(fused_itp) {
+            encode_tile_scaled(tile_cmd,image,v,&a);
+        } else {
+            dispatch(tile_cmd,12,@[image,input],&a);
+            dispatch(tile_cmd,0,@[input,v[0]],&a);
+            encode_tile(tile_cmd,input,v,&a);
+        }
+        dispatch(tile_cmd,13,@[v[22],v[23],v[24],red,green,blue],&a);
     }
-    [cmd commit];[cmd waitUntilCompleted];if(cmd.error)return fail(cmd.error.description);
+    int rc=submit_command(cmd);if(rc)return rc;
     copy_back(red,r,count*2);copy_back(green,g,count*2);copy_back(blue,b,count*2);return done(0);
 }}
 
@@ -213,6 +313,7 @@ typedef struct {
     uint32_t subpx_x,subpx_y,org_x,org_y,per_x,per_y;
     int32_t black_r,black_g,black_b;
     float log2_max,strength,k_up,k_down,scale;
+    uint32_t fix_capacity;
 } DroArgs;
 static void dispatch_dro(id<MTLCommandBuffer> cmd,int kernel,NSArray *buffers,DroArgs *args, uint32_t w,uint32_t h) {
     id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];[e setComputePipelineState:pipelines[kernel]];
@@ -220,25 +321,111 @@ static void dispatch_dro(id<MTLCommandBuffer> cmd,int kernel,NSArray *buffers,Dr
     [e setBytes:args length:sizeof(*args) atIndex:buffers.count];
     [e dispatchThreads:MTLSizeMake(w,h,1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];[e endEncoding];
 }
-int sonylook_metal_dro(const uint16_t *raw,uint32_t raww,uint32_t rawh,const uint16_t *r,const uint16_t *g,const uint16_t *b,uint32_t w,uint32_t h,const int32_t *black,int32_t ox,int32_t oy,const float *logtab,const float *curve,float log2_max,float strength,float k_up,float k_down,float scale,uint16_t *ro,uint16_t *go,uint16_t *bo,float *debug_sub,float *debug_w,float *debug_s) { @autoreleasepool {
-    if(!device||!raw||!r||!g||!b||!ro||!go||!bo||raww<448||rawh<336||!w||!h)return fail(@"Invalid Metal DRO arguments");
-    DroArgs a={.width=w,.height=h,.raw_width=raww,.raw_height=rawh,.origin_x=ox,.origin_y=oy,.black_r=black[0],.black_g=black[1],.black_b=black[2],.log2_max=log2_max,.strength=strength,.k_up=k_up,.k_down=k_down,.scale=scale};
+static void dispatch_dro(id<MTLCommandBuffer> cmd,int kernel,NSArray *buffers,DroArgs *args, uint32_t w,uint32_t h);
+// DRO apply with the fast exp2 (see dro.metal): main pass, indirect sizes,
+// exact recompute of the listed pixels, and an exact full pass that only gets
+// threadgroups when the list overflowed. No CPU round trip, so it batches.
+static int encode_dro_apply(id<MTLCommandBuffer> cmd,NSArray *io,DroArgs *a,uint32_t w,uint32_t h) {
+    size_t n=(size_t)w*h;uint32_t cap=(uint32_t)MAX((size_t)4096,n/64);a->fix_capacity=cap;
+    id<MTLBuffer> list=acquire((size_t)cap*4,MTLResourceStorageModePrivate);
+    id<MTLBuffer> count=acquire(4,MTLResourceStorageModeShared);
+    id<MTLBuffer> ind=acquire(6*4,MTLResourceStorageModePrivate);
+    if(!list||!count||!ind)return fail(@"Metal DRO list allocation failed");
+    memset(count.contents,0,4);
+    NSArray *all=[io arrayByAddingObjectsFromArray:@[list,count]];
+    dispatch_dro(cmd,18,all,a,w,h);
+    dispatch_dro(cmd,50,@[count,ind],a,1,1);
+    for(int pass=0;pass<2;pass++){
+        id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];[e setComputePipelineState:pipelines[pass?52:51]];
+        for(NSUInteger i=0;i<all.count;i++)bind(e,all[i],i);
+        [e setBytes:a length:sizeof(*a) atIndex:all.count];
+        [e dispatchThreadgroupsWithIndirectBuffer:ind indirectBufferOffset:pass?12:0
+                           threadsPerThreadgroup:pass?MTLSizeMake(16,16,1):MTLSizeMake(64,1,1)];
+        [e endEncoding];
+    }
+    return 0;
+}
+static DroArgs make_dro_args(uint32_t raww,uint32_t rawh,uint32_t w,uint32_t h,const int32_t *black,
+                             int32_t ox,int32_t oy,float log2_max,float strength,
+                             float k_up,float k_down,float scale) {
+    DroArgs a={.width=w,.height=h,.raw_width=raww,.raw_height=rawh,.origin_x=ox,.origin_y=oy,
+               .black_r=black[0],.black_g=black[1],.black_b=black[2],.log2_max=log2_max,
+               .strength=strength,.k_up=k_up,.k_down=k_down,.scale=scale};
     a.subpx_x=((raww>>2)/112)*4;a.subpx_y=((rawh>>2)/84)*4;a.per_x=a.subpx_x/4;a.per_y=a.subpx_y/4;
     a.org_x=((raww-a.subpx_x*112)>>1)&~1u;a.org_y=((rawh-a.subpx_y*84)>>1)&~1u;
+    return a;
+}
+int sonylook_metal_dro_grid(const uint16_t *raw,uint32_t raww,uint32_t rawh,const int32_t *black,
+                            int32_t ox,int32_t oy,const float *logtab,const float *curve,
+                            float log2_max,float strength,float k_up,float k_down,float scale,
+                            float *weights,float *sums) { @autoreleasepool {
+    if(!device||!aux_queue||!grid_event||!raw||!weights||!sums||raww<448||rawh<336)return fail(@"Invalid Metal DRO grid arguments");
+    DroArgs a=make_dro_args(raww,rawh,1,1,black,ox,oy,log2_max,strength,k_up,k_down,scale);
+    // The grid finishes asynchronously on aux_queue. W/S are read by a later
+    // call, so they must be resident arrays (metal_itp.empty), never pooled
+    // copies that would need a copy-back.
+    id Wb=find_resident(weights,8*6*14*4),Sb=find_resident(sums,8*6*14*4);
+    if(!Wb||!Sb)return fail(@"Metal DRO grid outputs must be GPU-resident arrays");
+    NSUInteger mark;@synchronized(buf_lock){mark=call_bufs.count;}
+    id rawbuf=in_buf(raw,(size_t)raww*rawh*2),tab=in_buf(logtab,2049*4);
+    id sub=acquire(112*84*4,MTLResourceStorageModeShared),hist=acquire(8*6*14*4,MTLResourceStorageModePrivate);
+    if(!rawbuf||!tab||!sub||!hist)return fail(@"Metal DRO grid allocation failed");
+    // Temporaries live until the aux command buffer completes, not until the
+    // next main-queue call's done(): take them out of call_bufs.
+    NSArray *grid_bufs;
+    @synchronized(buf_lock) {
+        NSRange r=NSMakeRange(mark,call_bufs.count-mark);
+        grid_bufs=[call_bufs subarrayWithRange:r];[call_bufs removeObjectsInRange:r];
+    }
+    id<MTLCommandBuffer> cmd=[aux_queue commandBuffer];
+    dispatch_dro(cmd,14,@[rawbuf,tab,sub],&a,112,84);
+    dispatch_dro(cmd,15,@[sub,hist],&a,8,6);
+    dispatch_dro(cmd,45,@[hist,Wb,Sb],&a,8,6);
+    pending_grid_value=++grid_event_value;
+    [cmd encodeSignalEvent:grid_event value:pending_grid_value];
+    [cmd addCompletedHandler:^(id<MTLCommandBuffer> c){(void)c;for(id<MTLBuffer> b in grid_bufs)pool_put(b);}];
+    [cmd commit];
+    (void)curve;
+    return 0;
+}}
+int sonylook_metal_dro_grid_apply(const uint16_t *r,const uint16_t *g,const uint16_t *b,uint32_t w,uint32_t h,
+                                  uint32_t raww,uint32_t rawh,const int32_t *black,int32_t ox,int32_t oy,
+                                  const float *logtab,const float *curve,float log2_max,float strength,
+                                  float k_up,float k_down,float scale,const float *weights,const float *sums,
+                                  uint16_t *ro,uint16_t *go,uint16_t *bo) { @autoreleasepool {
+    if(!device||!r||!g||!b||!ro||!go||!bo||!weights||!sums||!pending_grid_value)return fail(@"Invalid prepared Metal DRO arguments");
+    DroArgs a=make_dro_args(raww,rawh,w,h,black,ox,oy,log2_max,strength,k_up,k_down,scale);
+    size_t n=(size_t)w*h;
+    id rb=in_buf(r,n*2),gb=in_buf(g,n*2),bb=in_buf(b,n*2),tab=in_buf(logtab,2049*4),cv=in_buf(curve,104*4);
+    id Wb=in_buf(weights,8*6*14*4),Sb=in_buf(sums,8*6*14*4);
+    id R=out_buf(ro,n*2),G=out_buf(go,n*2),B=out_buf(bo,n*2);
+    if(!rb||!gb||!bb||!tab||!cv||!Wb||!Sb||!R||!G||!B)return fail(@"Prepared Metal DRO allocation failed");
+    id<MTLCommandBuffer> cmd=command_buffer();
+    [cmd encodeWaitForEvent:grid_event value:pending_grid_value];
+    if(encode_dro_apply(cmd,@[rb,gb,bb,Wb,Sb,cv,tab,R,G,B],&a,w,h))return -1;
+    int rc=submit_command(cmd);if(rc)return rc;
+    copy_back(R,ro,n*2);copy_back(G,go,n*2);copy_back(B,bo,n*2);
+    return done(0);
+}}
+int sonylook_metal_dro(const uint16_t *raw,uint32_t raww,uint32_t rawh,const uint16_t *r,const uint16_t *g,const uint16_t *b,uint32_t w,uint32_t h,const int32_t *black,int32_t ox,int32_t oy,const float *logtab,const float *curve,float log2_max,float strength,float k_up,float k_down,float scale,uint16_t *ro,uint16_t *go,uint16_t *bo,float *debug_sub,float *debug_w,float *debug_s) { @autoreleasepool {
+    if(!device||!raw||!r||!g||!b||!ro||!go||!bo||raww<448||rawh<336||!w||!h)return fail(@"Invalid Metal DRO arguments");
+    DroArgs a=make_dro_args(raww,rawh,w,h,black,ox,oy,log2_max,strength,k_up,k_down,scale);
     size_t n=(size_t)w*h;
     id<MTLBuffer> rawbuf=in_buf(raw,(size_t)raww*rawh*2);
     id<MTLBuffer> rb=in_buf(r,n*2);id<MTLBuffer> gb=in_buf(g,n*2);id<MTLBuffer> bb=in_buf(b,n*2);
     id<MTLBuffer> tab=in_buf(logtab,2049*4);id<MTLBuffer> cv=in_buf(curve,104*4);
-    id<MTLBuffer> sub=acquire(112*84*4,MTLResourceStorageModeShared);id<MTLBuffer> hist=acquire(8*6*14*4,MTLResourceStorageModePrivate);id<MTLBuffer> smooth=acquire(8*6*14*4,MTLResourceStorageModePrivate);
+    id<MTLBuffer> sub=acquire(112*84*4,MTLResourceStorageModeShared);id<MTLBuffer> hist=acquire(8*6*14*4,MTLResourceStorageModePrivate);
     id<MTLBuffer> W=acquire(8*6*14*4,MTLResourceStorageModeShared);id<MTLBuffer> S=acquire(8*6*14*4,MTLResourceStorageModeShared);
     id R=out_buf(ro,n*2),G=out_buf(go,n*2),B=out_buf(bo,n*2);
-    if(!rawbuf||!rb||!gb||!bb||!tab||!cv||!sub||!hist||!smooth||!W||!S||!R||!G||!B)return fail(@"Metal DRO buffer allocation failed");
-    id<MTLCommandBuffer> cmd=[queue commandBuffer];
-    dispatch_dro(cmd,14,@[rawbuf,tab,sub],&a,112,84);dispatch_dro(cmd,15,@[sub,hist],&a,8,6);dispatch_dro(cmd,16,@[hist,smooth],&a,8,6);dispatch_dro(cmd,17,@[smooth,W,S],&a,8,6);
-    dispatch_dro(cmd,18,@[rb,gb,bb,W,S,cv,tab,R,G,B],&a,w,h);
-    [cmd commit];[cmd waitUntilCompleted];if(cmd.error)return fail(cmd.error.description);
+    if(!rawbuf||!rb||!gb||!bb||!tab||!cv||!sub||!hist||!W||!S||!R||!G||!B)return fail(@"Metal DRO buffer allocation failed");
+    id<MTLCommandBuffer> cmd=command_buffer();
+    dispatch_dro(cmd,14,@[rawbuf,tab,sub],&a,112,84);dispatch_dro(cmd,15,@[sub,hist],&a,8,6);dispatch_dro(cmd,45,@[hist,W,S],&a,8,6);
+    if(encode_dro_apply(cmd,@[rb,gb,bb,W,S,cv,tab,R,G,B],&a,w,h))return -1;
+    int rc=submit_command(cmd);if(rc)return rc;
     copy_back(R,ro,n*2);copy_back(G,go,n*2);copy_back(B,bo,n*2);
-    if(debug_sub)memcpy(debug_sub,sub.contents,112*84*4);if(debug_w)memcpy(debug_w,W.contents,8*6*14*4);if(debug_s)memcpy(debug_s,S.contents,8*6*14*4);
+    if(!batch_cmd) {
+        if(debug_sub)memcpy(debug_sub,sub.contents,112*84*4);if(debug_w)memcpy(debug_w,W.contents,8*6*14*4);if(debug_s)memcpy(debug_s,S.contents,8*6*14*4);
+    }
     return done(0);
 }}
 
@@ -266,12 +453,12 @@ int sonylook_metal_geo(const uint16_t *r,const uint16_t *g,const uint16_t *b,uin
     id<MTLBuffer> bt=in_buf(tb,n*4);
     id R=out_buf(ro,outcount*2),G=out_buf(go,outcount*2),B=out_buf(bo,outcount*2);
     if(!rb||!gb||!bb||!rt||!gt||!bt||!R||!G||!B)return fail(@"Metal GeoCorr buffer allocation failed");
-    id<MTLCommandBuffer> cmd=[queue commandBuffer];id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];
+    id<MTLCommandBuffer> cmd=command_buffer();id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];
     [e setComputePipelineState:pipelines[19]];NSArray *buffers=@[rb,gb,bb,rt,gt,bt,R,G,B];
     for(NSUInteger i=0;i<buffers.count;i++)bind(e,buffers[i],i);
     [e setBytes:&a length:sizeof(a) atIndex:buffers.count];
     [e dispatchThreads:MTLSizeMake(ow,oh,1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];[e endEncoding];
-    [cmd commit];[cmd waitUntilCompleted];if(cmd.error)return fail(cmd.error.description);
+    int rc=submit_command(cmd);if(rc)return rc;
     copy_back(R,ro,outcount*2);copy_back(G,go,outcount*2);copy_back(B,bo,outcount*2);return done(0);
 }}
 
@@ -285,13 +472,44 @@ int sonylook_metal_sscs(const uint16_t *r,const uint16_t *g,const uint16_t *b,ui
     id<MTLBuffer> bb=in_buf(b,n*2);
     id result=out_buf(out,n*6);
     if(!rb||!gb||!bb||!result)return fail(@"Metal SSCS buffer allocation failed");
-    id<MTLCommandBuffer> cmd=[queue commandBuffer];id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];
+    id<MTLCommandBuffer> cmd=command_buffer();id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];
     [e setComputePipelineState:pipelines[20]];NSArray *buffers=@[rb,gb,bb,result];
     for(NSUInteger i=0;i<buffers.count;i++)bind(e,buffers[i],i);
     [e setBytes:&a length:sizeof(a) atIndex:buffers.count];
     [e dispatchThreads:MTLSizeMake(w,h,1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];[e endEncoding];
-    [cmd commit];[cmd waitUntilCompleted];if(cmd.error)return fail(cmd.error.description);
+    int rc=submit_command(cmd);if(rc)return rc;
     copy_back(result,out,n*6);return done(0);
+}}
+
+typedef struct { GeoArgs geo; SscsArgs sscs; } GeoSscsArgs;
+// GeoCorr and SSCS fused: sampled uint16 values feed SSCS in the same kernel,
+// and the final result is written directly as interleaved RGB.
+int sonylook_metal_geo_sscs(const uint16_t *r,const uint16_t *g,const uint16_t *b,uint32_t w,uint32_t h,
+                            int32_t ox,int32_t oy,int32_t rx,int32_t ry,uint32_t ow,uint32_t oh,
+                            const float *lens,const float *tr,const float *tg,const float *tb,uint32_t n,
+                            const int32_t *params,uint16_t *out) { @autoreleasepool {
+    if(!device||!r||!g||!b||!out||!w||!h||!ow||!oh||n<2||!params)return fail(@"Invalid Metal GeoCorr+SSCS arguments");
+    GeoSscsArgs a={.geo={.width=w,.height=h,.output_width=ow,.output_height=oh,.origin_x=ox,.origin_y=oy,
+                         .region_x=rx,.region_y=ry,.cx=lens[0],.cy=lens[1],.s=lens[2],.s2=lens[3],.step=lens[4],.n=n},
+                   .sscs={.width=ow,.height=oh,.t=params[0],.tr=params[1],.tg=params[2],.tb=params[3],
+                          .wr=params[4],.wg=params[5],.wb=params[6]}};
+    memcpy(a.geo.off,lens+5,sizeof(a.geo.off));
+    size_t count=(size_t)w*h,outcount=(size_t)ow*oh;
+    id<MTLBuffer> rb=in_buf(r,count*2);
+    id<MTLBuffer> gb=in_buf(g,count*2);
+    id<MTLBuffer> bb=in_buf(b,count*2);
+    id<MTLBuffer> rt=in_buf(tr,n*4);
+    id<MTLBuffer> gt=in_buf(tg,n*4);
+    id<MTLBuffer> bt=in_buf(tb,n*4);
+    id result=out_buf(out,outcount*6);
+    if(!rb||!gb||!bb||!rt||!gt||!bt||!result)return fail(@"Metal GeoCorr+SSCS buffer allocation failed");
+    id<MTLCommandBuffer> cmd=command_buffer();id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];
+    [e setComputePipelineState:pipelines[41]];NSArray *buffers=@[rb,gb,bb,rt,gt,bt,result];
+    for(NSUInteger i=0;i<buffers.count;i++)bind(e,buffers[i],i);
+    [e setBytes:&a length:sizeof(a) atIndex:buffers.count];
+    [e dispatchThreads:MTLSizeMake(ow,oh,1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];[e endEncoding];
+    int rc=submit_command(cmd);if(rc)return rc;
+    copy_back(result,out,outcount*6);return done(0);
 }}
 
 typedef struct { uint32_t width,height; float thresholds[3]; } LookArgs;
@@ -304,7 +522,7 @@ int sonylook_metal_look(const uint16_t *rgb,uint32_t w,uint32_t h,const float *t
     id<MTLBuffer> ab=in_buf(atan,512*4);
     id result=out_buf(out,n*6);
     if(!rgbb||!tab||!gb||!ab||!result)return fail(@"Metal Look buffer allocation failed");
-    id<MTLCommandBuffer> cmd=[queue commandBuffer];id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];
+    id<MTLCommandBuffer> cmd=own_command_buffer();if(!cmd)return -1;id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];
     [e setComputePipelineState:pipelines[21]];NSArray *buffers=@[rgbb,tab,gb,ab,result];
     for(NSUInteger i=0;i<buffers.count;i++)bind(e,buffers[i],i);
     [e setBytes:&a length:sizeof(a) atIndex:buffers.count];[e dispatchThreads:MTLSizeMake(w,h,1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];[e endEncoding];
@@ -317,7 +535,7 @@ static int run_front(int kernel,NSArray *inputs,uint32_t w,uint32_t h,const Fron
     id yb=out_buf(y,n*2),crb=out_buf(cr,n*2),cbb=out_buf(cb,n*2);
     if(!yb||!crb||!cbb)return fail(@"Metal front buffer allocation failed");
     NSArray *buffers=[inputs arrayByAddingObjectsFromArray:@[yb,crb,cbb]];
-    id<MTLCommandBuffer> cmd=[queue commandBuffer];id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];
+    id<MTLCommandBuffer> cmd=own_command_buffer();if(!cmd)return -1;id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];
     [e setComputePipelineState:pipelines[kernel]];
     for(NSUInteger i=0;i<buffers.count;i++)bind(e,buffers[i],i);
     [e setBytes:&a length:sizeof(a) atIndex:buffers.count];[e dispatchThreads:MTLSizeMake(w,h,1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];[e endEncoding];
@@ -372,7 +590,7 @@ static NSArray *out3(uint16_t *r,uint16_t *g,uint16_t *b,size_t len) {
     id x=out_buf(r,len),y=out_buf(g,len),z=out_buf(b,len);return (x&&y&&z)?@[x,y,z]:nil;
 }
 static int finish_rgb(id<MTLCommandBuffer> cmd,NSArray *rgb,size_t n,uint16_t *r,uint16_t *g,uint16_t *b) {
-    [cmd commit];[cmd waitUntilCompleted];if(cmd.error)return fail(cmd.error.description);
+    int rc=submit_command(cmd);if(rc)return rc;
     copy_back(rgb[0],r,n*2);copy_back(rgb[1],g,n*2);copy_back(rgb[2],b,n*2);return done(0);
 }
 int sonylook_metal_spatial(const uint16_t *y,const uint16_t *cr,const uint16_t *cb,uint32_t w,uint32_t h,const SpatialArgs *args,const int16_t *ylut,const int32_t *patterns,const float *coefs,uint16_t *r,uint16_t *g,uint16_t *b) { @autoreleasepool {
@@ -383,7 +601,7 @@ int sonylook_metal_spatial(const uint16_t *y,const uint16_t *cr,const uint16_t *
     id<MTLBuffer> cbb=in_buf(cb,n*2);
     NSArray *rgb=out3(r,g,b,n*2);
     if(!yb||!crb||!cbb||!rgb)return fail(@"Metal spatial buffer allocation failed");
-    id<MTLCommandBuffer> cmd=[queue commandBuffer];
+    id<MTLCommandBuffer> cmd=command_buffer();
     if(encode_spatial(cmd,yb,crb,cbb,w,h,args,ylut,patterns,coefs,rgb))return -1;
     return finish_rgb(cmd,rgb,n,r,g,b);
 }}
@@ -397,18 +615,26 @@ int sonylook_metal_front_spatial(const uint16_t *rgbin,uint32_t w,uint32_t h,con
     id<MTLBuffer> ab=in_buf(atan,512*4);
     NSArray *ycc=new_buffers(3,n*2,MTLResourceStorageModePrivate),*rgb=out3(r,g,b,n*2);
     if(!rgbb||!tab||!gb||!ab||!ycc||!rgb)return fail(@"Metal front/spatial buffer allocation failed");
-    id<MTLCommandBuffer> cmd=[queue commandBuffer];
+    id<MTLCommandBuffer> cmd=command_buffer();
     encode_grid(cmd,22,[@[rgbb,tab,gb,ab] arrayByAddingObjectsFromArray:ycc],&fa,sizeof(fa),w,h);
     if(encode_spatial(cmd,ycc[0],ycc[1],ycc[2],w,h,args,ylut,patterns,coefs,rgb))return -1;
     return finish_rgb(cmd,rgb,n,r,g,b);
 }}
 
+typedef struct { uint32_t width,height,capacity; int32_t effect,conv,m_fwd[9],m_inv[9]; float t_r,t_b,c_hi[3],c_lo[3]; int32_t tone,shade,cw,ch; float g_hi[11],g_lo[11],d_hi[10],d_lo[10]; uint32_t diff_zero,lo_one; int32_t c10_one; } PostArgs;
 typedef struct { uint32_t width,height,w4,h4,n8w,n8h; int32_t m_fwd[9],m_inv[9]; int32_t thr_y,a_y,g20,g24,lo_l,hi_l,gate,g34,g38,g3c,g40; float f; int32_t inset;
     int32_t lum_on,bnr,blk,nbw,nbh; uint32_t d0; int32_t cc,c8,c4,c0,bc,b8,b4,b0,ac,a8,l98,l90,l88,t7c,t80; int32_t up_t[4]; } MarbleArgs;
+typedef struct { MarbleArgs m; uint32_t shift; } MarblePackArgs;
 // ZcTaskMarble on whole planes: the luma path when lum_on, the chroma path when bnr.
 // tables: initial dec/enc, final dec/enc (0x4000 int16 each); upw: chroma upsample weights.
-int sonylook_metal_marble(const uint16_t *r,const uint16_t *g,const uint16_t *b,uint32_t w,uint32_t h,const MarbleArgs *args,const int16_t *dec_in,const int16_t *enc_in,const int16_t *dec_out,const int16_t *enc_out,const int32_t *upw,uint32_t upw_len,uint16_t *ro,uint16_t *go,uint16_t *bo) { @autoreleasepool {
-    if(!device||!r||!g||!b||w<10||h<10||!args||!dec_in||!enc_in||!dec_out||!enc_out||!upw||!ro||!go||!bo)return fail(@"Invalid Metal Marble arguments");
+// post == NULL runs Marble alone. Otherwise the final pixel feeds Effect,
+// ToneCurve and ShadeCorrection in the same kernel; fix/nfix receive the
+// pixels that must be recomputed by the host reference implementation.
+int sonylook_metal_marble(const uint16_t *r,const uint16_t *g,const uint16_t *b,uint32_t w,uint32_t h,const MarbleArgs *args,const int16_t *dec_in,const int16_t *enc_in,const int16_t *dec_out,const int16_t *enc_out,const int32_t *upw,uint32_t upw_len,const PostArgs *post,const int16_t *pdec_in,const int16_t *penc_in,const int16_t *pdec_out,const int16_t *penc_out,const uint16_t *luts,uint16_t *ro,uint16_t *go,uint16_t *bo,uint32_t *fix,uint32_t *nfix,uint16_t *fixrgb,uint16_t *packed,uint32_t shift) { @autoreleasepool {
+    if(!device||!r||!g||!b||w<10||h<10||!args||!dec_in||!enc_in||!dec_out||!enc_out||!upw)return fail(@"Invalid Metal Marble arguments");
+    if(!packed&&(!ro||!go||!bo))return fail(@"Invalid Metal Marble output arguments");
+    if(post&&(!pdec_in||!penc_in||!pdec_out||!penc_out||!luts||!fix||!nfix||!fixrgb))return fail(@"Invalid fused Marble + Post arguments");
+    if(post&&batch_cmd)return fail(@"A fused Marble + Post pass must own its command buffer");
     size_t n=(size_t)w*h;MarbleArgs a=*args;a.width=w;a.height=h;
     a.w4=(w+3)&~3u;a.h4=(h+3)&~3u;a.n8w=(a.w4+7)>>3;a.n8h=(a.h4+7)>>3;
     if(a.bnr&&(a.blk!=4&&a.blk!=8))return fail(@"Marble chroma block size must be 4 or 8");
@@ -417,12 +643,25 @@ int sonylook_metal_marble(const uint16_t *r,const uint16_t *g,const uint16_t *b,
     id rb=in_buf(r,n*2),gb=in_buf(g,n*2),bb=in_buf(b,n*2),ub=in_buf(upw,(size_t)upw_len*4);
     id t[4];const int16_t *tabs[4]={dec_in,enc_in,dec_out,enc_out};
     for(int i=0;i<4;i++){t[i]=in_buf(tabs[i],0x4000*2);if(!t[i])return fail(@"Metal Marble buffer allocation failed");}
-    NSArray *ycc=new_buffers(3,n*2,MTLResourceStorageModePrivate),*half=new_buffers(2,hn*2,MTLResourceStorageModePrivate),*rgb=out3(ro,go,bo,n*2);
+    NSArray *ycc=new_buffers(3,n*2,MTLResourceStorageModePrivate),*half=new_buffers(2,hn*2,MTLResourceStorageModePrivate),*rgb=packed?nil:out3(ro,go,bo,n*2);
+    id packed_buf=packed?out_buf(packed,n*6):nil;
     id<MTLBuffer> m=acquire((size_t)a.n8w*a.n8h*4,MTLResourceStorageModePrivate);
     id<MTLBuffer> q=acquire((size_t)(a.n8w+12)*(a.n8h+12)*4,MTLResourceStorageModePrivate);
     id<MTLBuffer> q2=acquire((size_t)a.n8w*a.n8h*4,MTLResourceStorageModePrivate);
-    if(!rb||!gb||!bb||!ub||!ycc||!half||!rgb||!m||!q||!q2)return fail(@"Metal Marble buffer allocation failed");
-    id<MTLCommandBuffer> cmd=[queue commandBuffer];
+    if(!rb||!gb||!bb||!ub||!ycc||!half||(!packed&&!rgb)||(packed&&!packed_buf)||!m||!q||!q2)return fail(@"Metal Marble buffer allocation failed");
+    PostArgs pa;const int16_t *ptabs[4]={pdec_in,penc_in,pdec_out,penc_out};id pb[4]={nil,nil,nil,nil},mab=nil,lb=nil,fb=nil,cb=nil,fib=nil;
+    uint32_t zero=0;
+    if(post) {
+        pa=*post;pa.width=w;pa.height=h;
+        mab=in_buf(&a,sizeof(a));
+        for(int i=0;i<4;i++){pb[i]=in_buf(ptabs[i],0x4000*2);if(!pb[i])return fail(@"Metal fused Post table allocation failed");}
+        lb=in_buf(luts,4*0x10000*2);
+        fb=acquire((size_t)(pa.capacity?pa.capacity:1)*4,MTLResourceStorageModeShared);
+        fib=acquire((size_t)(pa.capacity?pa.capacity:1)*6,MTLResourceStorageModeShared);
+        cb=in_buf(&zero,4);
+        if(!mab||!lb||!fb||!fib||!cb)return fail(@"Metal fused Post buffer allocation failed");
+    }
+    id<MTLCommandBuffer> cmd=command_buffer();
     encode_grid(cmd,27,[@[rb,gb,bb,t[0],t[1]] arrayByAddingObjectsFromArray:ycc],&a,sizeof(a),w,h);
     encode_grid(cmd,35,@[ycc[1],ycc[2],half[0],half[1]],&a,sizeof(a),a.w4/2,a.h4);
     if(a.lum_on) {
@@ -445,11 +684,39 @@ int sonylook_metal_marble(const uint16_t *r,const uint16_t *g,const uint16_t *b,
         encode_grid(cmd,38,@[qc[0],qc[1],ub,half[1],oc[0],oc[1]],&a,sizeof(a),a.w4/2,a.h4);
         hc=oc;
     }
-    encode_grid(cmd,31,[[[ycc arrayByAddingObjectsFromArray:@[q2,rb,gb,bb,t[2],t[3]]] arrayByAddingObjectsFromArray:rgb] arrayByAddingObjectsFromArray:hc],&a,sizeof(a),w,h);
-    return finish_rgb(cmd,rgb,n,ro,go,bo);
+    if(post) {
+        // Packed: one interleaved output, bound in all three plane slots.
+        NSArray *outs=packed?@[packed_buf,packed_buf,packed_buf]:rgb;
+        NSArray *buffers=[[[[[ycc arrayByAddingObjectsFromArray:@[q2,rb,gb,bb,t[2],t[3]]] arrayByAddingObjectsFromArray:hc]
+                           arrayByAddingObject:mab]
+                           arrayByAddingObjectsFromArray:@[pb[0],pb[1],pb[2],pb[3],lb]]
+                          arrayByAddingObjectsFromArray:outs];
+        buffers=[buffers arrayByAddingObjectsFromArray:@[fb,cb,fib]];
+        uint32_t layout[2]={packed?1u:0u,shift};
+        id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];[e setComputePipelineState:pipelines[46]];
+        for(NSUInteger i=0;i<buffers.count;i++)bind(e,buffers[i],i);
+        [e setBytes:&pa length:sizeof(pa) atIndex:buffers.count];
+        [e setBytes:layout length:sizeof(layout) atIndex:buffers.count+1];
+        [e dispatchThreads:MTLSizeMake(w,h,1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];[e endEncoding];
+    } else if(packed) {
+        MarblePackArgs pa={a,shift};
+        NSArray *buffers=[[ycc arrayByAddingObjectsFromArray:@[q2,rb,gb,bb,t[2],t[3]]] arrayByAddingObjectsFromArray:@[packed_buf]];
+        buffers=[buffers arrayByAddingObjectsFromArray:hc];
+        encode_grid(cmd,49,buffers,&pa,sizeof(pa),w,h);
+    } else {
+        encode_grid(cmd,31,[[[ycc arrayByAddingObjectsFromArray:@[q2,rb,gb,bb,t[2],t[3]]] arrayByAddingObjectsFromArray:rgb] arrayByAddingObjectsFromArray:hc],&a,sizeof(a),w,h);
+    }
+    int rc=submit_command(cmd);if(rc)return rc;
+    if(packed)copy_back(packed_buf,packed,n*6);
+    else {copy_back(rgb[0],ro,n*2);copy_back(rgb[1],go,n*2);copy_back(rgb[2],bo,n*2);}
+    if(post){
+        *nfix=*(uint32_t *)[cb contents];
+        size_t kept=(size_t)MIN(*nfix,pa.capacity);
+        memcpy(fix,[fb contents],kept*4);memcpy(fixrgb,[fib contents],kept*6);
+    }
+    return done(0);
 }}
 
-typedef struct { uint32_t width,height,capacity; int32_t effect,conv,m_fwd[9],m_inv[9]; float t_r,t_b,c_hi[3],c_lo[3]; int32_t tone,shade,cw,ch; float g_hi[11],g_lo[11],d_hi[10],d_lo[10]; uint32_t diff_zero,lo_one; int32_t c10_one; } PostArgs;
 // Effect, ToneCurve and ShadeCorrection. Pixels the GPU cannot decide exactly
 // are listed in fix[0..min(*nfix, capacity)); the caller recomputes them.
 int sonylook_metal_post(const uint16_t *r,const uint16_t *g,const uint16_t *b,uint32_t w,uint32_t h,const PostArgs *args,const int16_t *dec_in,const int16_t *enc_in,const int16_t *dec_out,const int16_t *enc_out,const uint16_t *luts,uint16_t *ro,uint16_t *go,uint16_t *bo,uint32_t *fix,uint32_t *nfix) { @autoreleasepool {
@@ -465,14 +732,13 @@ int sonylook_metal_post(const uint16_t *r,const uint16_t *g,const uint16_t *b,ui
     uint32_t zero=0;id<MTLBuffer> cb=in_buf(&zero,4);
     NSArray *rgb=out3(ro,go,bo,n*2);
     if(!rb||!gb||!bb||!lb||!fb||!cb||!rgb)return fail(@"Metal post buffer allocation failed");
-    id<MTLCommandBuffer> cmd=[queue commandBuffer];
+    id<MTLCommandBuffer> cmd=own_command_buffer();if(!cmd)return -1;
     encode_grid(cmd,32,[[@[rb,gb,bb,t[0],t[1],t[2],t[3],lb] arrayByAddingObjectsFromArray:rgb] arrayByAddingObjectsFromArray:@[fb,cb]],&a,sizeof(a),w,h);
     [cmd commit];[cmd waitUntilCompleted];if(cmd.error)return fail(cmd.error.description);
     copy_back(rgb[0],ro,n*2);copy_back(rgb[1],go,n*2);copy_back(rgb[2],bo,n*2);
     *nfix=*(uint32_t *)[cb contents];memcpy(fix,[fb contents],(size_t)MIN(*nfix,a.capacity)*4);return done(0);
 }}
 
-typedef struct { uint32_t width,height; int32_t off[3],gain[3],lim[3],wm[3]; float s; } NrArgs;
 // ZcTaskRawNR on the whole raw. thr: three 0x8000-entry threshold tables.
 int sonylook_metal_rawnr(const uint16_t *raw,uint32_t w,uint32_t h,const NrArgs *args,const int32_t *thr,uint16_t *out) { @autoreleasepool {
     if(!device||!raw||!out||!args||!thr||w<21||h<21)return fail(@"Invalid Metal RawNR arguments");
@@ -480,22 +746,23 @@ int sonylook_metal_rawnr(const uint16_t *raw,uint32_t w,uint32_t h,const NrArgs 
     id rb=in_buf(raw,n*2),tb=in_buf(thr,3*0x8000*4),ob=out_buf(out,n*2);
     id<MTLBuffer> hp=acquire(n*2,MTLResourceStorageModePrivate),base=acquire(n*2,MTLResourceStorageModePrivate);
     if(!rb||!tb||!ob||!hp||!base)return fail(@"Metal RawNR buffer allocation failed");
-    id<MTLCommandBuffer> cmd=[queue commandBuffer];
+    id<MTLCommandBuffer> cmd=command_buffer();
     encode_grid(cmd,33,@[rb,hp,base],&a,sizeof(a),w,h);
     encode_grid(cmd,34,@[rb,hp,base,tb,ob],&a,sizeof(a),w,h);
-    [cmd commit];[cmd waitUntilCompleted];if(cmd.error)return fail(cmd.error.description);
+    int rc=submit_command(cmd);if(rc)return rc;
     copy_back(ob,out,n*2);return done(0);
 }}
 
-// Three uint16 planes -> one H x W x 3 interleaved image.
-int sonylook_metal_interleave(const uint16_t *r,const uint16_t *g,const uint16_t *b,uint32_t w,uint32_t h,uint16_t *out) { @autoreleasepool {
+// Three uint16 planes -> one H x W x 3 interleaved image. shift=2 writes
+// Edit's 16-bit TIFF values directly (14-bit encoded value << 2).
+int sonylook_metal_interleave(const uint16_t *r,const uint16_t *g,const uint16_t *b,uint32_t w,uint32_t h,uint32_t shift,uint16_t *out) { @autoreleasepool {
     if(!device||!r||!g||!b||!out||!w||!h)return fail(@"Invalid Metal interleave arguments");
-    size_t n=(size_t)w*h;uint32_t dims[2]={w,h};
+    size_t n=(size_t)w*h;struct {uint32_t width,height,shift;} dims={w,h,shift};
     id rb=in_buf(r,n*2),gb=in_buf(g,n*2),bb=in_buf(b,n*2),ob=out_buf(out,n*6);
     if(!rb||!gb||!bb||!ob)return fail(@"Metal interleave buffer allocation failed");
-    id<MTLCommandBuffer> cmd=[queue commandBuffer];
-    encode_grid(cmd,40,@[rb,gb,bb,ob],dims,sizeof(dims),w,h);
-    [cmd commit];[cmd waitUntilCompleted];if(cmd.error)return fail(cmd.error.description);
+    id<MTLCommandBuffer> cmd=command_buffer();
+    encode_grid(cmd,40,@[rb,gb,bb,ob],&dims,sizeof(dims),w,h);
+    int rc=submit_command(cmd);if(rc)return rc;
     copy_back(ob,out,n*6);return done(0);
 }}
 
@@ -504,7 +771,7 @@ int sonylook_metal_dro_math(const float *a,const float *b,uint32_t n,float *e2,f
     if(!device||!a||!b||!e2||!q||!n)return fail(@"Invalid Metal DRO math arguments");
     id ab=in_buf(a,(size_t)n*4),bb=in_buf(b,(size_t)n*4),eb=out_buf(e2,(size_t)n*4),qb=out_buf(q,(size_t)n*4);
     if(!ab||!bb||!eb||!qb)return fail(@"Metal DRO math buffer allocation failed");
-    id<MTLCommandBuffer> cmd=[queue commandBuffer];id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];
+    id<MTLCommandBuffer> cmd=own_command_buffer();if(!cmd)return -1;id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];
     [e setComputePipelineState:pipelines[39]];NSArray *bufs=@[ab,bb,eb,qb];
     for(NSUInteger i=0;i<bufs.count;i++)bind(e,bufs[i],i);
     [e setBytes:&n length:4 atIndex:4];[e dispatchThreads:MTLSizeMake(n,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];[e endEncoding];

@@ -14,8 +14,8 @@ class NrArgs(ctypes.Structure):
                 ("lim", ctypes.c_int32 * 3), ("wm", ctypes.c_int32 * 3), ("s", ctypes.c_float)]
 
 
-def apply(raw, look, iso=100, settings=(0, 0, 0), strength_override=None):
-    """RawNR on a uint16 RGGB raw (RGGB at even/even); returns a new uint16 array."""
+def prepare(raw, look, iso=100, settings=(0, 0, 0), strength_override=None):
+    """Parameter block and threshold tables for Metal RawNR."""
     raw = np.ascontiguousarray(raw, dtype=np.uint16)
     if raw.ndim != 2 or min(raw.shape) < 21:
         raise ValueError("expected a 2D raw of at least 21 x 21")
@@ -30,6 +30,21 @@ def apply(raw, look, iso=100, settings=(0, 0, 0), strength_override=None):
         a.wm[k] = int(tb["W"][k])
     a.s = float(s)
     thr = np.ascontiguousarray(np.stack([np.asarray(t, np.int64) for t in tb["T"]]), dtype=np.int32)
+    return a, thr
+
+
+def apply(raw, look, iso=100, settings=(0, 0, 0), strength_override=None):
+    """RawNR on a uint16 RGGB raw (RGGB at even/even); returns a new uint16 array."""
+    raw = np.ascontiguousarray(raw, dtype=np.uint16)
+    a, thr = prepare(raw, look, iso=iso, settings=settings, strength_override=strength_override)
+    return apply_prepared(raw, a, thr)
+
+
+def apply_prepared(raw, args, thresholds):
+    """RawNR using an existing prepare() result."""
+    raw = np.ascontiguousarray(raw, dtype=np.uint16)
+    a = args
+    thr = np.ascontiguousarray(thresholds, dtype=np.int32)
     out = metal_itp.empty(raw.shape)
     lib = metal_itp._load()
     lib.sonylook_metal_rawnr.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,

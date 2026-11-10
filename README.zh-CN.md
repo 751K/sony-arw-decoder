@@ -39,10 +39,10 @@ Rust 与 Metal 可选，也可以组合使用。NumPy 始终作为逐阶段和�
 | --- | ---: | ---: |
 | NumPy | 24.92 秒 | 1.0× |
 | Rust | 1.79 秒 | 13.9× |
-| Metal | 0.35 秒 | 71.2× |
-| Rust + Metal | 0.22 秒 | 113.3× |
+| Metal | 0.203 秒 | 122.8× |
+| Rust + Metal | 0.203 秒 | 122.8× |
 
-四种路径的整图输出哈希完全一致。新进程中的首次解码还会包含初始化、表构建和 Metal 着色器编译，因此耗时更高。以上数据基于一张合成 ARW，不代表所有相机型号或显影设置下的通用性能。
+使用 `--metal` 时，如果 Rust 库可用，会自动使用 Rust 读取 RAW 并构建外观表。GPU 阶段分为 RAW 链和渲染链两条 command buffer 提交；GeoCorr 与 SSCS、Marble 与 Effect/ToneCurve/ShadeCorrection 分别在同一个 kernel 内完成。设置 `SONYLOOK_METAL_BATCH=0` 可恢复逐阶段提交。四种路径的整图输出哈希完全一致。新进程中的首次解码还会包含初始化、表构建和 Metal 着色器编译，因此耗时更高。以上数据基于一张合成 ARW，不代表所有相机型号或显影设置下的通用性能。
 
 ## 安装
 
@@ -61,9 +61,10 @@ cargo build --release --manifest-path rust/sonylook_core/Cargo.toml
 在 macOS 上构建 Metal 桥接层：
 
 ```bash
-clang -O2 -fobjc-arc -dynamiclib -framework Foundation -framework Metal \
-  metal/bridge.m -o metal/libsonylook_metal.dylib
+./metal/build.sh
 ```
+
+完整 Metal 工具链可用时，脚本会预编译 `metal/shaders/shaders.metallib`；否则生成动态库，并让运行时从 shader 源码编译。
 
 ## 解码
 
@@ -81,9 +82,10 @@ from base.sony_decode import decode
 
 image = decode("photo.ARW")
 fast_image = decode("photo.ARW", rust=True, metal=True)
+export_image = decode("photo.ARW", metal=True, output_bits=16)
 ```
 
-`decode()` 返回形状为 `(height, width, 3)` 的 `uint16` 数组。
+`decode()` 默认返回形状为 `(height, width, 3)`、范围 0–16383 的 `uint16` 数组。`output_bits=16` 返回 Edit 的 16 位 TIFF 编码，即每个值严格等于 14 位结果左移两位；Metal 路径在最终交错 kernel 中直接完成这一步。命令行导出 16 位 TIFF 时自动采用该路径。
 
 ## 验证
 
@@ -92,6 +94,9 @@ python3 tests/verify_raw_decode.py photo.ARW
 python3 tests/verify_rust_nr_dro.py photo.ARW
 python3 tests/verify_metal_itp.py photo.ARW
 python3 tests/verify_metal_geo.py photo.ARW
+python3 tests/verify_metal_geo_sscs.py photo.ARW
+python3 tests/verify_metal_batch.py photo.ARW
+python3 tests/verify_metal_export.py photo.ARW
 python3 tests/verify_metal_sscs.py photo.ARW
 python3 tests/verify_metal_look.py photo.ARW
 python3 tests/verify_metal_spatial.py photo.ARW

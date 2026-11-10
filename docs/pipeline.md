@@ -419,14 +419,14 @@ RAW → [RawNR] → ITP → [DRO] → [GeoCorr] → SSCS → LinearMatrix16 → 
 ```
 
 - **设置**：`effective_settings(arw)`（§7）。外观、各阶段开关和所有滑块都从这里来，显式参数可覆盖。
-- **输出**：解码器矩形，A7M5 为 7008×4672，uint16 0..16383（14 位编码）。
+- **输出**：解码器矩形，A7M5 为 7008×4672。默认使用 uint16 0..16383（14 位编码）；`output_bits=16` 直接返回 TIFF 的 `value << 2` 编码。
 - **边缘**：空间阶段在解码矩形外多取 32 px 真实 RAW（`pad=32`）上运行，最后裁回。
 - **分条**：外观链按 512 行一条处理，每条在 [y−8, y+8) 上跑逐像素部分，Spica 用精确的 [y−3, y+3) 子条；Marble 按行分块，上下各留 12 个块的上下文；DRO 按 256 行、GeoCorr 按 512 行。结果与整图处理逐位一致。
 
 ### 9.2 输出色彩空间与文件格式（`sony_export.py`）
 
 - **色彩空间**：`output="srgb" | "adobe"`。同一个 render+0x44 同时传给 LinearMatrix16、Marble 和 Effect。
-- **位深**：Edit 的 16 位 TIFF 是 14 位值 << 2（最大 65532）；8 位是 14 位值 >> 6，直接截断。
+- **位深**：Edit 的 16 位 TIFF 是 14 位值 << 2（最大 65532）；8 位是 14 位值 >> 6，直接截断。Metal 的 16 位路径在最终交错 kernel 中完成移位，不建立全图中间副本。
 - **ICC**：Edit 只在 AdobeRGB 时嵌入 `Sony_AdobeRGB_1998.icc`（EXIF ColorSpace = 0xFFFF），sRGB 导出不嵌（ColorSpace = 1）。本实现两种都嵌，配置文件运行时从本机 Edit 安装目录读取。
 
 ### 9.3 性能（Mac mini，Apple M6，A7M5 7008×4672）
@@ -455,6 +455,7 @@ macOS 上，RAW 读取之后的全部阶段都有可选的 Metal GPU 实现，�
 
 - 除 ITP 外，各阶段输出与 NumPy 逐位一致。DRO 使用自行实现的正确舍入除法和定点 `exp2`；Effect、ShadeCorrection 中的 float64 运算用双 float 求值，无法确定结果的像素由 CPU 重新计算。ITP 的部分求和使用 float32，个别值可能相差 1；真实 ARW 整图解码中没有出现差异。
 - 各阶段的输出留在 GPU 可见的共享内存中，相邻阶段之间不发生复制。
+- GeoCorr 与 SSCS、Marble 与 Post 分别融合到同一个 kernel；不确定的双 float 后处理像素仍保存 Post 前值并由 CPU 参考实现回填。
 - 构建、选项、内存、性能和验证脚本见 [Metal 加速](metal.md)。
 
 ## 10. 与 Edit 成片和其他版本的对照

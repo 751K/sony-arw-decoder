@@ -625,7 +625,36 @@ def lut3d_apply(y, cr, cb, lut):
 
 # --- inverse tone tables used by the ChromaSuppress threshold (FUN_1000d50f8) ---------------
 
+_INVERSE_CACHE = {}
+
+
+def _inverse_cached(kind, build, lut):
+    """Inverse tables depend only on the LUT contents; a decode rebuilds the
+    same ones for every image (~9 ms in Python), so keep a few by content hash."""
+    import hashlib
+    a = np.ascontiguousarray(np.asarray(lut).astype(np.int16))
+    key = (kind, a.size, hashlib.blake2b(a.tobytes(), digest_size=16).digest())
+    out = _INVERSE_CACHE.get(key)
+    if out is None:
+        out = build(a)
+        out.flags.writeable = False
+        if len(_INVERSE_CACHE) >= 16:
+            _INVERSE_CACHE.pop(next(iter(_INVERSE_CACHE)))
+        _INVERSE_CACHE[key] = out
+    return out
+
+
 def inverse_lut_centered(lut):
+    """FUN_1000c2618 (cached by LUT contents; the result is read-only)."""
+    return _inverse_cached("centered", _inverse_lut_centered, lut)
+
+
+def inverse_lut_positive(lut):
+    """FUN_1000c2690 (cached by LUT contents; the result is read-only)."""
+    return _inverse_cached("positive", _inverse_lut_positive, lut)
+
+
+def _inverse_lut_centered(lut):
     """FUN_1000c2618: render+0x69962 from the MainGamma LUT at render+0x18f6.
 
     lut: 65536 int16 entries indexed by (x + 0x8000). Returns 65536 int16 entries indexed by
@@ -642,7 +671,7 @@ def inverse_lut_centered(lut):
     return out.view(np.int16)
 
 
-def inverse_lut_positive(lut):
+def _inverse_lut_positive(lut):
     """FUN_1000c2690: render+0x89962 from the YGamma LUT at render+0x218fc (16384 entries)."""
     lut = np.asarray(lut).astype(np.int16).astype(np.int64)
     out = np.zeros(0x4000, np.uint16)

@@ -21,6 +21,7 @@ struct PostArgs {
     uint diff_zero,lo_one;   // per-index bits: difference exactly 0, coefficient exactly 1
     int c10_one;
 };
+struct MarblePackArgs { MarbleArgs m; uint shift; };
 struct dd { float hi,lo; };
 inline dd two_sum(float a,float b) { float s=a+b,bb=s-a;return {s,(a-(s-bb))+(b-bb)}; }
 inline dd fast_two_sum(float a,float b) { float s=a+b;return {s,b-(s-a)}; }
@@ -130,9 +131,54 @@ kernel void post_apply(device const ushort *ri [[buffer(0)]],device const ushort
     ro[i]=ushort(v[0]);go[i]=ushort(v[1]);bo[i]=ushort(v[2]);
 }
 
+// Marble's final pixel and Effect -> ToneCurve -> ShadeCorrection in one
+// thread. The inputs and output have the same layout as marble_out.
+kernel void marble_out_post(
+        device const ushort *y [[buffer(0)]],device const ushort *cb [[buffer(1)]],device const ushort *cr [[buffer(2)]],
+        device const int *q [[buffer(3)]],device const ushort *r0 [[buffer(4)]],device const ushort *g0 [[buffer(5)]],
+        device const ushort *b0 [[buffer(6)]],device const short *mdec [[buffer(7)]],device const short *menc [[buffer(8)]],
+        device const ushort *hcb [[buffer(9)]],device const ushort *hcr [[buffer(10)]],constant MarbleArgs &ma [[buffer(11)]],
+        device const short *dec_in [[buffer(12)]],device const short *enc_in [[buffer(13)]],
+        device const short *dec_out [[buffer(14)]],device const short *enc_out [[buffer(15)]],
+        device const ushort *luts [[buffer(16)]],device ushort *ro [[buffer(17)]],device ushort *go [[buffer(18)]],
+        device ushort *bo [[buffer(19)]],device uint *fix [[buffer(20)]],device atomic_uint *nfix [[buffer(21)]],
+        device ushort *fixrgb [[buffer(22)]],constant PostArgs &a [[buffer(23)]],
+        constant uint2 &layout [[buffer(24)]],uint2 p [[thread_position_in_grid]]) {
+    // layout.x = 1: ro is one interleaved H x W x 3 output (go/bo unused), each
+    // value shifted left by layout.y; 0: three planes, unshifted.
+    if(p.x>=a.width||p.y>=a.height)return;
+    ushort rgb[3];
+    marble_pixel(y,cb,cr,q,r0,g0,b0,mdec,menc,hcb,hcr,ma,p,rgb);
+    int v[3]={int(rgb[0]),int(rgb[1]),int(rgb[2])};
+    bool ok=true;
+    if(a.effect)ok=effect(v,dec_in,enc_in,dec_out,enc_out,a);
+    if(ok&&a.tone)tone(v,luts);
+    if(ok&&a.shade)ok=shade(v,p.x,p.y,a);
+    if(!ok){uint k=atomic_fetch_add_explicit(nfix,1u,memory_order_relaxed);if(k<a.capacity){
+        fix[k]=p.y*a.width+p.x;fixrgb[3*k]=rgb[0];fixrgb[3*k+1]=rgb[1];fixrgb[3*k+2]=rgb[2];
+    }}
+    uint i=p.y*a.width+p.x;
+    if(layout.x){ro[3*i]=ushort(uint(v[0])<<layout.y);ro[3*i+1]=ushort(uint(v[1])<<layout.y);ro[3*i+2]=ushort(uint(v[2])<<layout.y);}
+    else{ro[i]=ushort(v[0]);go[i]=ushort(v[1]);bo[i]=ushort(v[2]);}
+}
+
+kernel void marble_out_packed(
+        device const ushort *y [[buffer(0)]],device const ushort *cb [[buffer(1)]],device const ushort *cr [[buffer(2)]],
+        device const int *q [[buffer(3)]],device const ushort *r0 [[buffer(4)]],device const ushort *g0 [[buffer(5)]],
+        device const ushort *b0 [[buffer(6)]],device const short *dec [[buffer(7)]],device const short *enc [[buffer(8)]],
+        device ushort *out [[buffer(9)]],device const ushort *hcb [[buffer(10)]],device const ushort *hcr [[buffer(11)]],
+        constant MarblePackArgs &args [[buffer(12)]],uint2 p [[thread_position_in_grid]]) {
+    if(p.x>=args.m.width||p.y>=args.m.height)return;
+    ushort rgb[3];marble_pixel(y,cb,cr,q,r0,g0,b0,dec,enc,hcb,hcr,args.m,p,rgb);
+    uint i=p.y*args.m.width+p.x;
+    out[3*i]=ushort(uint(rgb[0])<<args.shift);out[3*i+1]=ushort(uint(rgb[1])<<args.shift);out[3*i+2]=ushort(uint(rgb[2])<<args.shift);
+}
+
 // Planar R, G, B -> interleaved RGB (the render's final layout).
+struct InterleaveArgs { uint width,height,shift; };
 kernel void interleave3(device const ushort *r [[buffer(0)]],device const ushort *g [[buffer(1)]],device const ushort *b [[buffer(2)]],
-                        device ushort *o [[buffer(3)]],constant uint2 &d [[buffer(4)]],uint2 p [[thread_position_in_grid]]) {
-    if(p.x>=d.x||p.y>=d.y)return;
-    uint i=p.y*d.x+p.x;o[3*i]=r[i];o[3*i+1]=g[i];o[3*i+2]=b[i];
+                        device ushort *o [[buffer(3)]],constant InterleaveArgs &d [[buffer(4)]],uint2 p [[thread_position_in_grid]]) {
+    if(p.x>=d.width||p.y>=d.height)return;
+    uint i=p.y*d.width+p.x;
+    o[3*i]=ushort(uint(r[i])<<d.shift);o[3*i+1]=ushort(uint(g[i])<<d.shift);o[3*i+2]=ushort(uint(b[i])<<d.shift);
 }

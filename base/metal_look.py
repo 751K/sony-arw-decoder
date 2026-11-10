@@ -210,11 +210,7 @@ def marble_supported(look, dev):
     return 0 <= lum <= 109 and (bnr or lum > 0)
 
 
-def marble(r, g, b, look, dev, dec, mode=0, inset=True):
-    """ZcTaskMarble (luma and chroma paths) on whole uint16 planes, as sony_marble.marble with no region.
-
-    inset=True keeps the input values outside the 16-px valid region, as render's
-    marble_inset does.  Returns (R, G, B), or None when marble_supported() is false."""
+def _marble_setup(r, g, b, look, dev, dec, mode, inset):
     import sony_effect as E
     import sony_marble as MB
     if not marble_supported(look, dev):
@@ -254,16 +250,66 @@ def marble(r, g, b, look, dev, dec, mode=0, inset=True):
     if any(t.shape != (0x4000,) for t in tabs):
         raise ValueError("Marble conversion tables must have 0x4000 entries")
     upw = np.ascontiguousarray(MB.UPW, dtype=np.int32)
-    out = _planes(h, w)
+    return planes, h, w, a, tabs, upw
+
+
+def marble(r, g, b, look, dev, dec, mode=0, inset=True, post=None, capacity=None, stats=None,
+           packed=False, output_bits=14):
+    """ZcTaskMarble (luma and chroma paths) on whole uint16 planes, as sony_marble.marble with no region.
+
+    inset=True keeps the input values outside the 16-px valid region, as render's
+    marble_inset does. If post is an active Post, Effect, ToneCurve and
+    ShadeCorrection run in the same final kernel; ambiguous pixels still use
+    Post.reference and are reported in stats["fixed"]. Returns (R, G, B), or
+    None when marble_supported() is false."""
+    setup = _marble_setup(r, g, b, look, dev, dec, mode, inset)
+    if setup is None:
+        return None
+    planes, h, w, a, tabs, upw = setup
+    if output_bits not in (14, 16):
+        raise ValueError("output_bits must be 14 or 16")
+    out = metal_itp.empty((h, w, 3)) if packed else _planes(h, w)
+    active_post = post is not None and post.active
+    fix = fixin = nfix = None
+    cap = 0
+    if active_post:
+        if (w, h) != (post.width, post.height):
+            raise ValueError("planes must match the Post image size")
+        n = w * h
+        cap = max(1, n // 64) if capacity is None else int(capacity)
+        post.args.capacity = cap
+        fix = np.empty(cap, np.uint32)
+        fixin = np.empty((cap, 3), np.uint16)
+        nfix = ctypes.c_uint32(0)
     lib = metal_itp._load()
     lib.sonylook_metal_marble.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_uint32, ctypes.c_uint32,
                                          ctypes.POINTER(MarbleArgs)] + [ctypes.c_void_p] * 5 + \
-                                        [ctypes.c_uint32] + [ctypes.c_void_p] * 3
+                                        [ctypes.c_uint32, ctypes.POINTER(PostArgs)] + \
+                                        [ctypes.c_void_p] * 5 + [ctypes.c_void_p] * 3 + \
+                                        [ctypes.c_void_p] * 3 + [ctypes.c_void_p, ctypes.c_uint32]
+    post_args = ctypes.byref(post.args) if active_post else None
+    post_ptrs = ((*(t.ctypes.data for t in post.tables), post.luts.ctypes.data)
+                 if active_post else (None, None, None, None, None))
+    out_ptrs = (None, None, None) if packed else tuple(v.ctypes.data for v in out)
     rc = lib.sonylook_metal_marble(*(v.ctypes.data for v in planes), w, h, ctypes.byref(a),
                                   *(t.ctypes.data for t in tabs), upw.ctypes.data, upw.size,
-                                  *(v.ctypes.data for v in out))
+                                  post_args, *post_ptrs,
+                                  *out_ptrs,
+                                  fix.ctypes.data if active_post else None,
+                                  ctypes.byref(nfix) if active_post else None,
+                                  fixin.ctypes.data if active_post else None,
+                                  out.ctypes.data if packed else None,
+                                  2 if output_bits == 16 else 0)
     if rc:
         raise RuntimeError(lib.sonylook_metal_error().decode())
+    if active_post:
+        count = int(nfix.value)
+        if count > cap:                          # rare: rerun with a list large enough
+            return marble(planes[0], planes[1], planes[2], look, dev, dec, mode=mode,
+                          inset=inset, post=post, capacity=count, stats=stats,
+                          packed=packed, output_bits=output_bits)
+        return _patch_post(out, planes, post, fix, count, cap, stats, fixed_inputs=fixin,
+                           shift=2 if output_bits == 16 else 0)
     return out
 
 
@@ -357,6 +403,42 @@ class Post:
         return r, g, b
 
 
+def _patch_post(out, planes, pp: Post, fix, count, capacity, stats, fixed_inputs=None, shift=0):
+    """Patch uncertain Post pixels with the float64 reference implementation.
+
+    out is three planes, or one interleaved (H, W, 3) array whose values are
+    shifted left by `shift` (Marble+Post writing the final layout directly)."""
+    packed = isinstance(out, np.ndarray) and out.ndim == 3
+    if stats is not None:
+        stats["fixed"] = count
+    if count > capacity:                         # too many to patch: use the CPU chain
+        ref = tuple(np.asarray(v, np.uint16) for v in pp.reference(*planes))
+        if packed:
+            out[...] = np.stack(ref, -1) << shift
+            return out
+        return ref
+    if count:
+        # The GPU appends in atomic (arbitrary) order; fixed_inputs[k] belongs to
+        # fix[k], so sort both with the same permutation.
+        order = np.argsort(fix[:count], kind="stable")
+        idx = fix[:count][order].astype(np.int64)
+        xs, ys = (idx % pp.width).astype(np.float64), (idx // pp.width).astype(np.float64)
+        if fixed_inputs is None:
+            flat = [v.reshape(-1) for v in planes]
+            source = tuple(f[idx] for f in flat)
+        else:
+            source = tuple(np.asarray(fixed_inputs[:count, c][order], np.uint16) for c in range(3))
+        fixed = pp.reference(*source, xs=xs, ys=ys)
+        if packed:
+            flat = out.reshape(-1, 3)
+            for c, v in enumerate(fixed):
+                flat[idx, c] = np.asarray(v, np.uint16) << shift
+        else:
+            for o, v in zip(out, fixed):
+                o.reshape(-1)[idx] = v
+    return out
+
+
 def post(r, g, b, pp: Post, capacity=None, stats=None):
     """Effect -> ToneCurve -> ShadeCorrection on whole uint16 planes; returns (R, G, B).
 
@@ -380,30 +462,25 @@ def post(r, g, b, pp: Post, capacity=None, stats=None):
                                 *(v.ctypes.data for v in out), fix.ctypes.data, ctypes.byref(nfix))
     if rc:
         raise RuntimeError(lib.sonylook_metal_error().decode())
-    count = int(nfix.value)
-    if stats is not None:
-        stats["fixed"] = count
-    if count > cap:                              # too many to patch: use the CPU chain
-        return tuple(np.asarray(v, np.uint16) for v in pp.reference(*planes))
-    if count:
-        idx = np.sort(fix[:count]).astype(np.int64)
-        flat = [v.reshape(-1) for v in planes]
-        xs, ys = (idx % w).astype(np.float64), (idx // w).astype(np.float64)
-        fixed = pp.reference(*(f[idx] for f in flat), xs=xs, ys=ys)
-        for o, v in zip(out, fixed):
-            o.reshape(-1)[idx] = v
-    return out
+    return _patch_post(out, planes, pp, fix, int(nfix.value), cap, stats)
 
 
-def interleave(r, g, b):
-    """(H, W, 3) uint16 in GPU-visible memory from three planes (resident planes are read in place)."""
+def interleave(r, g, b, output_bits=14):
+    """(H, W, 3) uint16 in GPU-visible memory from three planes.
+
+    output_bits=16 writes Edit's TIFF encoding (value << 2) in the interleave
+    kernel; 14 leaves the decoder's encoded values unchanged.
+    """
+    if output_bits not in (14, 16):
+        raise ValueError("output_bits must be 14 or 16")
     planes = [np.ascontiguousarray(v, dtype=np.uint16) for v in (r, g, b)]
     h, w = planes[0].shape
     if any(v.shape != (h, w) for v in planes) or not h or not w:
         raise ValueError("planes must be nonempty and the same size")
     out = metal_itp.empty((h, w, 3))
     lib = metal_itp._load()
-    lib.sonylook_metal_interleave.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_uint32] * 2 + [ctypes.c_void_p]
-    if lib.sonylook_metal_interleave(*(v.ctypes.data for v in planes), w, h, out.ctypes.data):
+    lib.sonylook_metal_interleave.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_uint32] * 3 + [ctypes.c_void_p]
+    if lib.sonylook_metal_interleave(*(v.ctypes.data for v in planes), w, h,
+                                     2 if output_bits == 16 else 0, out.ctypes.data):
         raise RuntimeError(lib.sonylook_metal_error().decode())
     return out

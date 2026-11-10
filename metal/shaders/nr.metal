@@ -3,18 +3,22 @@
 // is a single-rounding float32 fma, which is what the reference computes.
 struct NrArgs { uint width,height; int off[3],gain[3],lim[3],wm[3]; float s; };
 inline int nr_channel(uint x,uint y) { return (y&1)+(x&1); }   // 0 R, 1 G, 2 B
-// High-pass and base on the image shrunk by 2.
-kernel void nr_split(device const ushort *raw [[buffer(0)]],device short *hp [[buffer(1)]],device ushort *base [[buffer(2)]],constant NrArgs &a [[buffer(3)]],uint2 p [[thread_position_in_grid]]) {
-    uint w=a.width,h=a.height;if(p.x>=w||p.y>=h)return;
-    uint i=p.y*w+p.x;
-    if(p.x<2||p.x>=w-2||p.y<2||p.y>=h-2){hp[i]=0;base[i]=0;return;}
+inline void nr_split_value(device const ushort *raw,uint w,uint h,uint x,uint y,constant NrArgs &a,thread short &hpv,thread ushort &basev) {
+    if(x<2||x>=w-2||y<2||y>=h-2){hpv=0;basev=0;return;}
+    uint i=y*w+x;
     #define R(dy,dx) int(raw[uint(int(i)+(dy)*int(w)+(dx))])
-    int c=R(0,0),k=nr_channel(p.x,p.y);
+    int c=R(0,0),k=nr_channel(x,y);
     int d2=R(-2,-2)+R(-2,2)+R(2,-2)+R(2,2),a2=R(0,-2)+R(-2,0)+R(0,2)+R(2,0),hv;
     if(k==1){int d1=R(-1,-1)+R(-1,1)+R(1,-1)+R(1,1);hv=((24*c-(d2+2*a2))-3*d1)*36>>10;}
     else hv=(12*c-(d2+2*a2))>>4;
     #undef R
-    hp[i]=as_type<short>(ushort(uint(hv)&0xffffu));base[i]=ushort(clamp(a.off[k]+c-hv,0,0x7fff));
+    hpv=as_type<short>(ushort(uint(hv)&0xffffu));basev=ushort(clamp(a.off[k]+c-hv,0,0x7fff));
+}
+// High-pass and base on the image shrunk by 2.
+kernel void nr_split(device const ushort *raw [[buffer(0)]],device short *hp [[buffer(1)]],device ushort *base [[buffer(2)]],constant NrArgs &a [[buffer(3)]],uint2 p [[thread_position_in_grid]]) {
+    uint w=a.width,h=a.height;if(p.x>=w||p.y>=h)return;
+    uint i=p.y*w+p.x;
+    short hv;ushort bv;nr_split_value(raw,w,h,p.x,p.y,a,hv,bv);hp[i]=hv;base[i]=bv;
 }
 constant int2 nr_gmean[25]={int2(0,0),int2(-4,0),int2(0,-4),int2(0,4),int2(4,0),int2(0,-2),int2(0,2),int2(-2,0),int2(2,0),
     int2(-2,-2),int2(2,-2),int2(-2,2),int2(2,2),int2(-3,-1),int2(-3,1),int2(-1,-3),int2(-1,-1),int2(-1,1),int2(-1,3),

@@ -54,17 +54,21 @@ def to_16bit(img):
     return (np.asarray(img, np.uint16) << 2)
 
 
-def to_8bit(img):
-    """14-bit encoded 0..16383 -> uint8 (Edit's 16-bit value >> 8)."""
-    return (np.asarray(img, np.uint16) >> 6).astype(np.uint8)
+def to_8bit(img, input_bits=14):
+    """Encoded 14/16-bit image -> uint8 (Edit's 16-bit value >> 8)."""
+    if input_bits not in (14, 16):
+        raise ValueError("input_bits must be 14 or 16")
+    return (np.asarray(img, np.uint16) >> (6 if input_bits == 14 else 8)).astype(np.uint8)
 
 
-def write_image(img, path, *, color_space="srgb", bits=None, quality=95):
-    """Write (H, W, 3) 14-bit encoded image with the matching ICC profile.
+def write_image(img, path, *, color_space="srgb", bits=None, quality=95, input_bits=14):
+    """Write (H, W, 3) encoded image with the matching ICC profile.
 
     path: .tif/.tiff (default 16-bit), .jpg/.jpeg (8-bit), .png (default 8-bit).
     bits: 8 or 16; None picks the natural depth for the format.  16-bit is not a
           JPEG option.
+    input_bits: 14 (decoder values) or the 16-bit TIFF encoding produced by
+          decode(..., output_bits=16). No second shift is applied in the latter case.
     quality: JPEG quality 1..100.
     """
     img = np.asarray(img)
@@ -72,6 +76,8 @@ def write_image(img, path, *, color_space="srgb", bits=None, quality=95):
         raise ValueError(f"expected an (H, W, 3) image, got {img.shape}")
     if img.dtype.kind not in "ui":
         raise TypeError(f"expected an integer 14-bit image, got {img.dtype}")
+    if input_bits not in (14, 16):
+        raise ValueError("input_bits must be 14 or 16")
     img = img[..., :3]
     path = Path(path)
     space = normalize_space(color_space)
@@ -89,7 +95,8 @@ def write_image(img, path, *, color_space="srgb", bits=None, quality=95):
     if ext == ".png" and bits == 16:
         raise ValueError("PNG output is 8-bit; use a .tif for 16-bit")
 
-    arr = to_16bit(img) if bits == 16 else to_8bit(img)
+    arr = (img.astype(np.uint16, copy=False) if input_bits == 16 else to_16bit(img)) \
+        if bits == 16 else to_8bit(img, input_bits=input_bits)
     if is_tiff:
         import tifffile
         # TIFF type 7 (UNDEFINED), as Capture One and the TIFF ICC convention use

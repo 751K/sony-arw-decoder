@@ -5,6 +5,7 @@ struct DroArgs {
     uint subpx_x,subpx_y,org_x,org_y,per_x,per_y;
     int black_r,black_g,black_b;
     float log2_max,strength,k_up,k_down,scale;
+    uint fix_capacity;                 // dro_apply: size of the deferred-pixel list
 };
 
 // Correctly rounded float32 division (the reference's numpy float32 '/').
@@ -28,8 +29,37 @@ inline float dro_div(float a,float b) {
 constant ulong dro_exp2_tab[256]={0x4000000000000000UL,0x402c6be96af2fb58UL,0x4058f6a7ecccd5b6UL,0x4085a050ec0a036aUL,0x40b268f9de0183baUL,0x40df50b846ef302bUL,0x410c57a1b9fe12f6UL,0x41397dcbd952c4a6UL,0x4166c34c5615d0ecUL,0x41942838f07e22a3UL,0x41c1aca777db771bUL,0x41ef50adcaa0d899UL,0x421d1461d66f2023UL,0x424af7d9981f7e98UL,0x4278fb2b1bce0d15UL,0x42a71e6c7ce464afUL,0x42d561b3e6243d8aUL,0x4303c51791b21550UL,0x433248adc91fdd02UL,0x4360ec8ce577ae44UL,0x438fb0cb4f468808UL,0x43be957f7ea712b6UL,0x43ed9abffb4c6bc9UL,0x441cc0a35c8cf8eaUL,0x444c0740496d4294UL,0x447b6ead78aad636UL,0x44aaf701b0c72feeUL,0x44daa053c812abd2UL,0x450a6abaa4b77ecdUL,0x453a564d3cc4b723UL,0x456a632296394492UL,0x459a9151c70f0819UL,0x45cae0f1f545eb73UL,0x45fb521a56ef0042UL,0x462be4e23237a6efUL,0x465c9960dd74bd4bUL,0x468d6fadbf2dd4f3UL,0x46be67e04e28717cUL,0x46ef821011734e6bUL,0x4720be54a071ad01UL,0x47521cc5a2e6a9e0UL,0x47839d7ad1009a90UL,0x47b5408bf36472e2UL,0x47e70610e3393241UL,0x4818ee218a3358eeUL,0x484af8d5e2a06536UL,0x487d2645f7725895UL,0x48af7689e44b44eaUL,0x48e1e9b9d588e19bUL,0x49147fee085028d6UL,0x4947393eca98fcd6UL,0x497a15c47b39d53eUL,0x49ad159789f37496UL,0x49e038d0777ca5e0UL,0x4a137f87d58e025bUL,0x4a46e9d646edbf6aUL,0x4a7a77d47f7b84b1UL,0x4aae299b443c4a6bUL,0x4ae1ff436b663ff7UL,0x4b15f8e5dc6cbab0UL,0x4b4a169b900c2d00UL,0x4b7e587d905625d1UL,0x4bb2bea4f8bd5847UL,0x4be7492af621abd6UL,0x4c1bf828c6dc54b8UL,0x4c50cbb7bacbf4cbUL,0x4c85c3f13360c4d5UL,0x4cbae0eea3a8c63cUL,0x4cf022c9905bfd32UL,0x4d25899b8fe8b365UL,0x4d5b157e4a7fc325UL,0x4d90c68b7a20eb1eUL,0x4dc69cdceaa72a9cUL,0x4dfc988c79d52661UL,0x4e32b9b417619617UL,0x4e69006dc503ba65UL,0x4e9f6cd3967fdba8UL,0x4ed5feffb1b3d155UL,0x4f0cb70c4ea39210UL,0x4f439513b785cc80UL,0x4f7a993048d088d7UL,0x4fb1c37c7145d328UL,0x4fe91412b2006e83UL,0x50208b0d9e8090dfUL,0x50582887dcb8a7e1UL,0x508fec9c251a267cUL,0x50c7d76542a25b72UL,0x50ffe8fe12e750c4UL,0x513821818624b40cUL,0x5170810a9f48c7cfUL,0x51a907b474015dc9UL,0x51e1b59a2cc8da3eUL,0x521a8ad704f3404fUL,0x525387864abb4762UL,0x528cabc35f4f799dUL,0x52c5f7a9b6df5b77UL,0x52ff6b54d8a89c75UL,0x533906e05f045106UL,0x5372ca67f774358fUL,0x53acb60762affaaeUL,0x53e6c9da74b29ab5UL,0x542105fd14c7b869UL,0x545b6a8b3d990704UL,0x5495f7a0fd3bbb8eUL,0x54d0ad5a753e077cUL,0x550b8bd3dab49cbdUL,0x5546932976483b15UL,0x5581c377a44346f0UL,0x55bd1cdad49f699cUL,0x55f89f6f8b133af4UL,0x56344b525f1ff495UL,0x5670209ffc1f2e82UL,0x56ac1f752150a563UL,0x56e847eea1e80a49UL,0x57249a29651adc07UL,0x57611642662e4a33UL,0x579dbc56b48521baUL,0x57da8c8373adc331UL,0x581786e5db7022c2UL,0x5854ab9b37dbd1e5UL,0x5891fac0e95612c8UL,0x58cf747464a7f584UL,0x590d18d3330c7f1eUL,0x594ae7faf23eda52UL,0x5988e20954889245UL,0x59c7071c20cfd70cUL,0x5a05575132a5cc20UL,0x5a43d2c67a54e0c0UL,0x5a827999fcef3242UL,0x5ac14be9d45cf869UL,0x5b0049d42f6afbb6UL,0x5b3f737751d915c8UL,0x5b7ec8f19468bbc9UL,0x5bbe4a6164eb92f4UL,0x5bfdf7e546520f3eUL,0x5c3dd19bd0ba1c1aUL,0x5c7dd7a3b17dcf75UL,0x5cbe0a1bab4226dfUL,0x5cfe69229605cef5UL,0x5d3ef4d75f2ff504UL,0x5d7fad59099f22feUL,0x5dc092c6adb825b8UL,0x5e01a53f7974fd86UL,0x5e42e4e2b073d935UL,0x5e8451cfac061b5fUL,0x5ec5ec25db3f6a41UL,0x5f07b404c304c9f1UL,0x5f49a98bfe1bc11cUL,0x5f8bccdb3d398841UL,0x5fce1e124712437cUL,0x60109d50f86846d8UL,0x60534ab7441b6546UL,0x6096266533384a2bUL,0x60d9307ae507dd9aUL,0x611c69188f1eb339UL,0x615fd05e7d6c83e4UL,0x61a3666d124bb204UL,0x61e72b64c690d8afUL,0x622b1f66299a6599UL,0x626f4291e1603dd5UL,0x62b39508aa836d6fUL,0x62f816eb585de1edUL,0x633cc85ad5122fbdUL,0x6381a978219b628fUL,0x63c6ba6455dcd8aeUL,0x640bfb40a0b22959UL,0x64516c2e47ff1623UL,0x64970d4ea8bf8766UL,0x64dcdec3371793d1UL,0x6522e0ad7e639312UL,0x6569132f21483ba7UL,0x65af7669d9c2cbe4UL,0x65f60a7f79393e2eUL,0x663ccf91e88a8873UL,0x6683c5c3281ee6e9UL,0x66caed354ff83222UL,0x6712460a8fc24072UL,0x6759d0652ee352afUL,0x67a18c678c8c8c61UL,0x67e97a341fca775bUL,0x683199ed779592caUL,0x6879ebb63ae2edc6UL,0x68c26fb128b4cd63UL,0x690b2601182b5e56UL,0x69540ec8f895722dUL,0x699d2a2bd181482aUL,0x69e6784cc2cd61bdUL,0x6a2ff94f04b962b0UL,0x6a79ad55e7f6fd10UL,0x6ac39484d5bae8c5UL,0x6b0daeff4fcde703UL,0x6b57fce8f09dd17fUL,0x6ba27e656b4eb57aUL,0x6bed33988bcbfab5UL,0x6c381ca636d99642UL,0x6c8339b26a25494eUL,0x6cce8ae13c57ebdbUL,0x6d1a1056dd26c382UL,0x6d65ca379564e639UL,0x6db1b8a7c714a92bUL,0x6dfddbcbed791babUL,0x6e4a33c89d278e49UL,0x6e96c0c284192610UL,0x6ee382de69bc7bf8UL,0x6f307a412f074892UL,0x6f7da70fce881bf9UL,0x6fcb096f5c782210UL,0x7018a18506ccf314UL,0x70666f76154a7089UL,0x70b47367e994ae92UL,0x7102ad7fff41e9b4UL,0x71511de3ebec8913UL,0x719fc4b95f452d29UL,0x71eea2262324cb0cUL,0x723db6501b9ed447UL,0x728d015d47136b40UL,0x72dc8373be41a454UL,0x732c3cb9b459d38bUL,0x737c2d55770fe711UL,0x73cc556d6eadce5fUL,0x741cb5281e25ee34UL,0x746d4cac2325a155UL,0x74be1c203627c62bUL,0x750f23ab2a87593eUL,0x75606373ee921c97UL,0x75b1dba18b9b4c20UL,0x76038c5b260e5eeeUL,0x765575c7fd81d5a0UL,0x76a7980f6cca15c2UL,0x76f9f358ea0c5249UL,0x774c87cc06d1812eUL,0x779f559070195e36UL,0x77f25ccdee6d7ae6UL,0x78459dac65f45bb5UL,0x78991853d684a285UL,0x78ecccec5bb84661UL,0x7940bb9e2cffd89dUL,0x7994e4919db5d74eUL,0x79e947ef1d320d2dUL,0x7a3de5df36dcfeefUL,0x7a92be8a92436616UL,0x7ae7d219f329b948UL,0x7b3d20b6399fc237UL,0x7b92aa886214411cUL,0x7be86fb985689ddcUL,0x7c3e7072d904a6ceUL,0x7c94acddaeea5d3aUL,0x7ceb252375c9cf9bUL,0x7d41d96db915019dUL,0x7d98c9e62113e1faUL,0x7deff6b672f84e24UL,0x7e47600890f223deUL,0x7e9f06067a4360baUL,0x7ef6e8da4b544f9aUL,0x7f4f08ae3dc7c426UL,0x7fa765aca88f6453UL};
 constant ulong dro_ln2_q64=0xb17217f7d1cf79acUL;
 
+constant float dro_exp2_hi[257]={0x1.0000000000000p+0f,0x1.00b1b00000000p+0f,0x1.0163da0000000p+0f,0x1.0216820000000p+0f,0x1.02c9a40000000p+0f,0x1.037d420000000p+0f,0x1.04315e0000000p+0f,0x1.04e5f80000000p+0f,0x1.059b0e0000000p+0f,0x1.0650a00000000p+0f,0x1.0706b20000000p+0f,0x1.07bd420000000p+0f,0x1.0874520000000p+0f,0x1.092be00000000p+0f,0x1.09e3ec0000000p+0f,0x1.0a9c7a0000000p+0f,0x1.0b55860000000p+0f,0x1.0c0f140000000p+0f,0x1.0cc9220000000p+0f,0x1.0d83b20000000p+0f,0x1.0e3ec40000000p+0f,0x1.0efa560000000p+0f,0x1.0fb66a0000000p+0f,0x1.1073020000000p+0f,0x1.11301e0000000p+0f,0x1.11edba0000000p+0f,0x1.12abdc0000000p+0f,0x1.136a820000000p+0f,0x1.1429aa0000000p+0f,0x1.14e95a0000000p+0f,0x1.15a98c0000000p+0f,0x1.166a460000000p+0f,0x1.172b840000000p+0f,0x1.17ed480000000p+0f,0x1.18af940000000p+0f,0x1.1972660000000p+0f,0x1.1a35be0000000p+0f,0x1.1af9a00000000p+0f,0x1.1bbe080000000p+0f,0x1.1c82fa0000000p+0f,0x1.1d48740000000p+0f,0x1.1e0e760000000p+0f,0x1.1ed5020000000p+0f,0x1.1f9c180000000p+0f,0x1.2063b80000000p+0f,0x1.212be40000000p+0f,0x1.21f49a0000000p+0f,0x1.22bdda0000000p+0f,0x1.2387a60000000p+0f,0x1.2452000000000p+0f,0x1.251ce40000000p+0f,0x1.25e8580000000p+0f,0x1.26b4560000000p+0f,0x1.2780e40000000p+0f,0x1.284dfe0000000p+0f,0x1.291ba80000000p+0f,0x1.29e9e00000000p+0f,0x1.2ab8a60000000p+0f,0x1.2b87fe0000000p+0f,0x1.2c57e40000000p+0f,0x1.2d285a0000000p+0f,0x1.2df9620000000p+0f,0x1.2ecafa0000000p+0f,0x1.2f9d240000000p+0f,0x1.306fe00000000p+0f,0x1.31432e0000000p+0f,0x1.3217100000000p+0f,0x1.32eb840000000p+0f,0x1.33c08c0000000p+0f,0x1.3496260000000p+0f,0x1.356c560000000p+0f,0x1.36431a0000000p+0f,0x1.371a740000000p+0f,0x1.37f2620000000p+0f,0x1.38cae60000000p+0f,0x1.39a4020000000p+0f,0x1.3a7db40000000p+0f,0x1.3b57fc0000000p+0f,0x1.3c32dc0000000p+0f,0x1.3d0e540000000p+0f,0x1.3dea640000000p+0f,0x1.3ec70e0000000p+0f,0x1.3fa4500000000p+0f,0x1.40822c0000000p+0f,0x1.4160a20000000p+0f,0x1.423fb20000000p+0f,0x1.431f5e0000000p+0f,0x1.43ffa40000000p+0f,0x1.44e0860000000p+0f,0x1.45c2040000000p+0f,0x1.46a41e0000000p+0f,0x1.4786d60000000p+0f,0x1.486a2c0000000p+0f,0x1.494e1e0000000p+0f,0x1.4a32b00000000p+0f,0x1.4b17de0000000p+0f,0x1.4bfdae0000000p+0f,0x1.4ce41c0000000p+0f,0x1.4dcb2a0000000p+0f,0x1.4eb2d80000000p+0f,0x1.4f9b280000000p+0f,0x1.5084180000000p+0f,0x1.516daa0000000p+0f,0x1.5257de0000000p+0f,0x1.5342b60000000p+0f,0x1.542e300000000p+0f,0x1.551a4c0000000p+0f,0x1.56070e0000000p+0f,0x1.56f4740000000p+0f,0x1.57e27e0000000p+0f,0x1.58d12e0000000p+0f,0x1.59c0820000000p+0f,0x1.5ab07e0000000p+0f,0x1.5ba1200000000p+0f,0x1.5c92680000000p+0f,0x1.5d845a0000000p+0f,0x1.5e76f20000000p+0f,0x1.5f6a320000000p+0f,0x1.605e1c0000000p+0f,0x1.6152ae0000000p+0f,0x1.6247ec0000000p+0f,0x1.633dd20000000p+0f,0x1.6434640000000p+0f,0x1.652ba00000000p+0f,0x1.6623880000000p+0f,0x1.671c1c0000000p+0f,0x1.68155e0000000p+0f,0x1.690f4c0000000p+0f,0x1.6a09e60000000p+0f,0x1.6b05300000000p+0f,0x1.6c01280000000p+0f,0x1.6cfdce0000000p+0f,0x1.6dfb240000000p+0f,0x1.6ef92a0000000p+0f,0x1.6ff7e00000000p+0f,0x1.70f7460000000p+0f,0x1.71f75e0000000p+0f,0x1.72f8280000000p+0f,0x1.73f9a40000000p+0f,0x1.74fbd40000000p+0f,0x1.75feb60000000p+0f,0x1.77024c0000000p+0f,0x1.7806940000000p+0f,0x1.790b940000000p+0f,0x1.7a11480000000p+0f,0x1.7b17b00000000p+0f,0x1.7c1ed00000000p+0f,0x1.7d26a60000000p+0f,0x1.7e2f340000000p+0f,0x1.7f38780000000p+0f,0x1.8042760000000p+0f,0x1.814d2a0000000p+0f,0x1.82589a0000000p+0f,0x1.8364c20000000p+0f,0x1.8471a40000000p+0f,0x1.857f420000000p+0f,0x1.868d9a0000000p+0f,0x1.879cae0000000p+0f,0x1.88ac7e0000000p+0f,0x1.89bd0a0000000p+0f,0x1.8ace540000000p+0f,0x1.8be05c0000000p+0f,0x1.8cf3220000000p+0f,0x1.8e06a60000000p+0f,0x1.8f1aea0000000p+0f,0x1.902fee0000000p+0f,0x1.9145b00000000p+0f,0x1.925c360000000p+0f,0x1.93737c0000000p+0f,0x1.948b820000000p+0f,0x1.95a44c0000000p+0f,0x1.96bdda0000000p+0f,0x1.97d82a0000000p+0f,0x1.98f33e0000000p+0f,0x1.9a0f180000000p+0f,0x1.9b2bb40000000p+0f,0x1.9c49180000000p+0f,0x1.9d67420000000p+0f,0x1.9e86320000000p+0f,0x1.9fa5e80000000p+0f,0x1.a0c6680000000p+0f,0x1.a1e7ae0000000p+0f,0x1.a309be0000000p+0f,0x1.a42c980000000p+0f,0x1.a5503c0000000p+0f,0x1.a674a80000000p+0f,0x1.a799e20000000p+0f,0x1.a8bfe60000000p+0f,0x1.a9e6b60000000p+0f,0x1.ab0e520000000p+0f,0x1.ac36bc0000000p+0f,0x1.ad5ff40000000p+0f,0x1.ae89fa0000000p+0f,0x1.afb4ce0000000p+0f,0x1.b0e0720000000p+0f,0x1.b20ce60000000p+0f,0x1.b33a2c0000000p+0f,0x1.b468420000000p+0f,0x1.b597280000000p+0f,0x1.b6c6e20000000p+0f,0x1.b7f7700000000p+0f,0x1.b928d00000000p+0f,0x1.ba5b040000000p+0f,0x1.bb8e0c0000000p+0f,0x1.bcc1ea0000000p+0f,0x1.bdf69c0000000p+0f,0x1.bf2c260000000p+0f,0x1.c062860000000p+0f,0x1.c199be0000000p+0f,0x1.c2d1ce0000000p+0f,0x1.c40ab60000000p+0f,0x1.c544780000000p+0f,0x1.c67f120000000p+0f,0x1.c7ba880000000p+0f,0x1.c8f6da0000000p+0f,0x1.ca34060000000p+0f,0x1.cb720e0000000p+0f,0x1.ccb0f20000000p+0f,0x1.cdf0b60000000p+0f,0x1.cf31560000000p+0f,0x1.d072d40000000p+0f,0x1.d1b5320000000p+0f,0x1.d2f8700000000p+0f,0x1.d43c8e0000000p+0f,0x1.d5818e0000000p+0f,0x1.d6c76e0000000p+0f,0x1.d80e320000000p+0f,0x1.d955d80000000p+0f,0x1.da9e600000000p+0f,0x1.dbe7ce0000000p+0f,0x1.dd32200000000p+0f,0x1.de7d560000000p+0f,0x1.dfc9740000000p+0f,0x1.e116760000000p+0f,0x1.e264620000000p+0f,0x1.e3b3340000000p+0f,0x1.e502ee0000000p+0f,0x1.e653920000000p+0f,0x1.e7a5200000000p+0f,0x1.e8f7980000000p+0f,0x1.ea4afa0000000p+0f,0x1.eb9f480000000p+0f,0x1.ecf4820000000p+0f,0x1.ee4aaa0000000p+0f,0x1.efa1be0000000p+0f,0x1.f0f9c20000000p+0f,0x1.f252b40000000p+0f,0x1.f3ac940000000p+0f,0x1.f507660000000p+0f,0x1.f663280000000p+0f,0x1.f7bfda0000000p+0f,0x1.f91d800000000p+0f,0x1.fa7c180000000p+0f,0x1.fbdba40000000p+0f,0x1.fd3c220000000p+0f,0x1.fe9d960000000p+0f,0x1.0000000000000p+1f};
+constant float dro_exp2_lo[257]={0.0f,-0x1.6950d00000000p-26f,0x1.3f66660000000p-25f,-0x1.789fb00000000p-25f,-0x1.887fa00000000p-28f,0x1.c2377a0000000p-25f,0x1.0dcff00000000p-25f,-0x1.a1356a0000000p-25f,-0x1.9d4f520000000p-25f,0x1.c783f20000000p-25f,0x1.3bbedc0000000p-25f,0x1.6e55060000000p-25f,-0x1.e2990e0000000p-26f,-0x1.333f040000000p-25f,0x1.58de700000000p-25f,-0x1.3831ba0000000p-26f,0x1.9f31220000000p-25f,0x1.791b220000000p-26f,0x1.6e48fe0000000p-25f,0x1.9caef60000000p-27f,-0x1.a585cc0000000p-25f,-0x1.02b1da0000000p-31f,0x1.ffda640000000p-25f,0x1.1ae4680000000p-25f,-0x1.fdb4960000000p-25f,0x1.6bc5560000000p-25f,0x1.b0c7300000000p-30f,-0x1.61bf6a0000000p-25f,0x1.d525bc0000000p-25f,-0x1.9619da0000000p-25f,0x1.14b1ca0000000p-25f,-0x1.71c7880000000p-25f,-0x1.c157420000000p-27f,0x1.a56ef00000000p-26f,-0x1.dcdc860000000p-26f,-0x1.f228b40000000p-26f,0x1.6df96e0000000p-25f,-0x1.fb1d780000000p-26f,0x1.0117340000000p-26f,-0x1.5afc720000000p-25f,-0x1.d2e8ca0000000p-25f,-0x1.4bbfda0000000p-28f,0x1.7e6c8e0000000p-27f,0x1.0e33940000000p-26f,0x1.0c519a0000000p-25f,-0x1.50eafc0000000p-25f,-0x1.d0446e0000000p-25f,0x1.3c89680000000p-27f,0x1.ceac480000000p-25f,-0x1.1f7afe0000000p-26f,0x1.f654c80000000p-25f,-0x1.dc26320000000p-25f,0x1.789f380000000p-26f,-0x1.7c441a0000000p-25f,0x1.f563800000000p-28f,-0x1.4dc8920000000p-25f,-0x1.5c04240000000p-25f,0x1.b443c40000000p-26f,-0x1.e4a4ce0000000p-25f,-0x1.a239340000000p-26f,0x1.b900c20000000p-26f,-0x1.37d4ee0000000p-29f,0x1.27c5ea0000000p-25f,0x1.57b10e0000000p-25f,0x1.4636e20000000p-25f,0x1.bdd6600000000p-25f,-0x1.d993e80000000p-27f,-0x1.15c5740000000p-26f,-0x1.b37d200000000p-25f,0x1.b8fe8c0000000p-26f,-0x1.b5803c0000000p-30f,0x1.6f441e0000000p-27f,-0x1.18aac60000000p-25f,0x1.8f3aa40000000p-27f,0x1.a0bb0c0000000p-25f,-0x1.23afc40000000p-26f,-0x1.634c020000000p-25f,-0x1.3930ba0000000p-32f,0x1.89d4720000000p-27f,0x1.3b785c0000000p-26f,0x1.8246840000000p-25f,-0x1.c75d160000000p-29f,0x1.2b20060000000p-26f,0x1.b3d0120000000p-27f,0x1.f72e2a0000000p-28f,0x1.c251a20000000p-26f,-0x1.abd5da0000000p-26f,-0x1.ed18b00000000p-30f,0x1.8624b40000000p-30f,0x1.53e9180000000p-27f,0x1.a3a00a0000000p-25f,0x1.a2cc8e0000000p-26f,-0x1.47d8660000000p-25f,0x1.92aed20000000p-28f,-0x1.e505840000000p-25f,0x1.4db6fa0000000p-25f,-0x1.593abc0000000p-25f,-0x1.fa0fba0000000p-26f,-0x1.8088bc0000000p-26f,0x1.d8abfe0000000p-28f,-0x1.2c5a6c0000000p-25f,-0x1.759c240000000p-29f,0x1.67b3200000000p-27f,0x1.07e9de0000000p-25f,-0x1.2c56100000000p-25f,-0x1.612a5c0000000p-25f,0x1.4bb2420000000p-25f,-0x1.0b77980000000p-27f,-0x1.295b040000000p-25f,-0x1.074ecc0000000p-26f,-0x1.6d07000000000p-25f,0x1.ffc1f20000000p-26f,-0x1.5bd5ec0000000p-27f,-0x1.15e1800000000p-26f,0x1.4b28d60000000p-25f,-0x1.ecce8e0000000p-25f,-0x1.4a5bd60000000p-25f,0x1.b9d6e20000000p-29f,-0x1.a248fe0000000p-26f,0x1.b37dbe0000000p-26f,-0x1.f8b5500000000p-25f,-0x1.736b020000000p-27f,-0x1.66679c0000000p-25f,-0x1.43704a0000000p-28f,0x1.2a91120000000p-27f,0x1.c20cfe0000000p-26f,-0x1.766ad20000000p-25f,-0x1.cc2d580000000p-25f,0x1.9fcef40000000p-26f,-0x1.62ba300000000p-26f,-0x1.5e84a80000000p-25f,-0x1.15c4de0000000p-27f,-0x1.cd72e80000000p-27f,-0x1.e9b1460000000p-26f,-0x1.ab9ae00000000p-26f,0x1.bd0ba20000000p-26f,0x1.1d8bee0000000p-25f,0x1.bab4220000000p-26f,0x1.14b02e0000000p-25f,-0x1.4506800000000p-25f,-0x1.37b3060000000p-25f,-0x1.ca923e0000000p-25f,0x1.fbcba80000000p-25f,-0x1.d4f8c20000000p-26f,-0x1.829fd00000000p-25f,0x1.2ed9fc0000000p-25f,0x1.30c1320000000p-28f,0x1.7fc3780000000p-27f,-0x1.2616340000000p-25f,0x1.2471240000000p-26f,-0x1.783cbe0000000p-25f,0x1.ba20dc0000000p-25f,-0x1.accc7c0000000p-26f,-0x1.46be080000000p-28f,0x1.88f1ec0000000p-26f,-0x1.0c149c0000000p-25f,-0x1.2edb440000000p-26f,-0x1.b396f20000000p-26f,-0x1.9d665a0000000p-26f,0x1.1e16040000000p-26f,0x1.15506e0000000p-27f,-0x1.4a7a220000000p-26f,-0x1.29576e0000000p-25f,-0x1.f799280000000p-28f,-0x1.baa2320000000p-26f,-0x1.fafa6e0000000p-25f,0x1.723ff80000000p-25f,-0x1.8aba040000000p-25f,-0x1.e647440000000p-25f,0x1.6bf31c0000000p-25f,0x1.790a420000000p-25f,-0x1.6263d40000000p-26f,-0x1.0d8d840000000p-31f,0x1.1e88a80000000p-26f,-0x1.e6bf080000000p-25f,0x1.aa7fc20000000p-25f,0x1.51f8480000000p-27f,-0x1.ad11ca0000000p-26f,-0x1.8737380000000p-26f,0x1.a0fe540000000p-25f,-0x1.2886a60000000p-26f,0x1.b1d7180000000p-25f,0x1.8945a60000000p-25f,0x1.182b5e0000000p-30f,-0x1.b83b540000000p-25f,0x1.5e8c0a0000000p-25f,-0x1.99e9940000000p-25f,-0x1.87da340000000p-25f,-0x1.50c0480000000p-25f,0x1.356eba0000000p-28f,-0x1.6064320000000p-31f,-0x1.70f6220000000p-26f,-0x1.a94b140000000p-26f,0x1.88bcc00000000p-26f,0x1.31b6cc0000000p-25f,0x1.93512a0000000p-25f,-0x1.ec3a820000000p-26f,-0x1.4916ca0000000p-25f,0x1.bcab280000000p-25f,0x1.3e38a60000000p-25f,-0x1.a094380000000p-25f,-0x1.bb16c40000000p-25f,-0x1.ebdf360000000p-25f,-0x1.0cb21c0000000p-25f,-0x1.f687c60000000p-25f,0x1.f9d1040000000p-27f,-0x1.0a387e0000000p-26f,0x1.41b33c0000000p-28f,-0x1.3d56b20000000p-27f,-0x1.8166b60000000p-26f,-0x1.7c2c980000000p-39f,-0x1.c141380000000p-26f,0x1.cafa2a0000000p-25f,0x1.3119260000000p-25f,-0x1.7f230a0000000p-25f,-0x1.15c7640000000p-25f,-0x1.8837cc0000000p-27f,0x1.cda2ce0000000p-25f,-0x1.5447800000000p-25f,-0x1.2915240000000p-26f,0x1.40f1300000000p-25f,0x1.61192e0000000p-25f,0x1.01b13e0000000p-25f,0x1.59543a0000000p-25f,-0x1.822dbc0000000p-27f,0x1.0c5cda0000000p-25f,-0x1.26cf8e0000000p-25f,-0x1.c013f20000000p-25f,0x1.ed99420000000p-27f,-0x1.38af9e0000000p-25f,-0x1.9fc9740000000p-25f,0x1.0701960000000p-26f,-0x1.908c940000000p-25f,0x1.632fa20000000p-25f,-0x1.614bda0000000p-25f,-0x1.3a447c0000000p-26f,0x1.e2cffe0000000p-26f,0x1.19db5e0000000p-26f,-0x1.0e2ce00000000p-26f,-0x1.0649180000000p-25f,0x1.52486c0000000p-27f,0x1.9f329c0000000p-26f,0x1.b1ccfe0000000p-25f,0x1.0c42880000000p-27f,0x1.cc2b440000000p-25f,-0x1.a4df6c0000000p-27f,-0x1.1288ae0000000p-25f,0x1.1bae4e0000000p-25f,-0x1.246eb00000000p-26f,-0x1.9deec20000000p-26f,0x1.b397c20000000p-25f,0x1.121e440000000p-27f,0x1.9e90d80000000p-28f,-0x1.2da55e0000000p-25f,0x1.71ee3e0000000p-25f,0x1.65447c0000000p-25f,0.0f};
+constant float dro_ln2_hi=0x1.62e4300000000p-1f,dro_ln2_lo=-0x1.05c6100000000p-29f;
+// 2^e for normal results: e = n + f with f = fh + fe held exactly (TwoSum),
+// 2^f = T[j] * exp(x), x = (f - j/256) ln2 as a float pair, |x| < 0.003.
+// Returns q and sets ok when q is certainly the correctly rounded value
+// (|error| < 2^-37, rejected within 2^-34 of a rounding boundary).
+inline float dro_exp2_fast(float e,thread bool &ok) {
+    ok=false;
+    if(!(e>-125.0f&&e<127.0f))return 0.0f;
+    float fl=floor(e);int n=int(fl);
+    float fh=e-fl,fb=fh-e,fe=(e-(fh-fb))+(-fl-fb);              // fh + fe = e - fl exactly
+    if(fh==0.0f&&fe==0.0f){ok=true;return ldexp(1.0f,n);}       // integer e (e.g. DRO's neutral 0): exact
+    int j=int(fh*256.0f);float rh=fma(float(j),-0.00390625f,fh); // exact
+    float xh=rh*dro_ln2_hi,xl=fma(rh,dro_ln2_hi,-xh)+fma(rh,dro_ln2_lo,fe*dro_ln2_hi);
+    float x=xh+xl;
+    float p=x*x*fma(x,fma(x,0.041666668f,0.16666667f),0.5f);    // exp(x) - 1 - x
+    float th=dro_exp2_hi[j],tl=dro_exp2_lo[j];
+    float ph=th*xh,pl=fma(th,xh,-ph);                           // th*xh exactly
+    float small=tl+pl+fma(th,xl,fma(th,p,tl*x));
+    float uh=ph+small,ub=uh-ph,ul=(ph-(uh-ub))+(small-ub);      // TwoSum
+    float vh=th+uh,vb=vh-th,vl=((th-(vh-vb))+(uh-vb))+ul;       // TwoSum + tail
+    if(vh<=1.0f||vh>=2.0f)return 0.0f;                          // binade edge: exact path
+    float d=abs(vl)-0x1p-24f;                                   // vs half an ulp of [1, 2)
+    if(abs(d)<0x1p-34f)return 0.0f;
+    float q=d<0.0f?vh:(vl>0.0f?vh+0x1p-23f:vh-0x1p-23f);
+    ok=true;
+    return ldexp(q,n);
+}
 inline ulong dro_mulq(ulong a,ulong b) { return (mulhi(a,b)<<2)|((a*b)>>62); }
-inline float dro_exp2(float e) {
+inline float dro_exp2_exact(float e) {
     if(isnan(e))return e;
     if(e>=128.0f)return INFINITY;
     if(e<-149.0f)return 0.0f;
@@ -54,6 +84,8 @@ inline float dro_exp2(float e) {
     if(m24==(1UL<<24)){m24>>=1;n++;}
     return ldexp(float(m24),n-23);
 }
+// Fast path when it is certain, otherwise the exact routine: same results.
+inline float dro_exp2(float e) { bool ok; float y=dro_exp2_fast(e,ok); return ok?y:dro_exp2_exact(e); }
 kernel void dro_math_test(device const float *a [[buffer(0)]],device const float *b [[buffer(1)]],device float *e2 [[buffer(2)]],device float *q [[buffer(3)]],constant uint &n [[buffer(4)]],uint i [[thread_position_in_grid]]) {
     if(i>=n)return;e2[i]=dro_exp2(a[i]);q[i]=dro_div(a[i],b[i]);
 }
@@ -108,6 +140,29 @@ kernel void dro_weights(device const float *sm [[buffer(0)]],device float *W [[b
     int pos=(p.y*8+p.x)*14;
     for(int j=0;j<14;j++){float w=0,s=0;for(int k=0;k<14;k++){float hk=sm[pos+k],wt=weight[min(abs(j-k),8)];w=fma(hk,wt,w);s=fma(hk*wt,float(k),s);}S[pos+j]=fma(blend[j],fma(w,float(j),-s),s);W[pos+j]=w;}
 }
+// Smooth and weights share only the same 8x6 cell. Keep the intermediate
+// fourteen-bin vector in registers and write W/S directly.
+kernel void dro_smooth_weights(device const float *hist [[buffer(0)]],device float *W [[buffer(1)]],device float *S [[buffer(2)]],constant DroArgs &a [[buffer(3)]],uint2 p [[thread_position_in_grid]]) {
+    if(p.x>=8||p.y>=6)return;
+    int x=p.x,y=p.y;float sm[14];
+    for(int j=0;j<14;j++){
+#define H(dx,dy) hist[((y+(dy))*8+x+(dx))*14+j]
+        float c=H(0,0),v;
+        if(y==0||y==5){float vert=y==0?H(0,1):H(0,-1);
+            if(x==0)v=(fma(c,2.0f,H(1,0))+vert)*0.25f;
+            else if(x==7)v=(fma(c,2.0f,H(-1,0))+vert)*0.25f;
+            else v=(fma(c,3.0f,H(-1,0))+(H(1,0)+vert))*0.16666667f;
+        }else if(x==0)v=(fma(c,3.0f,H(1,0))+(H(0,-1)+H(0,1)))*0.16666667f;
+        else if(x==7)v=(fma(c,3.0f,H(-1,0))+(H(0,-1)+H(0,1)))*0.16666667f;
+        else v=(fma(c,4.0f,H(-1,0))+((H(1,0)+H(0,-1))+H(0,1)))*0.125f;
+#undef H
+        sm[j]=v;
+    }
+    constexpr float weight[9]={0.8828129768371582f,0.6054689884185791f,0.3242189884185791f,0.1367190033197403f,0.04296899959445f,0.011718999594449997f,0.0039059999398887157f,0.0039059999398887157f,0.0039059999398887157f};
+    constexpr float blend[14]={1,.75,.5,.25,0,0,0,0,0,.25,.5,.75,1,1};
+    int pos=(y*8+x)*14;
+    for(int j=0;j<14;j++){float w=0,s=0;for(int k=0;k<14;k++){float hk=sm[k],wt=weight[min(abs(j-k),8)];w=fma(hk,wt,w);s=fma(hk*wt,float(k),s);}S[pos+j]=fma(blend[j],fma(w,float(j),-s),s);W[pos+j]=w;}
+}
 inline int4 dro_axis(int p,int c,int cw,int n){
     int i0=p<c?0:(p<c+(n-1)*cw?(p-c)/max(cw,1):n-1);
     int i1=p<c?0:(p<c+(n-1)*cw?i0+1:n-1);
@@ -122,20 +177,64 @@ inline float dro_interp(device const float *table,int4 ax,int4 ay,int bin){
     float bot=sx?fma(a3,float(ax.z),a2*float(ax.w))*inv:a2;
     return sy?dro_div(fma(bot,float(ay.z),top*float(ay.w)),float(sy)):top;
 }
-kernel void dro_apply(device const ushort *r [[buffer(0)]],device const ushort *g [[buffer(1)]],device const ushort *b [[buffer(2)]],device const float *weights [[buffer(3)]],device const float *sums [[buffer(4)]],device const float *curve [[buffer(5)]],device const float *logtab [[buffer(6)]],device ushort *ro [[buffer(7)]],device ushort *go [[buffer(8)]],device ushort *bo [[buffer(9)]],constant DroArgs &a [[buffer(10)]],uint2 p [[thread_position_in_grid]]) {
-    if(p.x>=a.width||p.y>=a.height)return;uint i=p.y*a.width+p.x;
-    float R=float(r[i]>>1),G=float(g[i]>>1),B=float(b[i]>>1);
+// dro_interp with the horizontal reciprocal precomputed (it depends only on ax,
+// so the four lookups of one pixel share it); identical arithmetic otherwise.
+inline float dro_interp_inv(device const float *table,int4 ax,int4 ay,int bin,int sx,int sy,float inv){
+    float a0=dro_cell(table,ay.x,ax.x,bin),a1=dro_cell(table,ay.x,ax.y,bin);
+    float a2=dro_cell(table,ay.y,ax.x,bin),a3=dro_cell(table,ay.y,ax.y,bin);
+    float top=sx?fma(a1,float(ax.z),a0*float(ax.w))*inv:a0;
+    float bot=sx?fma(a3,float(ax.z),a2*float(ax.w))*inv:a2;
+    return sy?dro_div(fma(bot,float(ay.z),top*float(ay.w)),float(sy)):top;
+}
+// One DRO pixel: inputs are the ITP's doubled 14-bit values; (x, y) are plane
+// coordinates (origin_x/origin_y map them into the raw grid).
+// EXACT=false uses dro_exp2_fast and reports ok=false when it cannot decide;
+// the exact instance keeps the 64-bit routine out of the fast kernel.
+template<bool EXACT>
+static inline ushort3 dro_pixel(ushort r16,ushort g16,ushort b16,int x,int y,device const float *weights,device const float *sums,device const float *curve,device const float *logtab,constant DroArgs &a,thread bool &ok) {
+    float R=float(r16>>1),G=float(g16>>1),B=float(b16>>1);
     float Y=fma(0.057f,B,fma(0.2935f,G,0.1495f*R));Y=Y+Y;
-    float L=dro_log(Y,logtab);int px=int(a.scale*float(int(p.x)+a.origin_x)),py=int(a.scale*float(int(p.y)+a.origin_y));
+    float L=dro_log(Y,logtab);int px=int(a.scale*float(x+a.origin_x)),py=int(a.scale*float(y+a.origin_y));
     int cw=a.subpx_x*14,ch=a.subpx_y*14;int4 ax=dro_axis(px,a.org_x+(cw>>1),cw,8),ay=dro_axis(py,a.org_y+(ch>>1),ch,6);
     float fl=floor(L),f=L-fl;int bin=int(max(fl,0.0f)),bin1=bin<12?bin+1:13;
-    float w0=dro_interp(weights,ax,ay,bin),w1=dro_interp(weights,ax,ay,bin1);
-    float s0=dro_interp(sums,ax,ay,bin),s1=dro_interp(sums,ax,ay,bin1);
+    int sx=ax.z+ax.w,sy=ay.z+ay.w;float inv=sx?dro_div(1.0f,float(sx)):0;
+    float w0=dro_interp_inv(weights,ax,ay,bin,sx,sy,inv),w1=dro_interp_inv(weights,ax,ay,bin1,sx,sy,inv);
+    float s0=dro_interp_inv(sums,ax,ay,bin,sx,sy,inv),s1=dro_interp_inv(sums,ax,ay,bin1,sx,sy,inv);
     float W=fma(w1,f,fma(-f,w0,w0)),S=fma(s1,f,s0*(1.0f-f));
     float local=W==0.0f?a.log2_max:dro_div(S,W);int idx=int(max(local*8.0f,0.0f)),ic=min(idx,102);
     float t=fma(float(ic),-0.125f,local)*8.0f,cv=idx<103?fma(t,curve[ic+1]-curve[ic],curve[ic]):curve[103];
-    float e=fma(L-local,a.strength,-L)+cv,gain=dro_exp2(e),k=(gain-1.0f)>0?a.k_up:a.k_down,m=fma(gain,k,-k);
-    ro[i]=ushort(uint(clamp(fma(m,R,R),0.0f,16383.0f))<<1);
-    go[i]=ushort(uint(clamp(fma(m,G,G),0.0f,16383.0f))<<1);
-    bo[i]=ushort(uint(clamp(fma(m,B,B),0.0f,16383.0f))<<1);
+    float e=fma(L-local,a.strength,-L)+cv,gain;
+    if(EXACT){gain=dro_exp2_exact(e);ok=true;}else gain=dro_exp2_fast(e,ok);
+    float k=(gain-1.0f)>0?a.k_up:a.k_down,m=fma(gain,k,-k);
+    return ushort3(ushort(uint(clamp(fma(m,R,R),0.0f,16383.0f))<<1),
+                   ushort(uint(clamp(fma(m,G,G),0.0f,16383.0f))<<1),
+                   ushort(uint(clamp(fma(m,B,B),0.0f,16383.0f))<<1));
+}
+// DRO tone mapping in three steps: dro_apply runs the fast exp2 and appends
+// the (rare) undecided pixels to `list`; dro_fix_args turns the count into
+// indirect dispatch sizes; dro_apply_fix recomputes the listed pixels exactly.
+// If the list overflowed, dro_apply_exact redoes the whole image instead.
+kernel void dro_apply(device const ushort *r [[buffer(0)]],device const ushort *g [[buffer(1)]],device const ushort *b [[buffer(2)]],device const float *weights [[buffer(3)]],device const float *sums [[buffer(4)]],device const float *curve [[buffer(5)]],device const float *logtab [[buffer(6)]],device ushort *ro [[buffer(7)]],device ushort *go [[buffer(8)]],device ushort *bo [[buffer(9)]],device uint *list [[buffer(10)]],device atomic_uint *count [[buffer(11)]],constant DroArgs &a [[buffer(12)]],uint2 p [[thread_position_in_grid]]) {
+    if(p.x>=a.width||p.y>=a.height)return;uint i=p.y*a.width+p.x;
+    bool ok;ushort3 o=dro_pixel<false>(r[i],g[i],b[i],int(p.x),int(p.y),weights,sums,curve,logtab,a,ok);
+    if(!ok){uint k=atomic_fetch_add_explicit(count,1u,memory_order_relaxed);if(k<a.fix_capacity)list[k]=i;}
+    ro[i]=o.x;go[i]=o.y;bo[i]=o.z;
+}
+kernel void dro_fix_args(device const uint *count [[buffer(0)]],device uint *ind [[buffer(1)]],constant DroArgs &a [[buffer(2)]],uint2 p [[thread_position_in_grid]]) {
+    if(p.x||p.y)return;
+    uint c=count[0],m=min(c,a.fix_capacity);
+    ind[0]=(m+63)/64;ind[1]=1;ind[2]=1;
+    bool over=c>a.fix_capacity;
+    ind[3]=over?(a.width+15)/16:0;ind[4]=over?(a.height+15)/16:1;ind[5]=1;
+}
+kernel void dro_apply_fix(device const ushort *r [[buffer(0)]],device const ushort *g [[buffer(1)]],device const ushort *b [[buffer(2)]],device const float *weights [[buffer(3)]],device const float *sums [[buffer(4)]],device const float *curve [[buffer(5)]],device const float *logtab [[buffer(6)]],device ushort *ro [[buffer(7)]],device ushort *go [[buffer(8)]],device ushort *bo [[buffer(9)]],device const uint *list [[buffer(10)]],device const uint *count [[buffer(11)]],constant DroArgs &a [[buffer(12)]],uint t [[thread_position_in_grid]]) {
+    if(t>=min(count[0],a.fix_capacity))return;
+    uint i=list[t],x=i%a.width,y=i/a.width;bool ok;
+    ushort3 o=dro_pixel<true>(r[i],g[i],b[i],int(x),int(y),weights,sums,curve,logtab,a,ok);
+    ro[i]=o.x;go[i]=o.y;bo[i]=o.z;
+}
+kernel void dro_apply_exact(device const ushort *r [[buffer(0)]],device const ushort *g [[buffer(1)]],device const ushort *b [[buffer(2)]],device const float *weights [[buffer(3)]],device const float *sums [[buffer(4)]],device const float *curve [[buffer(5)]],device const float *logtab [[buffer(6)]],device ushort *ro [[buffer(7)]],device ushort *go [[buffer(8)]],device ushort *bo [[buffer(9)]],device const uint *list [[buffer(10)]],device const uint *count [[buffer(11)]],constant DroArgs &a [[buffer(12)]],uint2 p [[thread_position_in_grid]]) {
+    if(p.x>=a.width||p.y>=a.height)return;uint i=p.y*a.width+p.x;bool ok;
+    ushort3 o=dro_pixel<true>(r[i],g[i],b[i],int(p.x),int(p.y),weights,sums,curve,logtab,a,ok);
+    ro[i]=o.x;go[i]=o.y;bo[i]=o.z;
 }
