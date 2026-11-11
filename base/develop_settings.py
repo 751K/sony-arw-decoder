@@ -86,7 +86,43 @@ def _ifd(data: bytes, base: int, off: int) -> dict:
     return out
 
 
+def _valid_block(data: bytes, pos: int) -> bool:
+    try:
+        if data[pos:pos + len(_SIG)] != _SIG:
+            return False
+        off2 = struct.unpack_from("<I", data, pos + 22)[0]
+        cur, init = struct.unpack_from("<2I", data, pos + off2)
+        if 0 < cur < len(data) - pos and 0 < init < len(data) - pos:
+            _ifd(data, pos, cur)
+            _ifd(data, pos, init)
+            return True
+    except (struct.error, IndexError, ValueError):
+        pass
+    return False
+
+
+def _tagged_block(data: bytes) -> int | None:
+    """The block offset from SR2Private tag 0x7241 (0 when the file has no
+    Edit block); None when the tag is missing or does not point at a block."""
+    try:
+        import sr2
+        ifd0 = sr2.ifd(data, struct.unpack_from("<I", data, 4)[0])
+        priv = struct.unpack("<I", ifd0[0xc634][2])[0]
+        tag = sr2.ifd(data, priv).get(0x7241)
+    except (KeyError, struct.error, IndexError, ValueError):
+        return None
+    if tag is None or tag[0] != 4 or len(tag[1]) != 1:
+        return None
+    pos = tag[1][0]
+    return pos if pos == 0 or _valid_block(data, pos) else None
+
+
 def _block_base(data: bytes) -> int | None:
+    # SR2Private 0x7241 holds the offset of the block Edit appends (0: none),
+    # so the file need not be scanned; checked against the scan on 10077 ARWs.
+    pos = _tagged_block(data)
+    if pos is not None:
+        return pos or None
     pos = len(data)
     while True:
         pos = data.rfind(_SIG, 0, pos)

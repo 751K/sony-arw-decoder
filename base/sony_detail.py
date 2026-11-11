@@ -129,20 +129,21 @@ def _load_srsettings(key, weights):
     raw = np.frombuffer(b, "<i2", ncls * 240, off).astype(np.int64).reshape(ncls, 24, 10)
     w = np.array(weights, f32)
     coefs = np.zeros((ncls, 26), f32)
-    for c in range(ncls):
-        acc = f32(0)
-        t = 0
-        for k in range(25):
-            if k == 12:
-                continue
-            v = raw[c, t].astype(f32)
-            s = f32(w[0] * v[0])
-            for j in range(1, 10):
-                s = fma32(v[j], w[j], s)
-            coefs[c, 1 + k] = f32(s * f32(0.00048828125))
-            acc = fma32(s, f32(0.00048828125), acc)
-            t += 1
-        coefs[c, 1 + 12] = f32(f32(512.0) - acc)
+    # All classes at once; each lane is the same float32 sequence as the
+    # per-class loop in the binary.
+    v = raw.astype(f32)
+    acc = np.zeros(ncls, f32)
+    t = 0
+    for k in range(25):
+        if k == 12:
+            continue
+        s = (w[0] * v[:, t, 0]).astype(f32)
+        for j in range(1, 10):
+            s = fma32(v[:, t, j], w[j], s)
+        coefs[:, 1 + k] = s * f32(0.00048828125)
+        acc = fma32(s, f32(0.00048828125), acc)
+        t += 1
+    coefs[:, 1 + 12] = f32(512.0) - acc
     patterns = np.array(pat, np.int64)
     patterns.flags.writeable = False
     coefs.flags.writeable = False

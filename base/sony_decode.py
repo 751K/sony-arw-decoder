@@ -246,16 +246,19 @@ def decode(arw, look=None, *, output="srgb", raw=None, nr=None, dro=None, marble
     ox, oy = ex0 - x0, ey0 - y0               # expanded array origin in crop coords
     itp_stream = None
     if metal_itp:
-        # Crop straight into GPU-visible memory so Metal ITP reads it in place.
         import metal_itp as MI
-        cropped = MI.empty((ey1 - ey0, ex1 - ex0), raw.dtype)
-        if raw_stream is not None:              # the GPU crops it as rows arrive
+        if raw_stream is not None:
+            # RawNR and ITP read the crop of the sensor raw in place as rows
+            # arrive; `raw` stays a view that is never read on the host.
             full = raw_stream.full
             itp_stream = MI.RawStream(full.ctypes.data, full.shape[1], full.shape[0],
                                       raw_stream.left + ex0, raw_stream.top + ey0, raw_stream.base)
+            raw = raw[ey0:ey1, ex0:ex1]
         else:
+            # Crop straight into GPU-visible memory so Metal ITP reads it in place.
+            cropped = MI.empty((ey1 - ey0, ex1 - ex0), raw.dtype)
             np.copyto(cropped, raw[ey0:ey1, ex0:ex1])
-        raw = cropped
+            raw = cropped
     else:
         raw = np.ascontiguousarray(raw[ey0:ey1, ex0:ex1])
 
@@ -301,12 +304,13 @@ def decode(arw, look=None, *, output="srgb", raw=None, nr=None, dro=None, marble
                                     nr_args=nr_args, nr_thresholds=nr_thresholds, stream=itp_stream))
         if itp_stream is not None:
             if dro and metal_dro:
-                # The grid reads the decoder rect of the GPU crop once it is
-                # complete, on the auxiliary queue.
+                # The grid reads the decoder rect of the sensor raw in place on
+                # the auxiliary queue, once its last row is decoded.
                 import metal_dro as MD
-                dro_grid = MD.prepare_view(raw, (x0 - ex0, y0 - ey0), (x1 - x0, y1 - y0),
+                top, left = raw_stream.top + y0, raw_stream.left + x0
+                dro_grid = MD.prepare_view(raw_stream.full, (left, top), (x1 - x0, y1 - y0),
                                            dro_black, dro_curve, origin=(ox, oy),
-                                           wait=raw_stream.base)
+                                           wait=raw_stream.base + raw_stream.top + y1)
             if metal_batch:
                 MI.flush()                     # start the GPU while rows are decoding
     else:

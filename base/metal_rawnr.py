@@ -11,12 +11,15 @@ import sony_rawnr as N
 class NrArgs(ctypes.Structure):
     _fields_ = [("width", ctypes.c_uint32), ("height", ctypes.c_uint32),
                 ("off", ctypes.c_int32 * 3), ("gain", ctypes.c_int32 * 3),
-                ("lim", ctypes.c_int32 * 3), ("wm", ctypes.c_int32 * 3), ("s", ctypes.c_float)]
+                ("lim", ctypes.c_int32 * 3), ("wm", ctypes.c_int32 * 3), ("s", ctypes.c_float),
+                # raw view (set by the bridge; 0, 0: a dense width-wide image)
+                ("raw_stride", ctypes.c_uint32), ("raw_origin", ctypes.c_uint32)]
 
 
 def prepare(raw, look, iso=100, settings=(0, 0, 0), strength_override=None):
-    """Parameter block and threshold tables for Metal RawNR."""
-    raw = np.ascontiguousarray(raw, dtype=np.uint16)
+    """Parameter block and threshold tables for Metal RawNR. Only raw's shape
+    is used, so it may be a view of a raw that is still being decoded."""
+    raw = np.asarray(raw)
     if raw.ndim != 2 or min(raw.shape) < 21:
         raise ValueError("expected a 2D raw of at least 21 x 21")
     tb = N.tables(look, *settings)

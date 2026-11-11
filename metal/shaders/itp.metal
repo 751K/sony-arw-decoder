@@ -2,7 +2,9 @@
 using namespace metal;
 #pragma clang fp contract(off)
 
-struct Args { uint width, height; int black[4]; float gains[4]; int scale; float blend_k, blend_lo, blend_hi, blend_half; float k1,k2,k3,k4,k5,k6; uint image_width,image_height,tile_x,tile_y,tile_width,tile_height,halo; };
+struct Args { uint width, height; int black[4]; float gains[4]; int scale; float blend_k, blend_lo, blend_hi, blend_half; float k1,k2,k3,k4,k5,k6; uint image_width,image_height,tile_x,tile_y,tile_width,tile_height,halo;
+    uint src_stride,src_origin; };   // input view: image pixel (x, y) at src_origin + y*src_stride + x (stride 0: dense)
+inline uint src_index(constant Args &a,int x,int y) { return a.src_origin+uint(y)*(a.src_stride?a.src_stride:a.image_width)+uint(x); }
 inline float get(device const float *p, int x, int y, int w, int h) {
     return x < 0 || y < 0 || x >= w || y >= h ? 0.0f : p[y*w+x];
 }
@@ -32,7 +34,7 @@ kernel void load_scale_tile(device const ushort *image [[buffer(0)]],device floa
     y=y<0?(y&1):(y>=h?(h-1)-((h-1^y)&1):y);
     uint b=(p.x&1)|((p.y&1)<<1),i=p.y*a.width+p.x;
     float k=(float(a.scale)*3.0517578e-05f)*a.gains[b];
-    out[i]=(k*0.0625f)*float(int(image[uint(y)*uint(w)+uint(x)])-a.black[b]);
+    out[i]=(k*0.0625f)*float(int(image[src_index(a,x,y)])-a.black[b]);
 }
 kernel void differences(device const float *src [[buffer(0)]], device float *ah [[buffer(1)]], device float *av [[buffer(2)]], constant Args &a [[buffer(3)]], uint2 p [[thread_position_in_grid]]) {
     uint x=p.x,y=p.y,w=a.width,h=a.height; if (x>=w || y>=h) return;
@@ -202,7 +204,7 @@ kernel void load_tile(device const ushort *image [[buffer(0)]],device ushort *ti
  int w=int(a.image_width),h=int(a.image_height);
  x=x<0?(x&1):(x>=w?(w-1)-((w-1^x)&1):x);
  y=y<0?(y&1):(y>=h?(h-1)-((h-1^y)&1):y);
- tile[p.y*a.width+p.x]=image[y*w+x];
+ tile[p.y*a.width+p.x]=image[src_index(a,x,y)];
 }
 kernel void store_tile(device const ushort *r [[buffer(0)]],device const ushort *g [[buffer(1)]],device const ushort *b [[buffer(2)]],device ushort *R [[buffer(3)]],device ushort *G [[buffer(4)]],device ushort *B [[buffer(5)]],constant Args &a [[buffer(6)]],uint2 p [[thread_position_in_grid]]) {
  if(p.x>=a.tile_width||p.y>=a.tile_height)return;

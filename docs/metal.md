@@ -74,20 +74,22 @@ NumPy 中的部分运算在 float64 下进行，或依赖 NumPy 的正确舍入�
 | --- | ---: |
 | NumPy | 24.92 s |
 | `--rust` | 1.79 s |
-| `--metal`（自动使用 Rust 读取和表构造） | 0.090 s |
-| `--rust --metal` | 0.090 s |
+| `--metal`（自动使用 Rust 读取和表构造） | 0.088 s |
+| `--rust --metal` | 0.088 s |
 
-`--metal` 在 Rust 库可用时自动使用 Rust RAW 读取和表构造。热运行 9 次的中位数为 0.090 s；四种后端生成的整图哈希完全一致。
+`--metal` 在 Rust 库可用时自动使用 Rust RAW 读取和表构造。热运行 9 次的中位数为 0.088 s；四种后端生成的整图哈希完全一致。
 
 Metal 阶段按两条 command buffer 提交：RawNR → ITP → DRO → GeoCorr/SSCS 为 RAW 链；front/spatial → Marble/Post → interleave 为渲染链。Post 需要 CPU 回填时会在融合调用前完成已排队的 command buffer。设置 `SONYLOOK_METAL_BATCH=0` 可恢复逐阶段提交。
 
 ITP 每个分块只用 3 个 kernel：`load_scale_tile` 生成 s；`itp_edges` 一次算出 ah/av 和 eh/ev/e1/e2 六个平面（马赛克平面就是奇数相位上的 s，各抽头与中心同相位，因此不再单独存储）；`itp_final` 在每个像素上就地计算权重、方向、绿色插值和色度插值（色度输入在它读取的 ±1 邻点上由 s 重算），直接写入整图。原先只在本像素读取的十余个中间平面不再落地，ITP 由约 45 ms 降到约 25 ms，结果逐位不变。`SONYLOOK_ITP_FUSED=1` 使用原来的 9 个 kernel，`=0` 使用逐个 kernel，用于对照。
 
-Marble 的颜色转换与半宽色度合为一个 kernel（`marble_in_half`）：每个线程转换一对像素，写出 Y/Cb/Cr 和这对像素的半宽色度，不再整平面重读 Cb/Cr；GPU 时间由 7.6 ms 降到 5.5 ms。`SONYLOOK_MARBLE_HALFC=1` 恢复两个独立 kernel。其余只在本像素读取的中间平面已检查过：RawNR 的 hp 平面改为在滤波时重算没有收益（两个 kernel 受计算限制）；空间阶段的 Cr/Cb 和 Marble 输出读取的 Y/Cb/Cr 若就地重算，需要重复整个 front 或颜色转换，计算量大于省下的内存流量，因此保留。
+Marble 的颜色转换与半宽色度合为一个 kernel（`marble_in_half`）：每个线程转换一对像素，写出 Y/Cb/Cr 和这对像素的半宽色度，不再整平面重读 Cb/Cr；GPU 时间由 7.6 ms 降到 5.5 ms。`SONYLOOK_MARBLE_HALFC=1` 恢复两个独立 kernel。
+
+Sharpness、YGamma、Spica 和 YCC2RGB 合为一个 kernel（`spatial_fused`）。每个线程组负责 32×32 的输出块：先把带 6 像素边的 Y（44×44）读进线程组内存，再依次算水平模糊（44×38）、竖直模糊 + Sharpness + YGamma（38×38），最后做 Spica 和 YCC2RGB。这样不再生成整幅的 float `hb` 平面和 `yg` 平面（共约 200 MB 临时缓冲），运算顺序与原来三个 kernel 相同。这几步主要受计算限制，合并本身只快约 0.2 ms；省时间的是 Spica 改用 32 位整数：GPU 上的 64 位整数是软件模拟的，而截断结果只要落在 int 范围内就与 64 位相同，超出时最后的 clamp 也得到同样的值（增益曲线在参数端点超过 2^30 时退回 64 位）。合计由 14.5 ms 降到 12.4 ms。`SONYLOOK_SPATIAL_FUSED=0` 恢复三个独立 kernel。其余只在本像素读取的中间平面已检查过：RawNR 的 hp 平面改为在滤波时重算没有收益（两个 kernel 受计算限制）；空间阶段的 Cr/Cb 和 Marble 输出读取的 Y/Cb/Cr 若就地重算，需要重复整个 front 或颜色转换，计算量大于省下的内存流量，因此保留。
 
 `SONYLOOK_GPU_PROFILE=1` 让每个 encoder 在开始和结束时记录 GPU 时间戳；`sonylook_metal_profile_collect()` 在 GPU 工作完成后累计，`sonylook_metal_profile_report(runs)` 按 kernel 打印每次运行的 GPU 毫秒数（不设置时不采样）。
 
-RAW 读取与 GPU 并行：压缩 RAW 由 Rust 在后台线程解码，直接写入 GPU 可见内存。每解完一行分块（512 行），Rust 回调 bridge，把一个 `MTLSharedEvent` 设为已解码的行数。RAW 链在 RAW 解完之前就提交，GPU 按 ITP 的分块行推进：每行分块之前等待所需的 RAW 行，再依次做裁剪、RawNR（`nr_split` 读 ±2 行，`nr_filter` 读 ±8 行）和这一行的 ITP。DRO 网格在辅助队列上等裁剪完成后读取。只有 ITP、RawNR、DRO 都用 Metal 且白平衡不是取样模式 3 时才启用；`SONYLOOK_RAW_STREAM=0` 可关闭。引入时 SonyChart 由 0.117 s 降到 0.110 s，开启 NR 和 DRO 的 DSC05740 由 0.127 s 降到 0.109 s。解码失败时会解除 GPU 的等待并报告失败的分块。
+RAW 读取与 GPU 并行：压缩 RAW 由 Rust 在后台线程解码，直接写入 GPU 可见内存。每解完一行分块（512 行），Rust 回调 bridge，把一个 `MTLSharedEvent` 设为已解码的行数。RAW 链在 RAW 解完之前就提交，GPU 按 ITP 的分块行推进：每行分块之前等待所需的 RAW 行，再依次做 RawNR（`nr_split` 读 ±2 行，`nr_filter` 读 ±8 行）和这一行的 ITP。RawNR 和 ITP 按行跨度与偏移直接读取完整传感器 RAW 中的裁剪区域，不再先拷贝出裁剪图（省去约 3 ms 的 `raw_crop_rows`，GPU 时间由约 86 ms 降到约 82 ms）。DRO 网格同样就地读取，在辅助队列上等到裁剪区域的最后一行解码完成后开始。只有 ITP、RawNR、DRO 都用 Metal 且白平衡不是取样模式 3 时才启用；`SONYLOOK_RAW_STREAM=0` 可关闭。引入时 SonyChart 由 0.117 s 降到 0.110 s，开启 NR 和 DRO 的 DSC05740 由 0.127 s 降到 0.109 s。解码失败时会解除 GPU 的等待并报告失败的分块。
 
 DSC05740 的分阶段耗时（`--metal`，`SONYLOOK_METAL_BATCH=0 SONYLOOK_RAW_STREAM=0` 逐阶段测量；默认设置下 RAW 读取与 RawNR/ITP 重叠）：
 
@@ -101,7 +103,7 @@ DSC05740 的分阶段耗时（`--metal`，`SONYLOOK_METAL_BATCH=0 SONYLOOK_RAW_S
 | Marble + Effect / ToneCurve / ShadeCorrection | 17 ms |
 
 - 同一进程中首次解码某个文件时，需要读取文件并解析元数据，每张另需约 0.1–0.3 s。
-- 有 `shaders.metallib` 时直接加载预编译库；否则进程中第一次使用 Metal 时需要编译 shader 源码。命令行单张解码（含 Python 启动、Metal 初始化和写 TIFF）约 0.35–0.45 s；开机后首次运行，文件和着色器缓存均未命中时约 1.8 s。
+- 有 `shaders.metallib` 时直接加载预编译库；否则进程中第一次使用 Metal 时需要编译 shader 源码。命令行单张解码（含 Python 启动、Metal 初始化和写 TIFF）约 0.22 s，其中进程内第一次解码约 0.11 s（热运行 0.088 s）；开机后首次运行，文件和着色器缓存均未命中时约 1.8 s。
 
 ## 验证
 

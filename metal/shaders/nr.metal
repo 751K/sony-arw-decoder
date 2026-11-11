@@ -1,12 +1,16 @@
 // ZcTaskRawNR on the whole CFA image (RGGB at even/even), as sony_rawnr.rawnr
 // with region = whole image. Integer arithmetic throughout; the final blend
 // is a single-rounding float32 fma, which is what the reference computes.
-struct NrArgs { uint width,height; int off[3],gain[3],lim[3],wm[3]; float s; };
+// The raw is read as a view: pixel (x, y) is raw[raw_origin + y*raw_stride + x]
+// (raw_stride 0: a dense width-wide image), so a crop of the full sensor raw
+// is read in place.
+struct NrArgs { uint width,height; int off[3],gain[3],lim[3],wm[3]; float s; uint raw_stride,raw_origin; };
+inline uint nr_raw_stride(constant NrArgs &a) { return a.raw_stride?a.raw_stride:a.width; }
 inline int nr_channel(uint x,uint y) { return (y&1)+(x&1); }   // 0 R, 1 G, 2 B
 inline void nr_split_value(device const ushort *raw,uint w,uint h,uint x,uint y,constant NrArgs &a,thread short &hpv,thread ushort &basev) {
     if(x<2||x>=w-2||y<2||y>=h-2){hpv=0;basev=0;return;}
-    uint i=y*w+x;
-    #define R(dy,dx) int(raw[uint(int(i)+(dy)*int(w)+(dx))])
+    uint rs=nr_raw_stride(a),i=a.raw_origin+y*rs+x;
+    #define R(dy,dx) int(raw[uint(int(i)+(dy)*int(rs)+(dx))])
     int c=R(0,0),k=nr_channel(x,y);
     int d2=R(-2,-2)+R(-2,2)+R(2,-2)+R(2,2),a2=R(0,-2)+R(-2,0)+R(0,2)+R(2,0),hv;
     if(k==1){int d1=R(-1,-1)+R(-1,1)+R(1,-1)+R(1,1);hv=((24*c-(d2+2*a2))-3*d1)*36>>10;}
@@ -30,8 +34,8 @@ constant int2 nr_gmean[25]={int2(0,0),int2(-4,0),int2(0,-4),int2(0,4),int2(4,0),
 kernel void nr_filter(device const ushort *raw [[buffer(0)]],device const short *hp [[buffer(1)]],device const ushort *base [[buffer(2)]],device const int *thr [[buffer(3)]],device ushort *out [[buffer(4)]],constant NrArgs &a [[buffer(5)]],constant uint2 &band [[buffer(6)]],uint2 q [[thread_position_in_grid]]) {
     uint2 p=uint2(q.x,q.y+band.x);
     uint w=a.width,h=a.height;if(p.x>=w||p.y>=h||q.y>=band.y)return;
-    uint i=p.y*w+p.x;
-    if(p.x<10||p.x>=w-10||p.y<10||p.y>=h-10){out[i]=raw[i];return;}
+    uint i=p.y*w+p.x,ri=a.raw_origin+p.y*nr_raw_stride(a)+p.x;
+    if(p.x<10||p.x>=w-10||p.y<10||p.y>=h-10){out[i]=raw[ri];return;}
     #define B(dy,dx) int(base[uint(int(i)+(dy)*int(w)+(dx))])
     int k=nr_channel(p.x,p.y),b0=B(0,0),t=thr[k*0x8000+b0],t2=t*t,m=0;
     if(k==1){for(int j=0;j<25;j++)m+=B(nr_gmean[j].x,nr_gmean[j].y);m=m*0x29>>10;}
@@ -44,14 +48,7 @@ kernel void nr_filter(device const ushort *raw [[buffer(0)]],device const short 
     #undef B
     long tv=(long(a.gain[k])*long(hp[i]))>>8;
     tv=tv<=-long(a.lim[k])?-long(a.lim[k]):tv;tv=tv>long(a.lim[k])?long(a.lim[k]):tv;
-    int o=int(clamp(tv-long(a.off[k])+long(acc/n),0L,0x3fffL)),r=int(raw[i]);
+    int o=int(clamp(tv-long(a.off[k])+long(acc/n),0L,0x3fffL)),r=int(raw[ri]);
     out[i]=ushort(int(trunc(fma(float(o-r),a.s,float(r)))));
 }
 
-// Copy a row band of a crop out of a larger image (the full sensor raw):
-// c = (source stride, source x, source y, crop width), band = (row0, rows).
-kernel void raw_crop_rows(device const ushort *src [[buffer(0)]],device ushort *dst [[buffer(1)]],constant uint4 &c [[buffer(2)]],constant uint2 &band [[buffer(3)]],uint2 q [[thread_position_in_grid]]) {
-    if(q.x>=c.w||q.y>=band.y)return;
-    uint y=q.y+band.x;
-    dst[y*c.w+q.x]=src[(y+c.z)*c.x+q.x+c.y];
-}

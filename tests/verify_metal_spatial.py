@@ -3,6 +3,7 @@
 
 Run after building both native libraries: python tests/verify_metal_spatial.py photo.ARW
 """
+import os
 import sys
 import time
 from pathlib import Path
@@ -84,6 +85,21 @@ def main(path):
             same(f'{look_name} {name} Rust', fused_rust.spatial_u16(y, cr, cb, 0, 0, h, 0, h, cfg), actual)
             same(f'{look_name} {name} NumPy', numpy_spatial(y, cr, cb, look, detail), actual)
         print(f'{look_name}: {len(sets)} parameter sets, Metal, Rust and NumPy identical')
+
+    # Image edges crossing the fused kernel's 32 x 32 tiles, down to 7 x 7:
+    # the fused kernel against the three separate ones.
+    look = sony_render.Look('Standard', looks, use_rust=True)
+    y0, cr0, cb0 = test_planes(rng, 100, 257)
+    sizes = ((7, 7), (7, 40), (33, 9), (64, 65), (95, 31), (100, 257))
+    for h, w in sizes:
+        y, cr, cb = (np.ascontiguousarray(v[:h, :w]) for v in (y0, cr0, cb0))
+        for name, detail in sets[::3]:
+            sp = metal_look.Spatial(look, detail)
+            os.environ['SONYLOOK_SPATIAL_FUSED'] = '0'
+            separate = metal_look.spatial(y, cr, cb, sp)
+            os.environ.pop('SONYLOOK_SPATIAL_FUSED')
+            same(f'fused {h} x {w} {name}', separate, metal_look.spatial(y, cr, cb, sp))
+    print(f'fused kernel: {len(sizes)} image sizes from 7 x 7, identical to the separate kernels')
 
     # Full render path: band overlap, SSCS, and both CPU backends.
     params = sony_sscs.params_from_arw(path)

@@ -46,8 +46,8 @@ def prepare(raw, black, curve, *, origin=(0, 0), strength=1.0,
 def prepare_view(source, offset, size, black, curve, *, origin=(0, 0), strength=1.0,
                  k_up=1.0, k_down=1.0, scale=1.0, wait=0):
     """prepare() on the size = (w, h) crop at offset = (x, y) of a GPU-resident
-    2D array, read in place. wait: a RAW stream base; the grid then starts on the
-    GPU only once that stream's crop has been written."""
+    2D array, read in place. wait: a RAW stream value (stream base + sensor rows);
+    the grid then starts on the GPU only once that many rows are decoded."""
     if source.ndim != 2 or source.dtype != np.uint16 or not source.flags.c_contiguous:
         raise ValueError("source must be a contiguous 2D uint16 array")
     black = np.ascontiguousarray(black, dtype=np.int32)

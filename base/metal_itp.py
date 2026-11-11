@@ -111,7 +111,7 @@ def flush():
 
 
 class RawStream(ctypes.Structure):
-    """ITP input cropped on the GPU from a sensor raw that is still decoding.
+    """ITP input read in place from a sensor raw that is still decoding.
 
     Image row y is row y + src_y of `src` (a src_rows x src_stride GPU-resident
     array) and may be read once the decoder has reported that many rows."""
@@ -168,10 +168,13 @@ def full_image(raw, black, gains, scale, params, tile=384, halo=12,
                nr_args=None, nr_thresholds=None, stream=None):
     """Run experimental Metal ITP over an RGGB image with Sony's tile edges.
 
-    stream: optional RawStream. `raw` must then be an empty((h, w)) array that
-    the GPU fills from the stream's source as rows arrive; tiles start as soon
-    as their rows are decoded."""
-    raw = np.ascontiguousarray(raw, dtype=np.uint16)
+    stream: optional RawStream. `raw` is then only the (h, w) view of the
+    stream's source that the GPU reads in place as rows arrive (never read
+    here); tiles start as soon as their rows are decoded."""
+    if stream is None:
+        raw = np.ascontiguousarray(raw, dtype=np.uint16)
+    elif raw.dtype != np.uint16:
+        raise ValueError("a streamed raw must be uint16")
     if raw.ndim != 2 or min(raw.shape) < 12 or tile <= 0 or halo < 10:
         raise ValueError("expected a 2D Bayer image, positive tile and halo >= 10")
     if tile % 2 or halo % 2:
@@ -190,7 +193,7 @@ def full_image(raw, black, gains, scale, params, tile=384, halo=12,
             raise ValueError("nr_thresholds must have shape (3, 0x8000)")
     out = [empty(raw.shape) for _ in range(3)]
     lib = _load()
-    rc = lib.sonylook_metal_itp_image(raw.ctypes.data, raw.shape[1], raw.shape[0], black.ctypes.data,
+    rc = lib.sonylook_metal_itp_image(stream.src if stream is not None else raw.ctypes.data, raw.shape[1], raw.shape[0], black.ctypes.data,
                                      gains.ctypes.data, int(scale), p.ctypes.data, tile, halo,
                                      ctypes.byref(nr_args) if nr_args is not None else None,
                                      nr_thresholds.ctypes.data if nr_thresholds is not None else None,

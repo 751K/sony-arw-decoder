@@ -3,17 +3,16 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-typedef struct { uint32_t width,height; int32_t black[4]; float gains[4]; int32_t scale; float blend_k,blend_lo,blend_hi,blend_half; float k1,k2,k3,k4,k5,k6; uint32_t image_width,image_height,tile_x,tile_y,tile_width,tile_height,halo; } Args;
-typedef struct { uint32_t width,height; int32_t off[3],gain[3],lim[3],wm[3]; float s; } NrArgs;
+typedef struct { uint32_t width,height; int32_t black[4]; float gains[4]; int32_t scale; float blend_k,blend_lo,blend_hi,blend_half; float k1,k2,k3,k4,k5,k6; uint32_t image_width,image_height,tile_x,tile_y,tile_width,tile_height,halo,src_stride,src_origin; } Args;
+typedef struct { uint32_t width,height; int32_t off[3],gain[3],lim[3],wm[3]; float s; uint32_t raw_stride,raw_origin; } NrArgs;
 static id<MTLDevice> device;
 static id<MTLCommandQueue> queue;
 static id<MTLCommandQueue> aux_queue;
 static id<MTLSharedEvent> grid_event;
 static id<MTLCommandBuffer> batch_cmd;
 static NSMutableArray *flushed_cmds;      // batch buffers committed early, not yet waited on
-// RAW streaming: raw_event counts decoded sensor rows (stream base + rows);
-// crop_event is signalled on the main queue once a stream's crop is complete.
-static id<MTLSharedEvent> raw_event,crop_event;
+// RAW streaming: raw_event counts decoded sensor rows (stream base + rows).
+static id<MTLSharedEvent> raw_event;
 static uint64_t raw_stream_base;
 static uint64_t grid_event_value;
 static uint64_t pending_grid_value;
@@ -195,7 +194,6 @@ void sonylook_metal_raw_progress(void *ctx,uint32_t rows) {
 }
 void sonylook_metal_raw_release(uint64_t base) {
     raw_event.signaledValue=base+((uint64_t)1<<24)-1;
-    crop_event.signaledValue=base;
 }
 int sonylook_metal_is_active(void) { return batch_cmd != nil; }
 static SLBuf *find_resident(const void *p,size_t len) {
@@ -269,7 +267,7 @@ int sonylook_metal_init(const char *path) { @autoreleasepool {
         }
         library=[d newLibraryWithSource:source options:opts error:&err]; if(!library) return fail(err.description);
     }
-    NSArray *names=@[@"scale_raw",@"differences",@"candidates",@"weights",@"green_inputs",@"green_five",@"average_pairs",@"direction_errors",@"direction",@"green_finish",@"chroma_inputs",@"chroma_finish",@"load_tile",@"store_tile",@"dro_subcells",@"dro_histogram",@"dro_smooth",@"dro_weights",@"dro_apply",@"geo_apply",@"sscs_apply",@"look_lm_gamma",@"look_front",@"encoded_front",@"sharp_hblur",@"sharp_apply",@"spica_ycc",@"marble_in",@"marble_blocks",@"marble_sigma",@"marble_binom",@"marble_out",@"post_apply",@"nr_split",@"nr_filter",@"marble_halfc",@"marble_cblocks",@"marble_csigma",@"marble_cup",@"dro_math_test",@"interleave3",@"geo_sscs_apply",@"candidates_both",@"green_inputs_five",@"green_finish_fused",@"dro_smooth_weights",@"marble_out_post",@"load_scale_tile",@"weights_candidates",@"marble_out_packed",@"dro_fix_args",@"dro_apply_fix",@"dro_apply_exact",@"raw_crop_rows",@"itp_edges",@"itp_final",@"marble_in_half"];
+    NSArray *names=@[@"scale_raw",@"differences",@"candidates",@"weights",@"green_inputs",@"green_five",@"average_pairs",@"direction_errors",@"direction",@"green_finish",@"chroma_inputs",@"chroma_finish",@"load_tile",@"store_tile",@"dro_subcells",@"dro_histogram",@"dro_smooth",@"dro_weights",@"dro_apply",@"geo_apply",@"sscs_apply",@"look_lm_gamma",@"look_front",@"encoded_front",@"sharp_hblur",@"sharp_apply",@"spica_ycc",@"marble_in",@"marble_blocks",@"marble_sigma",@"marble_binom",@"marble_out",@"post_apply",@"nr_split",@"nr_filter",@"marble_halfc",@"marble_cblocks",@"marble_csigma",@"marble_cup",@"dro_math_test",@"interleave3",@"geo_sscs_apply",@"candidates_both",@"green_inputs_five",@"green_finish_fused",@"dro_smooth_weights",@"marble_out_post",@"load_scale_tile",@"weights_candidates",@"marble_out_packed",@"dro_fix_args",@"dro_apply_fix",@"dro_apply_exact",@"itp_edges",@"itp_final",@"marble_in_half",@"spatial_fused"];
     if(names.count!=NPIPE) return fail(@"Metal kernel table size mismatch");
     pipeline_names=names;
     id<MTLComputePipelineState> ps[NPIPE];
@@ -277,8 +275,8 @@ int sonylook_metal_init(const char *path) { @autoreleasepool {
     queue=[d newCommandQueue]; if(!queue) return fail(@"Cannot create Metal command queue");
     aux_queue=[d newCommandQueue];if(!aux_queue)return fail(@"Cannot create Metal auxiliary queue");
     grid_event=[d newSharedEvent];if(!grid_event)return fail(@"Cannot create Metal shared event");
-    raw_event=[d newSharedEvent];crop_event=[d newSharedEvent];
-    if(!raw_event||!crop_event)return fail(@"Cannot create Metal shared event");
+    raw_event=[d newSharedEvent];
+    if(!raw_event)return fail(@"Cannot create Metal shared event");
     for(int i=0;i<NPIPE;i++) pipelines[i]=ps[i]; device=d; return 0;
 }}
 static void dispatch(id<MTLCommandBuffer> cmd,int kernel,NSArray *buffers,Args *args) {
@@ -345,9 +343,9 @@ static void encode_tile_scaled(id<MTLCommandBuffer> cmd, id source, NSArray *v, 
 static void encode_tile_three(id<MTLCommandBuffer> cmd,id source,NSArray *v,Args *a,id R,id G,id B) {
     id<MTLComputeCommandEncoder> e=new_encoder(cmd,101);
     itp_dispatch_encoder(e,47,@[source,v[0]],a);[e memoryBarrierWithScope:MTLBarrierScopeBuffers];
-    itp_dispatch_encoder(e,54,@[v[0],v[1],v[2],v[13],v[14],v[3],v[4]],a);[e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    itp_dispatch_encoder(e,53,@[v[0],v[1],v[2],v[13],v[14],v[3],v[4]],a);[e memoryBarrierWithScope:MTLBarrierScopeBuffers];
     NSArray *fin=@[v[0],v[1],v[2],v[13],v[14],v[3],v[4],R,G,B];
-    [e setComputePipelineState:pipelines[55]];
+    [e setComputePipelineState:pipelines[54]];
     for(NSUInteger i=0;i<fin.count;i++)bind(e,fin[i],i);
     [e setBytes:a length:sizeof(*a) atIndex:fin.count];
     [e dispatchThreads:MTLSizeMake(a->tile_width,a->tile_height,1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];
@@ -373,14 +371,17 @@ int sonylook_metal_itp_image(const uint16_t *raw, uint32_t w, uint32_t h, const 
     size_t count=(size_t)w*h;
     uint32_t maxw=MIN(w,tile)+2*halo, maxh=MIN(h,tile)+2*halo;
     size_t tilecount=(size_t)maxw*maxh;
-    // Streaming: `raw` is a GPU-resident array the crop kernel fills from the
-    // (resident) sensor raw as its rows are decoded; nothing is read on the host.
-    id image=nil,src=nil;
+    // Streaming: RawNR and ITP read the w x h crop at (src_x, src_y) of the
+    // GPU-resident sensor raw in place, as its rows are decoded; `raw` is unused
+    // and nothing is read on the host.
+    id image=nil;
+    uint32_t src_stride=w,src_origin=0;
     if(stream){
-        image=find_resident(raw,count*2);
-        src=stream->src?find_resident(stream->src,(size_t)stream->src_stride*stream->src_rows*2):nil;
-        if(!image||!src||stream->src_x+w>stream->src_stride||stream->src_y+h>stream->src_rows)
-            return fail(@"Streamed ITP needs GPU-resident raw arrays and an in-bounds crop");
+        if(!stream->src||stream->src_x+w>stream->src_stride||stream->src_y+h>stream->src_rows)
+            return fail(@"Streamed ITP needs an in-bounds crop of the sensor raw");
+        image=find_resident(stream->src,(size_t)stream->src_stride*stream->src_rows*2);
+        if(!image)return fail(@"Streamed ITP needs a GPU-resident sensor raw");
+        src_stride=stream->src_stride;src_origin=stream->src_y*stream->src_stride+stream->src_x;
     } else image=in_buf(raw,count*2);
     id<MTLBuffer> input=acquire(tilecount*2,MTLResourceStorageModePrivate);
     id<MTLBuffer> nr_image=nil,nr_hp=nil,nr_base=nil,nr_thr_buf=nil;
@@ -395,9 +396,12 @@ int sonylook_metal_itp_image(const uint16_t *raw, uint32_t w, uint32_t h, const 
         nr_base=acquire(count*2,MTLResourceStorageModePrivate);
         nr_thr_buf=in_buf(nr_thr,3*0x8000*4);
         nr_local=*nr_args;nr_local.width=w;nr_local.height=h;
+        nr_local.raw_stride=src_stride;nr_local.raw_origin=src_origin;
         if(!nr_image||!nr_hp||!nr_base||!nr_thr_buf)return fail(@"Metal fused RawNR buffers failed");
     }
-    Args a={.image_width=w,.image_height=h,.halo=halo,.scale=scale};memcpy(a.black,black,sizeof(a.black));memcpy(a.gains,gains,sizeof(a.gains));
+    Args a={.image_width=w,.image_height=h,.halo=halo,.scale=scale};
+    // ITP reads the raw view directly, or RawNR's dense output.
+    if(!nr_args){a.src_stride=src_stride;a.src_origin=src_origin;}memcpy(a.black,black,sizeof(a.black));memcpy(a.gains,gains,sizeof(a.gains));
     a.blend_k=params[0];a.blend_lo=params[1];a.blend_hi=params[2];a.blend_half=params[3];a.k1=params[4];a.k2=params[5];a.k3=params[6];a.k4=params[7];a.k5=params[8];a.k6=params[9];
     id<MTLCommandBuffer> cmd=command_buffer();
     // SONYLOOK_ITP_FUSED: unset/2 = three passes, 1 = the nine-kernel encoder, 0 = separate kernels.
@@ -406,16 +410,13 @@ int sonylook_metal_itp_image(const uint16_t *raw, uint32_t w, uint32_t h, const 
     // Row frontiers: before each row of tiles, make sure its input rows exist.
     // ITP reads rows [y - halo, y + tile + halo) (mirrored inside the image);
     // nr_filter row r reads base/hp rows r +- 8, nr_split row r raw rows r +- 2.
-    uint32_t crop_done=stream?0:h,split_done=0,filter_done=0;
-    uint32_t crop_args[4]={stream?stream->src_stride:0,stream?stream->src_x:0,stream?stream->src_y:0,w};
+    uint32_t raw_ready=stream?0:h,split_done=0,filter_done=0;
     for(uint32_t y=0;y<h;y+=tile) {
         uint32_t need=MIN(h,y+MIN(tile,h-y)+halo);
-        uint32_t need_split=nr_args?MIN(h,need+8):0,need_crop=nr_args?MIN(h,need_split+2):need;
-        if(crop_done<need_crop){
-            [cmd encodeWaitForEvent:raw_event value:stream->base+stream->src_y+need_crop];
-            encode_band(cmd,53,@[src,image],crop_args,sizeof(crop_args),w,crop_done,need_crop-crop_done);
-            crop_done=need_crop;
-            if(crop_done==h)[cmd encodeSignalEvent:crop_event value:stream->base];
+        uint32_t need_split=nr_args?MIN(h,need+8):0,need_raw=nr_args?MIN(h,need_split+2):need;
+        if(raw_ready<need_raw){
+            [cmd encodeWaitForEvent:raw_event value:stream->base+stream->src_y+need_raw];
+            raw_ready=need_raw;
         }
         if(nr_args){
             encode_band(cmd,33,@[image,nr_hp,nr_base],&nr_local,sizeof(nr_local),w,split_done,need_split-split_done);
@@ -497,7 +498,7 @@ static DroArgs make_dro_args(uint32_t raww,uint32_t rawh,uint32_t w,uint32_t h,c
     return a;
 }
 // The grid from a raww x rawh crop at (src_x, src_y) of a GPU-resident
-// src_stride-wide array, waiting on the aux queue for crop_event >= wait (0: none).
+// src_stride-wide array, waiting on the aux queue for raw_event >= wait (0: none).
 int sonylook_metal_dro_grid_view(const uint16_t *src,uint32_t src_stride,uint32_t src_rows,uint32_t src_x,uint32_t src_y,uint64_t wait,
                                  uint32_t raww,uint32_t rawh,const int32_t *black,
                                  int32_t ox,int32_t oy,const float *logtab,float log2_max,float strength,
@@ -538,7 +539,7 @@ int sonylook_metal_dro_grid_view(const uint16_t *src,uint32_t src_stride,uint32_
         grid_bufs=[call_bufs subarrayWithRange:r];[call_bufs removeObjectsInRange:r];
     }
     id<MTLCommandBuffer> cmd=[aux_queue commandBuffer];
-    if(wait)[cmd encodeWaitForEvent:crop_event value:wait];
+    if(wait)[cmd encodeWaitForEvent:raw_event value:wait];
     dispatch_dro(cmd,14,@[rawbuf,tab,sub],&a,112,84);
     dispatch_dro(cmd,15,@[sub,hist],&a,8,6);
     dispatch_dro(cmd,45,@[hist,Wb,Sb],&a,8,6);
@@ -748,9 +749,20 @@ static int encode_spatial(id<MTLCommandBuffer> cmd,id<MTLBuffer> y,id<MTLBuffer>
     id<MTLBuffer> lut=in_buf(ylut,65536*2);
     id<MTLBuffer> pat=in_buf(patterns,256*3*4);
     id<MTLBuffer> cof=in_buf(coefs,100*26*4);
+    if(!lut||!pat||!cof)return fail(@"Metal spatial buffer allocation failed");
+    // SONYLOOK_SPATIAL_FUSED=0: the three separate kernels with hb/yg planes.
+    const char *fused=getenv("SONYLOOK_SPATIAL_FUSED");
+    if(!fused||atoi(fused)) {
+        id<MTLComputeCommandEncoder> e=new_encoder(cmd,56);[e setComputePipelineState:pipelines[56]];
+        NSArray *bufs=[@[y,cr,cb,lut,pat,cof] arrayByAddingObjectsFromArray:rgb];
+        for(NSUInteger i=0;i<bufs.count;i++)bind(e,bufs[i],i);
+        [e setBytes:&a length:sizeof(a) atIndex:bufs.count];
+        [e dispatchThreadgroups:MTLSizeMake((w+31)/32,(h+31)/32,1) threadsPerThreadgroup:MTLSizeMake(32,8,1)];[e endEncoding];
+        return 0;
+    }
     id<MTLBuffer> hb=acquire((size_t)(w-4)*(h-4)*4,MTLResourceStorageModePrivate);
     id<MTLBuffer> yg=acquire(n*2,MTLResourceStorageModePrivate);
-    if(!lut||!pat||!cof||!hb||!yg)return fail(@"Metal spatial buffer allocation failed");
+    if(!hb||!yg)return fail(@"Metal spatial buffer allocation failed");
     encode_grid(cmd,24,@[y,hb],&a,sizeof(a),w-4,h-4);
     encode_grid(cmd,25,@[y,hb,lut,yg],&a,sizeof(a),w,h);
     encode_grid(cmd,26,[@[yg,cr,cb,pat,cof] arrayByAddingObjectsFromArray:rgb],&a,sizeof(a),w,h);
@@ -835,7 +847,7 @@ int sonylook_metal_marble(const uint16_t *r,const uint16_t *g,const uint16_t *b,
     if(getenv("SONYLOOK_MARBLE_HALFC")&&strcmp(getenv("SONYLOOK_MARBLE_HALFC"),"0")!=0){   // separate passes, for comparison
         encode_grid(cmd,27,[@[rb,gb,bb,t[0],t[1]] arrayByAddingObjectsFromArray:ycc],&a,sizeof(a),w,h);
         encode_grid(cmd,35,@[ycc[1],ycc[2],half[0],half[1]],&a,sizeof(a),a.w4/2,a.h4);
-    } else encode_grid(cmd,56,[[@[rb,gb,bb,t[0],t[1]] arrayByAddingObjectsFromArray:ycc] arrayByAddingObjectsFromArray:half],&a,sizeof(a),a.w4/2,a.h4);
+    } else encode_grid(cmd,55,[[@[rb,gb,bb,t[0],t[1]] arrayByAddingObjectsFromArray:ycc] arrayByAddingObjectsFromArray:half],&a,sizeof(a),a.w4/2,a.h4);
     if(a.lum_on) {
         encode_grid(cmd,28,@[ycc[0],m],&a,sizeof(a),a.n8w,a.n8h);
         encode_grid(cmd,29,@[m,q],&a,sizeof(a),a.n8w+4,a.n8h+4);
