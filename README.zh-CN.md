@@ -2,7 +2,7 @@
 
 [English](README.md) | 中文
 
-本仓库为 Sony RAW 完整解码器，基于 Imaging Edge Edit 的显影管线构建。NumPy 是参考实现，并另提供基于 Rust 与 Metal 的加速后段。
+本仓库为 Sony RAW 完整解码器，基于 Imaging Edge Edit 的显影管线构建，针对 CPU 与 GPU 分别提供基于 Rust 和 Metal 的加速后端。在速度上，解码一张 3300 万像素的 RAW 仅需 88 ms，比 macOS 自带的 RAW 解码（Core Image）快 3–4 倍；在内存占用上，单张峰值约 1.05 GB，低于 Core Image 的 1.48 GB；并支持 sRGB、Adobe RGB、Display P3、ProPhoto RGB 多种色彩空间，以及 TIFF、JPEG、PNG、HEIF 多种格式输出。
 
 ## 处理管线
 
@@ -39,10 +39,9 @@ Rust 与 Metal 可选，也可以组合使用。NumPy 始终作为逐阶段和�
 | --- | ---: | ---: |
 | NumPy | 24.92 秒 | 1.0× |
 | Rust | 1.79 秒 | 13.9× |
-| Metal | 0.088 秒 | 283.2× |
-| Rust + Metal | 0.088 秒 | 283.2× |
+| Metal（`--metal`） | 0.088 秒 | 283.2× |
 
-使用 `--metal` 时，如果 Rust 库可用，会自动使用 Rust 读取 RAW 并构建外观表。GPU 阶段分为 RAW 链和渲染链两条 command buffer 提交；GeoCorr 与 SSCS、Marble 与 Effect/ToneCurve/ShadeCorrection 分别在同一个 kernel 内完成。压缩 RAW 在后台线程解码，GPU 同时处理已经解出的行（`SONYLOOK_RAW_STREAM=0` 改为先解码完再开始）。设置 `SONYLOOK_METAL_BATCH=0` 可恢复逐阶段提交。四种路径的整图输出哈希完全一致。新进程中的首次解码还会包含初始化、表构建和 Metal 着色器编译，因此耗时更高。以上数据基于一张合成 ARW，不代表所有相机型号或显影设置下的通用性能。
+使用 `--metal` 时，如果 Rust 库可用，会自动使用 Rust 读取 RAW 并构建外观表，所以 `--rust --metal` 与它是同一条路径。GPU 阶段分为 RAW 链和渲染链两条 command buffer 提交；GeoCorr 与 SSCS、Marble 与 Effect/ToneCurve/ShadeCorrection 分别在同一个 kernel 内完成。压缩 RAW 在后台线程解码，GPU 同时处理已经解出的行（`SONYLOOK_RAW_STREAM=0` 改为先解码完再开始）。设置 `SONYLOOK_METAL_BATCH=0` 可恢复逐阶段提交。三种后端的整图输出哈希完全一致。新进程中的首次解码还会包含初始化、表构建和 Metal 着色器编译，因此耗时更高。以上数据基于一张合成 ARW，不代表所有相机型号或显影设置下的通用性能。
 
 ## 安装
 

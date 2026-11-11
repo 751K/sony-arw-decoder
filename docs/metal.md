@@ -74,10 +74,9 @@ NumPy 中的部分运算在 float64 下进行，或依赖 NumPy 的正确舍入�
 | --- | ---: |
 | NumPy | 24.92 s |
 | `--rust` | 1.79 s |
-| `--metal`（自动使用 Rust 读取和表构造） | 0.088 s |
-| `--rust --metal` | 0.088 s |
+| `--metal`（自动使用 Rust 读取和表构造，与 `--rust --metal` 相同） | 0.088 s |
 
-`--metal` 在 Rust 库可用时自动使用 Rust RAW 读取和表构造。热运行 9 次的中位数为 0.088 s；四种后端生成的整图哈希完全一致。
+`--metal` 在 Rust 库可用时自动使用 Rust RAW 读取和表构造。热运行 9 次的中位数为 0.088 s；三种后端生成的整图哈希完全一致。
 
 Metal 阶段按两条 command buffer 提交：RawNR → ITP → DRO → GeoCorr/SSCS 为 RAW 链；front/spatial → Marble/Post → interleave 为渲染链。Post 需要 CPU 回填时会在融合调用前完成已排队的 command buffer。设置 `SONYLOOK_METAL_BATCH=0` 可恢复逐阶段提交。
 
