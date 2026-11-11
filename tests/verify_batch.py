@@ -38,7 +38,7 @@ def main(paths):
         o = int(ifd.offsets[len(ifd.offsets) // 2])
         data[o + 16:o + 144] = b'\xff\x00' * 64
         bad.write_bytes(bytes(data))
-        for fmt, bits in (('.tif', 16), ('.jpg', 14)):
+        for fmt, bits in (('.tif', 16), ('.jpg', 14), ('.hif', 16)):
             out = tmp / ('out' + fmt)
             jobs = sony_batch.collect([src], out, fmt)
             failures = sony_batch.run(jobs, dict(metal=True, output_bits=bits),
@@ -50,8 +50,8 @@ def main(paths):
                 img = sony_decode.decode(str(f), metal=True, output_bits=bits)
                 if fmt == '.tif':
                     same = np.array_equal(tifffile.imread(got), img)
-                else:
-                    ref = tmp / 'ref.jpg'
+                else:                       # JPEG and HEIF encoding are deterministic
+                    ref = tmp / ('ref' + fmt)
                     sony_export.write_image(img, ref, input_bits=bits)
                     same = ref.read_bytes() == got.read_bytes()
                 if not same:

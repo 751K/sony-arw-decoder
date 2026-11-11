@@ -35,7 +35,8 @@ import sony_decode as SD        # noqa: E402
 import sony_export as EXP       # noqa: E402
 import sr2                      # noqa: E402
 
-FORMATS = {"jpg": ".jpg", "jpeg": ".jpg", "tif": ".tif", "tiff": ".tif", "png": ".png"}
+FORMATS = {"jpg": ".jpg", "jpeg": ".jpg", "tif": ".tif", "tiff": ".tif", "png": ".png",
+           "hif": ".hif", "heif": ".hif", "heic": ".heic"}
 
 
 def collect(inputs, out_dir, ext):
@@ -136,17 +137,22 @@ def main():
     ap.add_argument("inputs", nargs="+", help="ARW files and/or folders (searched recursively)")
     ap.add_argument("--out-dir", required=True, help="output folder; subfolders mirror the inputs")
     ap.add_argument("--format", default="jpg", choices=sorted(FORMATS),
-                    help="output format (default jpg; tif is 16-bit, about 200 MB per A7M5 image)")
+                    help="output format (default jpg; tif is 16-bit, about 200 MB per A7M5 image; "
+                         "hif/heic is 10-bit HEIF)")
     ap.add_argument("--skip-existing", action="store_true", help="leave files whose output exists")
     ap.add_argument("--read-ahead", type=int, default=2, help="files read ahead of the decoder")
-    ap.add_argument("--writers", type=int, default=1, help="image encoding/writing threads")
+    ap.add_argument("--writers", type=int, default=None,
+                    help="image encoding/writing threads (default 2 for HEIF, whose encode is slower "
+                         "than a decode, else 1); each holds one more image in memory")
     SD.add_decode_arguments(ap)
     a = ap.parse_args()
     ext = FORMATS[a.format]
     output_bits = SD.output_bits_for(a, ext)
     jobs = collect(a.inputs, a.out_dir, ext)
     failures = run(jobs, SD.decode_kwargs(a, output_bits), SD.write_kwargs(a, output_bits),
-                   read_ahead=max(0, a.read_ahead), writers=a.writers, skip_existing=a.skip_existing)
+                   read_ahead=max(0, a.read_ahead),
+                   writers=a.writers if a.writers else (2 if ext in EXP.HEIF_EXTS else 1),
+                   skip_existing=a.skip_existing)
     for arw, exc in failures:
         print(f"failed: {arw}: {type(exc).__name__}: {exc}", file=sys.stderr)
     sys.exit(1 if failures else 0)

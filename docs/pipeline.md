@@ -426,6 +426,7 @@ RAW → [RawNR] → ITP → [DRO] → [GeoCorr] → SSCS → LinearMatrix16 → 
 ### 9.2 输出色彩空间与文件格式（`sony_export.py`）
 
 - **色彩空间**：`output="srgb" | "adobe"`（另有本项目新增的 `"p3"` 和 `"prophoto"`，见下文）。同一个 render+0x44 同时传给 LinearMatrix16、Marble 和 Effect。
+- **HEIF（`.hif`/`.heic`，本项目新增）**：`metal/heif.m` 用 Core Image 的 `writeHEIF10Representation` 写出（Apple 硬件 HEVC 编码），输入为 16 位尺度的值（14 位 << 2），默认 10 位，可选 8 位，嵌入输出空间的 ICC。同一图像两次写出的字节相同。DSC03591 质量 95：10 位约 8 MB、PSNR 51 dB，8 位约 8.8 MB、45.6 dB。
 - **位深**：Edit 的 16 位 TIFF 是 14 位值 << 2（最大 65532）；8 位是 14 位值 >> 6，直接截断。Metal 的 16 位路径在最终交错 kernel 中完成移位，不建立全图中间副本。
 - **ICC**：Edit 只在 AdobeRGB 时嵌入 `Sony_AdobeRGB_1998.icc`（EXIF ColorSpace = 0xFFFF），sRGB 导出不嵌（ColorSpace = 1）。本实现两种都嵌，配置文件运行时从本机 Edit 安装目录读取。
 - **Display P3 和 ProPhoto（本项目新增，Edit 没有）**：`output="p3" | "prophoto"`，即 `output_mode` 3 / 4，照 AdobeRGB 的做法构造（`color_spaces.py`）：

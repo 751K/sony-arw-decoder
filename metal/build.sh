@@ -22,7 +22,8 @@ else
 fi
 
 clang -O2 -fobjc-arc -dynamiclib -framework Foundation -framework Metal \
-    "$ROOT/metal/bridge.m" -o "$ROOT/metal/libsonylook_metal.dylib"
+    -framework CoreImage -framework ImageIO -framework CoreGraphics \
+    "$ROOT/metal/bridge.m" "$ROOT/metal/heif.m" -o "$ROOT/metal/libsonylook_metal.dylib"
 
 if [ -f "$SHADERS/shaders.metallib" ]; then
     printf 'Built %s\n' "$SHADERS/shaders.metallib"

@@ -14,7 +14,7 @@ RAW → [RawNR] → ITP → [DRO] → [GeoCorr] → SSCS
 ```
 
 方括号中的阶段根据 ARW 中保存的显影设置运行。输出为解码器矩形对应的
-16 位 sRGB 或 Adobe RGB 图像（另可输出本项目新增的 Display P3 和 ProPhoto RGB，Edit 没有这两个选项），可写入 TIFF、JPEG 或 PNG。
+16 位 sRGB 或 Adobe RGB 图像（另可输出本项目新增的 Display P3 和 ProPhoto RGB，Edit 没有这两个选项），可写入 TIFF、JPEG、PNG 或 HEIF（`.hif`，10 位，和 Sony 相机保存的格式相同）。
 
 当前实现使用 A7 V 样张和显影设置作为初始标定目标，并已对 Sony Imaging
 Edge Edit 4.0 / 4.1 的 RGGB 传感器结果进行验证。
@@ -95,7 +95,10 @@ export_image = decode("photo.ARW", metal=True, output_bits=16)
 python3 base/sony_batch.py ~/Pictures/2025 more.ARW --out-dir out --metal
 python3 base/sony_batch.py ~/Pictures/2025 --out-dir out --format tif --metal --skip-existing
 python3 base/sony_batch.py ~/Pictures/2025 --out-dir out-p3 --metal --color-space p3
+python3 base/sony_batch.py ~/Pictures/2025 --out-dir out-hif --format hif --metal
 ```
+
+`--format hif`（或 `--out photo.hif`）通过 Core Image 写出 10 位 HEIF，由 Apple 的硬件编码器做 HEVC 编码（仅限 macOS；`--bits 8` 输出 8 位）。A7M5 图像在默认质量 95 下约 6–9 MB，与解码结果相比 PSNR 51 dB（同质量的 8 位 JPEG 为 4 MB、46 dB）。写一张约 150 ms，所以批量输出 HEIF 时默认用两个写出线程；文件已在系统缓存中时每张约 79 ms。ICC 配置文件和其他格式一样嵌入。
 
 文件夹会递归查找，输出保留原来的子目录结构；默认输出 8 位 JPEG（`--format tif` 输出 16 位 TIFF，每张约 200 MB）。解码选项与 `sony_decode.py` 相同。读取后面的文件、解码、编码写出前面的图片三者同时进行，输出与逐张单独解码逐字节相同。出错的文件（例如损坏的文件）会报告并跳过。在上面的 Mac mini 上，输出 JPEG 并使用 `--metal` 时：文件已在系统缓存中，每张约 87 ms（逐张串行为 151 ms）；从外接 USB 固态硬盘读取，每张 126–162 ms（串行为 267–354 ms），此时瓶颈是硬盘约 300 MB/s 的读取速度。结束时的汇总行会把时间拆分为解码、等待读取和等待写出。
 
@@ -110,6 +113,7 @@ python3 tests/verify_metal_geo_sscs.py photo.ARW
 python3 tests/verify_metal_batch.py photo.ARW
 python3 tests/verify_batch.py photo.ARW [more.ARW ...]
 python3 tests/verify_color_spaces.py photo.ARW
+python3 tests/verify_heif.py photo.ARW
 python3 tests/verify_metal_export.py photo.ARW
 python3 tests/verify_metal_sscs.py photo.ARW
 python3 tests/verify_metal_look.py photo.ARW

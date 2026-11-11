@@ -68,15 +68,48 @@ def to_8bit(img, input_bits=14):
     return (np.asarray(img, np.uint16) >> (6 if input_bits == 14 else 8)).astype(np.uint8)
 
 
+HEIF_EXTS = (".hif", ".heif", ".heic")
+
+
+@lru_cache(maxsize=1)
+def _heif_lib():
+    import ctypes
+    import os
+    path = os.environ.get("SONYLOOK_METAL_LIB") or str(Path(__file__).resolve().parents[1] / "metal" / "libsonylook_metal.dylib")
+    try:
+        lib = ctypes.CDLL(path)
+        fn = lib.sonylook_heif_write
+    except (OSError, AttributeError) as exc:
+        raise RuntimeError("HEIF output needs the macOS bridge: run ./metal/build.sh") from exc
+    fn.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_char_p, ctypes.c_size_t,
+                   ctypes.c_float, ctypes.c_int, ctypes.c_char_p]
+    lib.sonylook_heif_error.restype = ctypes.c_char_p
+    lib.sonylook_heif_info.argtypes = [ctypes.c_char_p] + [ctypes.c_void_p] * 3 + [ctypes.c_char_p, ctypes.c_size_t]
+    lib.sonylook_heif_read.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32]
+    return lib
+
+
+def write_heif(arr16, path, icc, bits=10, quality=95):
+    """HEIF through Core Image (hardware HEVC): arr16 is (H, W, 3) uint16 on the
+    16-bit scale; bits 10 or 8; the profile is embedded."""
+    arr16 = np.ascontiguousarray(arr16, np.uint16)
+    h, w = arr16.shape[:2]
+    lib = _heif_lib()
+    if lib.sonylook_heif_write(arr16.ctypes.data, w, h, icc, len(icc), float(quality) / 100.0,
+                               int(bits), str(path).encode()):
+        raise RuntimeError(lib.sonylook_heif_error().decode())
+
+
 def write_image(img, path, *, color_space="srgb", bits=None, quality=95, input_bits=14):
     """Write (H, W, 3) encoded image with the matching ICC profile.
 
-    path: .tif/.tiff (default 16-bit), .jpg/.jpeg (8-bit), .png (default 8-bit).
-    bits: 8 or 16; None picks the natural depth for the format.  16-bit is not a
-          JPEG option.
+    path: .tif/.tiff (default 16-bit), .jpg/.jpeg (8-bit), .png (default 8-bit),
+          .hif/.heif/.heic (HEIF, default 10-bit, as Sony's cameras write it; macOS).
+    bits: 8 or 16 (8 or 10 for HEIF); None picks the natural depth for the format.
+          16-bit is not a JPEG option.
     input_bits: 14 (decoder values) or the 16-bit TIFF encoding produced by
           decode(..., output_bits=16). No second shift is applied in the latter case.
-    quality: JPEG quality 1..100.
+    quality: JPEG / HEIF quality 1..100.
     """
     img = np.asarray(img)
     if img.ndim != 3 or img.shape[2] < 3:
@@ -92,8 +125,15 @@ def write_image(img, path, *, color_space="srgb", bits=None, quality=95, input_b
     ext = path.suffix.lower()
     is_tiff = ext in (".tif", ".tiff")
     is_jpeg = ext in (".jpg", ".jpeg")
+    if ext in HEIF_EXTS:
+        bits = 10 if bits is None else int(bits)
+        if bits not in (8, 10):
+            raise ValueError("HEIF output is 10-bit or 8-bit")
+        arr16 = img.astype(np.uint16, copy=False) if input_bits == 16 else to_16bit(img)
+        write_heif(arr16, path, icc, bits=bits, quality=quality)
+        return path
     if not (is_tiff or is_jpeg or ext == ".png"):
-        raise ValueError(f"unsupported extension {path.suffix!r}; use .tif, .jpg or .png")
+        raise ValueError(f"unsupported extension {path.suffix!r}; use .tif, .jpg, .png or .hif")
     bits = (16 if is_tiff else 8) if bits is None else int(bits)
     if bits not in (8, 16):
         raise ValueError("bits must be 8 or 16")

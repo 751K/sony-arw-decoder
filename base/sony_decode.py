@@ -481,9 +481,9 @@ def add_decode_arguments(ap):
     ap.add_argument("--color-space", default="srgb", choices=["srgb", "adobe", "p3", "prophoto"],
                     help="output color space (default srgb; p3 = Display P3, prophoto = ProPhoto RGB "
                          "gamma 1.8 -- these two are not Edit options, see base/color_spaces.py)")
-    ap.add_argument("--bits", type=int, default=None, choices=[8, 16],
-                    help="bit depth (default: 16 for TIFF, 8 otherwise)")
-    ap.add_argument("--quality", type=int, default=95, help="JPEG quality 1..100")
+    ap.add_argument("--bits", type=int, default=None, choices=[8, 10, 16],
+                    help="bit depth (default: 16 for TIFF, 10 for HEIF, 8 otherwise; 10 is HEIF only)")
+    ap.add_argument("--quality", type=int, default=95, help="JPEG / HEIF quality 1..100")
     ap.add_argument("--no-nr", action="store_true")
     ap.add_argument("--no-dro", action="store_true")
     ap.add_argument("--no-marble", action="store_true")
@@ -517,11 +517,13 @@ def add_decode_arguments(ap):
 
 
 def output_bits_for(a, suffix):
-    """decode()'s output_bits for writing a `suffix` file: 16 for a 16-bit TIFF
-    (written without a second shift), else the 14-bit decoder values."""
+    """decode()'s output_bits for writing a `suffix` file: 16 for a 16-bit TIFF and
+    for HEIF (both take the 16-bit values; the shift is then done on the GPU),
+    else the 14-bit decoder values."""
+    heif = bool(suffix) and suffix.lower() in EXP.HEIF_EXTS
     if a.bits is not None:
-        return 16 if a.bits == 16 else 14
-    return 16 if suffix and suffix.lower() in (".tif", ".tiff") else 14
+        return 16 if a.bits == 16 or heif else 14
+    return 16 if suffix and suffix.lower() in (".tif", ".tiff") + EXP.HEIF_EXTS else 14
 
 
 def decode_kwargs(a, output_bits=14, verbose=False):
@@ -547,7 +549,7 @@ def main():
                                              "(many files: sony_batch.py)")
     ap.add_argument("arw")
     ap.add_argument("--out", default=None,
-                    help="output .tif/.tiff (16-bit), .jpg (8-bit) or .png (8-bit)")
+                    help="output .tif/.tiff (16-bit), .jpg (8-bit), .png (8-bit) or .hif/.heic (10-bit HEIF)")
     add_decode_arguments(ap)
     a = ap.parse_args()
     output_bits = output_bits_for(a, Path(a.out).suffix if a.out else None)
