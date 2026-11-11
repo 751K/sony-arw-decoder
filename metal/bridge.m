@@ -49,7 +49,7 @@ static id<MTLComputeCommandEncoder> new_encoder(id<MTLCommandBuffer> cmd,int lab
     return [cmd computeCommandEncoderWithDescriptor:d];
 }
 // Fold completed samples into the per-kernel totals (call after the GPU work finished).
-void sonylook_metal_profile_collect(void){
+void sonylook_metal_profile_collect(void){ @autoreleasepool {
     if(prof_on!=1||!prof_n)return;
     NSData *r=[prof_sb resolveCounterRange:NSMakeRange(0,prof_n)];
     const MTLCounterResultTimestamp *t=(const MTLCounterResultTimestamp *)r.bytes;
@@ -57,9 +57,9 @@ void sonylook_metal_profile_collect(void){
         if(t[k].timestamp==MTLCounterErrorValue||t[k+1].timestamp==MTLCounterErrorValue||t[k+1].timestamp<t[k].timestamp)continue;
         prof_ticks[l]+=(double)(t[k+1].timestamp-t[k].timestamp);prof_calls[l]++;}
     prof_n=0;
-}
+}}
 // Print per-kernel GPU milliseconds divided by `runs`, then reset.
-void sonylook_metal_profile_report(uint32_t runs){
+void sonylook_metal_profile_report(uint32_t runs){ @autoreleasepool {
     sonylook_metal_profile_collect();
     if(prof_on!=1){fprintf(stderr,"GPU profiling unavailable (set SONYLOOK_GPU_PROFILE=1)\n");return;}
     MTLTimestamp c1,g1;[device sampleTimestamps:&c1 gpuTimestamp:&g1];
@@ -71,7 +71,7 @@ void sonylook_metal_profile_report(uint32_t runs){
         NSString *n=l==100?@"itp tile (9 kernels)":l==101?@"itp tile (3 passes)":(l<(int)pipeline_names.count?pipeline_names[l]:@"?");
         fprintf(stderr,"  %-24s %8.2f ms  %6llu encoders\n",n.UTF8String,prof_ticks[l]*ns_per_tick/1e6/(runs?runs:1),(unsigned long long)(prof_calls[l]/(runs?runs:1)));
         prof_ticks[l]=0;prof_calls[l]=0;}
-}
+}}
 
 static void encode_grid(id<MTLCommandBuffer> cmd,int kernel,NSArray *buffers,const void *args,size_t len,uint32_t w,uint32_t h);
 static void encode_band(id<MTLCommandBuffer> cmd,int kernel,NSArray *buffers,const void *args,size_t len,uint32_t w,uint32_t row0,uint32_t rows);
@@ -145,29 +145,32 @@ static int submit_command(id<MTLCommandBuffer> cmd) {
     [cmd commit];[cmd waitUntilCompleted];
     return cmd.error ? fail(cmd.error.description) : 0;
 }
-int sonylook_metal_begin(void) {
+// Every entry point drains its own autorelease pool: Python's thread never
+// drains the default one, so an autoreleased command buffer left there (from
+// [queue commandBuffer]) would keep every buffer it used alive for good.
+int sonylook_metal_begin(void) { @autoreleasepool {
     if(!device)return fail(@"Metal device unavailable");
     if(batch_cmd)return fail(@"Metal command batch already active");
     batch_cmd=[queue commandBuffer];
     return batch_cmd ? 0 : fail(@"Cannot create Metal command buffer");
-}
+}}
 // Commit the batch so far without waiting and keep batching into a new
 // buffer on the same queue (which preserves order): the GPU can start on
 // early stages while the host is still encoding or producing input.
-int sonylook_metal_flush(void) {
+int sonylook_metal_flush(void) { @autoreleasepool {
     if(!batch_cmd)return fail(@"No Metal command batch is active");
     if(!flushed_cmds)flushed_cmds=[NSMutableArray array];
     [batch_cmd commit];[flushed_cmds addObject:batch_cmd];
     batch_cmd=[queue commandBuffer];
     return batch_cmd ? 0 : fail(@"Cannot create Metal command buffer");
-}
+}}
 static int finish_flushed(void) {
     int rc=0;
     for(id<MTLCommandBuffer> c in flushed_cmds){[c waitUntilCompleted];if(c.error&&!rc)rc=fail(c.error.description);}
     [flushed_cmds removeAllObjects];
     return rc;
 }
-int sonylook_metal_end(void) {
+int sonylook_metal_end(void) { @autoreleasepool {
     if(!batch_cmd)return fail(@"No Metal command batch is active");
     id<MTLCommandBuffer> cmd=batch_cmd;
     batch_cmd=nil;
@@ -175,13 +178,13 @@ int sonylook_metal_end(void) {
     int frc=finish_flushed();
     done(0);
     return rc?rc:frc;
-}
-int sonylook_metal_abort(void) {
+}}
+int sonylook_metal_abort(void) { @autoreleasepool {
     batch_cmd=nil;
     finish_flushed();          // their temporaries must not be reused before they finish
     done(0);
     return 0;
-}
+}}
 // RAW streaming. begin returns the base value for a new stream; the decoder
 // reports rows through raw_progress(ctx = base); release unblocks all waits
 // (decode failure).
@@ -222,19 +225,19 @@ static void bind(id<MTLComputeCommandEncoder> e,id o,NSUInteger i) {
     if([o isKindOfClass:[SLBuf class]])[e setBuffer:((SLBuf *)o).buf offset:((SLBuf *)o).off atIndex:i];
     else [e setBuffer:o offset:0 atIndex:i];
 }
-void *sonylook_metal_alloc(size_t len) {
+void *sonylook_metal_alloc(size_t len) { @autoreleasepool {
     if(!device)return NULL;
     id<MTLBuffer> b=pool_take(len,MTLResourceStorageModeShared);if(!b)return NULL;
     @synchronized(buf_lock){resident[@((uintptr_t)b.contents)]=b;}
     return b.contents;
-}
-void sonylook_metal_free(void *p) {
+}}
+void sonylook_metal_free(void *p) { @autoreleasepool {
     id<MTLBuffer> b=nil;
     @synchronized(buf_lock){NSNumber *k=@((uintptr_t)p);b=resident[k];[resident removeObjectForKey:k];}
     if(b)pool_put(b);
-}
+}}
 // Drop all idle pooled buffers.
-void sonylook_metal_trim(void) { @synchronized(buf_lock){[pool_bufs removeAllObjects];pool_bytes=0;} }
+void sonylook_metal_trim(void) { @autoreleasepool { @synchronized(buf_lock){[pool_bufs removeAllObjects];pool_bytes=0;} }}
 size_t sonylook_metal_pool_bytes(void) { @synchronized(buf_lock){return pool_bytes;} }
 int sonylook_metal_init(const char *path) { @autoreleasepool {
     if (device) return 0;
