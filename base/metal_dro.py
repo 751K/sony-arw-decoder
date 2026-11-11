@@ -43,6 +43,37 @@ def prepare(raw, black, curve, *, origin=(0, 0), strength=1.0,
     return weights, sums
 
 
+def prepare_view(source, offset, size, black, curve, *, origin=(0, 0), strength=1.0,
+                 k_up=1.0, k_down=1.0, scale=1.0, wait=0):
+    """prepare() on the size = (w, h) crop at offset = (x, y) of a GPU-resident
+    2D array, read in place. wait: a RAW stream base; the grid then starts on the
+    GPU only once that stream's crop has been written."""
+    if source.ndim != 2 or source.dtype != np.uint16 or not source.flags.c_contiguous:
+        raise ValueError("source must be a contiguous 2D uint16 array")
+    black = np.ascontiguousarray(black, dtype=np.int32)
+    if black.shape != (3,) or len(offset) != 2 or len(size) != 2:
+        raise ValueError("expected three black levels, an offset and a size")
+    w, h = map(int, size)
+    if w < 448 or h < 336:
+        raise ValueError("DRO raw grid requires at least 448 x 336 pixels")
+    weights = metal_itp.empty((6, 8, 14), np.float32)
+    sums = metal_itp.empty((6, 8, 14), np.float32)
+    lib = metal_itp._load()
+    lib.sonylook_metal_dro_grid_view.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+        ctypes.c_uint64, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
+        ctypes.c_int32, ctypes.c_int32, ctypes.c_void_p, ctypes.c_float, ctypes.c_float,
+        ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_void_p, ctypes.c_void_p]
+    rc = lib.sonylook_metal_dro_grid_view(
+        source.ctypes.data, source.shape[1], source.shape[0], int(offset[0]), int(offset[1]),
+        int(wait), w, h, black.ctypes.data, int(origin[0]), int(origin[1]),
+        sony_dro.LOG_T.ctypes.data, sony_dro.LOG2_MAX, float(strength), float(k_up),
+        float(k_down), float(scale), weights.ctypes.data, sums.ctypes.data)
+    if rc:
+        raise RuntimeError(lib.sonylook_metal_error().decode())
+    return weights, sums
+
+
 def apply_prepared(planes, grid, black, curve, *, origin=(0, 0), strength=1.0,
                    k_up=1.0, k_down=1.0, scale=1.0, raw_size=None):
     """Apply a DRO grid started by prepare(), waiting on the shared event."""

@@ -10,14 +10,23 @@ static id<MTLCommandQueue> queue;
 static id<MTLCommandQueue> aux_queue;
 static id<MTLSharedEvent> grid_event;
 static id<MTLCommandBuffer> batch_cmd;
+static NSMutableArray *flushed_cmds;      // batch buffers committed early, not yet waited on
+// RAW streaming: raw_event counts decoded sensor rows (stream base + rows);
+// crop_event is signalled on the main queue once a stream's crop is complete.
+static id<MTLSharedEvent> raw_event,crop_event;
+static uint64_t raw_stream_base;
 static uint64_t grid_event_value;
 static uint64_t pending_grid_value;
-#define NPIPE 53
+#define NPIPE 54
 static id<MTLComputePipelineState> pipelines[NPIPE];
 static char error_text[2048];
 const char *sonylook_metal_error(void) { return error_text; }
 static int fail(NSString *s) { snprintf(error_text,sizeof(error_text),"%s",s.UTF8String); return -1; }
 static void encode_grid(id<MTLCommandBuffer> cmd,int kernel,NSArray *buffers,const void *args,size_t len,uint32_t w,uint32_t h);
+static void encode_band(id<MTLCommandBuffer> cmd,int kernel,NSArray *buffers,const void *args,size_t len,uint32_t w,uint32_t row0,uint32_t rows);
+// The ITP input streamed from a larger sensor raw that is still being decoded:
+// image row y is source row y + src_y, available once raw_event >= base + that + 1.
+typedef struct { const uint16_t *src; uint32_t src_stride,src_rows,src_x,src_y; uint64_t base; } RawStream;
 static NSArray *new_buffers(size_t count,size_t length,MTLResourceOptions options);
 
 // ---------------------------------------------------------------------------
@@ -91,18 +100,50 @@ int sonylook_metal_begin(void) {
     batch_cmd=[queue commandBuffer];
     return batch_cmd ? 0 : fail(@"Cannot create Metal command buffer");
 }
+// Commit the batch so far without waiting and keep batching into a new
+// buffer on the same queue (which preserves order): the GPU can start on
+// early stages while the host is still encoding or producing input.
+int sonylook_metal_flush(void) {
+    if(!batch_cmd)return fail(@"No Metal command batch is active");
+    if(!flushed_cmds)flushed_cmds=[NSMutableArray array];
+    [batch_cmd commit];[flushed_cmds addObject:batch_cmd];
+    batch_cmd=[queue commandBuffer];
+    return batch_cmd ? 0 : fail(@"Cannot create Metal command buffer");
+}
+static int finish_flushed(void) {
+    int rc=0;
+    for(id<MTLCommandBuffer> c in flushed_cmds){[c waitUntilCompleted];if(c.error&&!rc)rc=fail(c.error.description);}
+    [flushed_cmds removeAllObjects];
+    return rc;
+}
 int sonylook_metal_end(void) {
     if(!batch_cmd)return fail(@"No Metal command batch is active");
     id<MTLCommandBuffer> cmd=batch_cmd;
     batch_cmd=nil;
     int rc=submit_command(cmd);
+    int frc=finish_flushed();
     done(0);
-    return rc;
+    return rc?rc:frc;
 }
 int sonylook_metal_abort(void) {
     batch_cmd=nil;
+    finish_flushed();          // their temporaries must not be reused before they finish
     done(0);
     return 0;
+}
+// RAW streaming. begin returns the base value for a new stream; the decoder
+// reports rows through raw_progress(ctx = base); release unblocks all waits
+// (decode failure).
+uint64_t sonylook_metal_raw_stream_begin(void) {
+    raw_stream_base+=(uint64_t)1<<24;
+    return raw_stream_base;
+}
+void sonylook_metal_raw_progress(void *ctx,uint32_t rows) {
+    raw_event.signaledValue=(uint64_t)(uintptr_t)ctx+rows;
+}
+void sonylook_metal_raw_release(uint64_t base) {
+    raw_event.signaledValue=base+((uint64_t)1<<24)-1;
+    crop_event.signaledValue=base;
 }
 int sonylook_metal_is_active(void) { return batch_cmd != nil; }
 static SLBuf *find_resident(const void *p,size_t len) {
@@ -176,13 +217,15 @@ int sonylook_metal_init(const char *path) { @autoreleasepool {
         }
         library=[d newLibraryWithSource:source options:opts error:&err]; if(!library) return fail(err.description);
     }
-    NSArray *names=@[@"scale_raw",@"differences",@"candidates",@"weights",@"green_inputs",@"green_five",@"average_pairs",@"direction_errors",@"direction",@"green_finish",@"chroma_inputs",@"chroma_finish",@"load_tile",@"store_tile",@"dro_subcells",@"dro_histogram",@"dro_smooth",@"dro_weights",@"dro_apply",@"geo_apply",@"sscs_apply",@"look_lm_gamma",@"look_front",@"encoded_front",@"sharp_hblur",@"sharp_apply",@"spica_ycc",@"marble_in",@"marble_blocks",@"marble_sigma",@"marble_binom",@"marble_out",@"post_apply",@"nr_split",@"nr_filter",@"marble_halfc",@"marble_cblocks",@"marble_csigma",@"marble_cup",@"dro_math_test",@"interleave3",@"geo_sscs_apply",@"candidates_both",@"green_inputs_five",@"green_finish_fused",@"dro_smooth_weights",@"marble_out_post",@"load_scale_tile",@"weights_candidates",@"marble_out_packed",@"dro_fix_args",@"dro_apply_fix",@"dro_apply_exact"];
+    NSArray *names=@[@"scale_raw",@"differences",@"candidates",@"weights",@"green_inputs",@"green_five",@"average_pairs",@"direction_errors",@"direction",@"green_finish",@"chroma_inputs",@"chroma_finish",@"load_tile",@"store_tile",@"dro_subcells",@"dro_histogram",@"dro_smooth",@"dro_weights",@"dro_apply",@"geo_apply",@"sscs_apply",@"look_lm_gamma",@"look_front",@"encoded_front",@"sharp_hblur",@"sharp_apply",@"spica_ycc",@"marble_in",@"marble_blocks",@"marble_sigma",@"marble_binom",@"marble_out",@"post_apply",@"nr_split",@"nr_filter",@"marble_halfc",@"marble_cblocks",@"marble_csigma",@"marble_cup",@"dro_math_test",@"interleave3",@"geo_sscs_apply",@"candidates_both",@"green_inputs_five",@"green_finish_fused",@"dro_smooth_weights",@"marble_out_post",@"load_scale_tile",@"weights_candidates",@"marble_out_packed",@"dro_fix_args",@"dro_apply_fix",@"dro_apply_exact",@"raw_crop_rows"];
     if(names.count!=NPIPE) return fail(@"Metal kernel table size mismatch");
     id<MTLComputePipelineState> ps[NPIPE];
     for(int i=0;i<NPIPE;i++) { id<MTLFunction> f=[library newFunctionWithName:names[i]]; if(!f) return fail(@"Missing Metal function"); ps[i]=[d newComputePipelineStateWithFunction:f error:&err]; if(!ps[i]) return fail(err.description); }
     queue=[d newCommandQueue]; if(!queue) return fail(@"Cannot create Metal command queue");
     aux_queue=[d newCommandQueue];if(!aux_queue)return fail(@"Cannot create Metal auxiliary queue");
     grid_event=[d newSharedEvent];if(!grid_event)return fail(@"Cannot create Metal shared event");
+    raw_event=[d newSharedEvent];crop_event=[d newSharedEvent];
+    if(!raw_event||!crop_event)return fail(@"Cannot create Metal shared event");
     for(int i=0;i<NPIPE;i++) pipelines[i]=ps[i]; device=d; return 0;
 }}
 static void dispatch(id<MTLCommandBuffer> cmd,int kernel,NSArray *buffers,Args *args) {
@@ -259,12 +302,20 @@ int sonylook_metal_itp_tile(const uint16_t *raw, uint32_t w, uint32_t h, const i
 }}
 
 // Whole image: scratch planes are allocated once and reused in GPU command order.
-int sonylook_metal_itp_image(const uint16_t *raw, uint32_t w, uint32_t h, const int32_t *black, const float *gains, int32_t scale, const float *params, uint32_t tile, uint32_t halo, const NrArgs *nr_args, const int32_t *nr_thr, uint16_t *r, uint16_t *g, uint16_t *b) { @autoreleasepool {
+int sonylook_metal_itp_image(const uint16_t *raw, uint32_t w, uint32_t h, const int32_t *black, const float *gains, int32_t scale, const float *params, uint32_t tile, uint32_t halo, const NrArgs *nr_args, const int32_t *nr_thr, const RawStream *stream, uint16_t *r, uint16_t *g, uint16_t *b) { @autoreleasepool {
     if(!device || !raw || !r || !g || !b || w<12 || h<12 || tile==0 || halo<10) return fail(@"Invalid Metal ITP image arguments");
     size_t count=(size_t)w*h;
     uint32_t maxw=MIN(w,tile)+2*halo, maxh=MIN(h,tile)+2*halo;
     size_t tilecount=(size_t)maxw*maxh;
-    id<MTLBuffer> image=in_buf(raw,count*2);
+    // Streaming: `raw` is a GPU-resident array the crop kernel fills from the
+    // (resident) sensor raw as its rows are decoded; nothing is read on the host.
+    id image=nil,src=nil;
+    if(stream){
+        image=find_resident(raw,count*2);
+        src=stream->src?find_resident(stream->src,(size_t)stream->src_stride*stream->src_rows*2):nil;
+        if(!image||!src||stream->src_x+w>stream->src_stride||stream->src_y+h>stream->src_rows)
+            return fail(@"Streamed ITP needs GPU-resident raw arrays and an in-bounds crop");
+    } else image=in_buf(raw,count*2);
     id<MTLBuffer> input=acquire(tilecount*2,MTLResourceStorageModePrivate);
     id<MTLBuffer> nr_image=nil,nr_hp=nil,nr_base=nil,nr_thr_buf=nil;
     NrArgs nr_local={0};
@@ -284,11 +335,27 @@ int sonylook_metal_itp_image(const uint16_t *raw, uint32_t w, uint32_t h, const 
     a.blend_k=params[0];a.blend_lo=params[1];a.blend_hi=params[2];a.blend_half=params[3];a.k1=params[4];a.k2=params[5];a.k3=params[6];a.k4=params[7];a.k5=params[8];a.k6=params[9];
     id<MTLCommandBuffer> cmd=command_buffer();
     int fused_itp=getenv("SONYLOOK_ITP_FUSED")==NULL||strcmp(getenv("SONYLOOK_ITP_FUSED"),"0")!=0;
-    if(nr_args) {
-        encode_grid(cmd,33,@[image,nr_hp,nr_base],&nr_local,sizeof(nr_local),w,h);
-        encode_grid(cmd,34,@[image,nr_hp,nr_base,nr_thr_buf,nr_image],&nr_local,sizeof(nr_local),w,h);
-    }
-    for(uint32_t y=0;y<h;y+=tile) for(uint32_t x=0;x<w;x+=tile) {
+    // Row frontiers: before each row of tiles, make sure its input rows exist.
+    // ITP reads rows [y - halo, y + tile + halo) (mirrored inside the image);
+    // nr_filter row r reads base/hp rows r +- 8, nr_split row r raw rows r +- 2.
+    uint32_t crop_done=stream?0:h,split_done=0,filter_done=0;
+    uint32_t crop_args[4]={stream?stream->src_stride:0,stream?stream->src_x:0,stream?stream->src_y:0,w};
+    for(uint32_t y=0;y<h;y+=tile) {
+        uint32_t need=MIN(h,y+MIN(tile,h-y)+halo);
+        uint32_t need_split=nr_args?MIN(h,need+8):0,need_crop=nr_args?MIN(h,need_split+2):need;
+        if(crop_done<need_crop){
+            [cmd encodeWaitForEvent:raw_event value:stream->base+stream->src_y+need_crop];
+            encode_band(cmd,53,@[src,image],crop_args,sizeof(crop_args),w,crop_done,need_crop-crop_done);
+            crop_done=need_crop;
+            if(crop_done==h)[cmd encodeSignalEvent:crop_event value:stream->base];
+        }
+        if(nr_args){
+            encode_band(cmd,33,@[image,nr_hp,nr_base],&nr_local,sizeof(nr_local),w,split_done,need_split-split_done);
+            split_done=need_split;
+            encode_band(cmd,34,@[image,nr_hp,nr_base,nr_thr_buf,nr_image],&nr_local,sizeof(nr_local),w,filter_done,need-filter_done);
+            filter_done=need;
+        }
+    for(uint32_t x=0;x<w;x+=tile) {
         a.tile_x=x;a.tile_y=y;a.tile_width=MIN(tile,w-x);a.tile_height=MIN(tile,h-y);
         a.width=a.tile_width+2*halo;a.height=a.tile_height+2*halo;
         id<MTLCommandBuffer> tile_cmd=cmd;
@@ -302,7 +369,7 @@ int sonylook_metal_itp_image(const uint16_t *raw, uint32_t w, uint32_t h, const 
             encode_tile(tile_cmd,input,v,&a);
         }
         dispatch(tile_cmd,13,@[v[22],v[23],v[24],red,green,blue],&a);
-    }
+    }}
     int rc=submit_command(cmd);if(rc)return rc;
     copy_back(red,r,count*2);copy_back(green,g,count*2);copy_back(blue,b,count*2);return done(0);
 }}
@@ -314,6 +381,7 @@ typedef struct {
     int32_t black_r,black_g,black_b;
     float log2_max,strength,k_up,k_down,scale;
     uint32_t fix_capacity;
+    uint32_t src_stride,src_x,src_y;
 } DroArgs;
 static void dispatch_dro(id<MTLCommandBuffer> cmd,int kernel,NSArray *buffers,DroArgs *args, uint32_t w,uint32_t h) {
     id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];[e setComputePipelineState:pipelines[kernel]];
@@ -353,21 +421,41 @@ static DroArgs make_dro_args(uint32_t raww,uint32_t rawh,uint32_t w,uint32_t h,c
                .strength=strength,.k_up=k_up,.k_down=k_down,.scale=scale};
     a.subpx_x=((raww>>2)/112)*4;a.subpx_y=((rawh>>2)/84)*4;a.per_x=a.subpx_x/4;a.per_y=a.subpx_y/4;
     a.org_x=((raww-a.subpx_x*112)>>1)&~1u;a.org_y=((rawh-a.subpx_y*84)>>1)&~1u;
+    a.src_stride=raww;a.src_x=0;a.src_y=0;
     return a;
 }
+// The grid from a raww x rawh crop at (src_x, src_y) of a GPU-resident
+// src_stride-wide array, waiting on the aux queue for crop_event >= wait (0: none).
+int sonylook_metal_dro_grid_view(const uint16_t *src,uint32_t src_stride,uint32_t src_rows,uint32_t src_x,uint32_t src_y,uint64_t wait,
+                                 uint32_t raww,uint32_t rawh,const int32_t *black,
+                                 int32_t ox,int32_t oy,const float *logtab,float log2_max,float strength,
+                                 float k_up,float k_down,float scale,float *weights,float *sums);
 int sonylook_metal_dro_grid(const uint16_t *raw,uint32_t raww,uint32_t rawh,const int32_t *black,
                             int32_t ox,int32_t oy,const float *logtab,const float *curve,
                             float log2_max,float strength,float k_up,float k_down,float scale,
-                            float *weights,float *sums) { @autoreleasepool {
-    if(!device||!aux_queue||!grid_event||!raw||!weights||!sums||raww<448||rawh<336)return fail(@"Invalid Metal DRO grid arguments");
+                            float *weights,float *sums) {
+    (void)curve;
+    return sonylook_metal_dro_grid_view(raw,raww,rawh,0,0,0,raww,rawh,black,ox,oy,logtab,log2_max,strength,k_up,k_down,scale,weights,sums);
+}
+int sonylook_metal_dro_grid_view(const uint16_t *src,uint32_t src_stride,uint32_t src_rows,uint32_t src_x,uint32_t src_y,uint64_t wait,
+                                 uint32_t raww,uint32_t rawh,const int32_t *black,
+                                 int32_t ox,int32_t oy,const float *logtab,float log2_max,float strength,
+                                 float k_up,float k_down,float scale,float *weights,float *sums) { @autoreleasepool {
+    if(!device||!aux_queue||!grid_event||!src||!weights||!sums||raww<448||rawh<336||
+       src_x+raww>src_stride||src_y+rawh>src_rows)return fail(@"Invalid Metal DRO grid arguments");
     DroArgs a=make_dro_args(raww,rawh,1,1,black,ox,oy,log2_max,strength,k_up,k_down,scale);
+    a.src_stride=src_stride;a.src_x=src_x;a.src_y=src_y;
     // The grid finishes asynchronously on aux_queue. W/S are read by a later
     // call, so they must be resident arrays (metal_itp.empty), never pooled
     // copies that would need a copy-back.
     id Wb=find_resident(weights,8*6*14*4),Sb=find_resident(sums,8*6*14*4);
     if(!Wb||!Sb)return fail(@"Metal DRO grid outputs must be GPU-resident arrays");
     NSUInteger mark;@synchronized(buf_lock){mark=call_bufs.count;}
-    id rawbuf=in_buf(raw,(size_t)raww*rawh*2),tab=in_buf(logtab,2049*4);
+    size_t srclen=(size_t)src_stride*src_rows*2;
+    // A wait means the source is still being produced on the GPU: it must be
+    // read in place, never copied now.
+    id rawbuf=wait?find_resident(src,srclen):in_buf(src,srclen),tab=in_buf(logtab,2049*4);
+    if(wait&&!rawbuf)return fail(@"Streamed DRO grid needs a GPU-resident source");
     id sub=acquire(112*84*4,MTLResourceStorageModeShared),hist=acquire(8*6*14*4,MTLResourceStorageModePrivate);
     if(!rawbuf||!tab||!sub||!hist)return fail(@"Metal DRO grid allocation failed");
     // Temporaries live until the aux command buffer completes, not until the
@@ -378,6 +466,7 @@ int sonylook_metal_dro_grid(const uint16_t *raw,uint32_t raww,uint32_t rawh,cons
         grid_bufs=[call_bufs subarrayWithRange:r];[call_bufs removeObjectsInRange:r];
     }
     id<MTLCommandBuffer> cmd=[aux_queue commandBuffer];
+    if(wait)[cmd encodeWaitForEvent:crop_event value:wait];
     dispatch_dro(cmd,14,@[rawbuf,tab,sub],&a,112,84);
     dispatch_dro(cmd,15,@[sub,hist],&a,8,6);
     dispatch_dro(cmd,45,@[hist,Wb,Sb],&a,8,6);
@@ -385,7 +474,6 @@ int sonylook_metal_dro_grid(const uint16_t *raw,uint32_t raww,uint32_t rawh,cons
     [cmd encodeSignalEvent:grid_event value:pending_grid_value];
     [cmd addCompletedHandler:^(id<MTLCommandBuffer> c){(void)c;for(id<MTLBuffer> b in grid_bufs)pool_put(b);}];
     [cmd commit];
-    (void)curve;
     return 0;
 }}
 int sonylook_metal_dro_grid_apply(const uint16_t *r,const uint16_t *g,const uint16_t *b,uint32_t w,uint32_t h,
@@ -567,6 +655,16 @@ static void encode_grid(id<MTLCommandBuffer> cmd,int kernel,NSArray *buffers,con
     for(NSUInteger i=0;i<buffers.count;i++)bind(e,buffers[i],i);
     [e setBytes:args length:len atIndex:buffers.count];[e dispatchThreads:MTLSizeMake(w,h,1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];[e endEncoding];
 }
+// encode_grid over rows [row0, row0 + rows) of a w-wide image; the kernel
+// takes the band as the constant after `args`.
+static void encode_band(id<MTLCommandBuffer> cmd,int kernel,NSArray *buffers,const void *args,size_t len,uint32_t w,uint32_t row0,uint32_t rows) {
+    if(!rows)return;
+    uint32_t band[2]={row0,rows};
+    id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];[e setComputePipelineState:pipelines[kernel]];
+    for(NSUInteger i=0;i<buffers.count;i++)bind(e,buffers[i],i);
+    [e setBytes:args length:len atIndex:buffers.count];[e setBytes:band length:sizeof(band) atIndex:buffers.count+1];
+    [e dispatchThreads:MTLSizeMake(w,rows,1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];[e endEncoding];
+}
 static NSArray *new_buffers(size_t count,size_t length,MTLResourceOptions options) {
     NSMutableArray *v=[NSMutableArray array];
     for(size_t i=0;i<count;i++){id<MTLBuffer> b=acquire(length,options);if(!b)return nil;[v addObject:b];}
@@ -747,8 +845,8 @@ int sonylook_metal_rawnr(const uint16_t *raw,uint32_t w,uint32_t h,const NrArgs 
     id<MTLBuffer> hp=acquire(n*2,MTLResourceStorageModePrivate),base=acquire(n*2,MTLResourceStorageModePrivate);
     if(!rb||!tb||!ob||!hp||!base)return fail(@"Metal RawNR buffer allocation failed");
     id<MTLCommandBuffer> cmd=command_buffer();
-    encode_grid(cmd,33,@[rb,hp,base],&a,sizeof(a),w,h);
-    encode_grid(cmd,34,@[rb,hp,base,tb,ob],&a,sizeof(a),w,h);
+    encode_band(cmd,33,@[rb,hp,base],&a,sizeof(a),w,0,h);
+    encode_band(cmd,34,@[rb,hp,base,tb,ob],&a,sizeof(a),w,0,h);
     int rc=submit_command(cmd);if(rc)return rc;
     copy_back(ob,out,n*2);return done(0);
 }}

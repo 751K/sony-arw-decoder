@@ -74,25 +74,25 @@ NumPy 中的部分运算在 float64 下进行，或依赖 NumPy 的正确舍入�
 | --- | ---: |
 | NumPy | 24.92 s |
 | `--rust` | 1.79 s |
-| `--metal`（自动使用 Rust 读取和表构造） | 0.203 s |
-| `--rust --metal` | 0.203 s |
+| `--metal`（自动使用 Rust 读取和表构造） | 0.110 s |
+| `--rust --metal` | 0.110 s |
 
-`--metal` 在 Rust 库可用时自动使用 Rust RAW 读取和表构造。热运行 9 次的中位数为 0.203 s；四种后端生成的整图哈希完全一致。
+`--metal` 在 Rust 库可用时自动使用 Rust RAW 读取和表构造。热运行 9 次的中位数为 0.110 s；四种后端生成的整图哈希完全一致。
 
-Metal 阶段按两条 command buffer 提交：RawNR → ITP → DRO → GeoCorr/SSCS 为 RAW 链；front/spatial → Marble/Post → interleave 为渲染链。Post 需要 CPU 回填时会在融合调用前完成已排队的 command buffer。设置 `SONYLOOK_METAL_BATCH=0` 可恢复逐阶段提交，热运行中位数为 0.209 s。
+Metal 阶段按两条 command buffer 提交：RawNR → ITP → DRO → GeoCorr/SSCS 为 RAW 链；front/spatial → Marble/Post → interleave 为渲染链。Post 需要 CPU 回填时会在融合调用前完成已排队的 command buffer。设置 `SONYLOOK_METAL_BATCH=0` 可恢复逐阶段提交。
 
-DSC05740 的分阶段耗时（`--rust --metal`）：
+RAW 读取与 GPU 并行：压缩 RAW 由 Rust 在后台线程解码，直接写入 GPU 可见内存。每解完一行分块（512 行），Rust 回调 bridge，把一个 `MTLSharedEvent` 设为已解码的行数。RAW 链在 RAW 解完之前就提交，GPU 按 ITP 的分块行推进：每行分块之前等待所需的 RAW 行，再依次做裁剪、RawNR（`nr_split` 读 ±2 行，`nr_filter` 读 ±8 行）和这一行的 ITP。DRO 网格在辅助队列上等裁剪完成后读取。只有 ITP、RawNR、DRO 都用 Metal 且白平衡不是取样模式 3 时才启用；`SONYLOOK_RAW_STREAM=0` 可关闭。SonyChart 上由 0.117 s 降到 0.110 s，开启 NR 和 DRO 的 DSC05740 由 0.127 s 降到 0.109 s。解码失败时会解除 GPU 的等待并报告失败的分块。
+
+DSC05740 的分阶段耗时（`--metal`，`SONYLOOK_METAL_BATCH=0 SONYLOOK_RAW_STREAM=0` 逐阶段测量；默认设置下 RAW 读取与 RawNR/ITP 重叠）：
 
 | 阶段 | 耗时 |
 | --- | ---: |
-| 读取 RAW | 21 ms |
-| RawNR | 8 ms |
-| ITP | 72 ms |
-| DRO | 19 ms |
-| GeoCorr | 5 ms |
-| SSCS | 4 ms |
-| 外观链 + 空间阶段 | 20 ms |
-| Marble + Effect / ToneCurve / ShadeCorrection | 22 ms |
+| 读取 RAW | 23 ms |
+| RawNR + ITP | 51 ms |
+| DRO | 6 ms |
+| GeoCorr + SSCS | 5 ms |
+| 外观链 + 空间阶段 | 22 ms |
+| Marble + Effect / ToneCurve / ShadeCorrection | 20 ms |
 
 - 同一进程中首次解码某个文件时，需要读取文件并解析元数据，每张另需约 0.1–0.3 s。
 - 有 `shaders.metallib` 时直接加载预编译库；否则进程中第一次使用 Metal 时需要编译 shader 源码。命令行单张解码（含 Python 启动、Metal 初始化和写 TIFF）约 0.35–0.45 s；开机后首次运行，文件和着色器缓存均未命中时约 1.8 s。

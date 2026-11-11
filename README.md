@@ -37,10 +37,10 @@ Each backend was run once to initialise caches and Metal shaders, then the secon
 | --- | ---: | ---: |
 | NumPy | 24.92 s | 1.0× |
 | Rust | 1.79 s | 13.9× |
-| Metal | 0.203 s | 122.8× |
-| Rust + Metal | 0.203 s | 122.8× |
+| Metal | 0.110 s | 226.5× |
+| Rust + Metal | 0.110 s | 226.5× |
 
-`--metal` automatically uses the Rust RAW reader and table builders when the Rust library is available. GPU stages are submitted in two command buffers: the RAW chain and the render chain. GeoCorr with SSCS, and Marble with Effect/ToneCurve/ShadeCorrection, run in fused kernels. Set `SONYLOOK_METAL_BATCH=0` to restore independent stage submission. All four paths produced identical full-image hashes. The first decode in a new process is slower because it includes initialisation, table construction and Metal shader compilation. These figures describe one synthetic ARW and should not be treated as a general benchmark across all camera models or development settings.
+`--metal` automatically uses the Rust RAW reader and table builders when the Rust library is available. GPU stages are submitted in two command buffers: the RAW chain and the render chain. GeoCorr with SSCS, and Marble with Effect/ToneCurve/ShadeCorrection, run in fused kernels. The compressed RAW is decoded on a background thread while the GPU already processes the rows that are ready (`SONYLOOK_RAW_STREAM=0` decodes it first). Set `SONYLOOK_METAL_BATCH=0` to restore independent stage submission. All four paths produced identical full-image hashes. The first decode in a new process is slower because it includes initialisation, table construction and Metal shader compilation. These figures describe one synthetic ARW and should not be treated as a general benchmark across all camera models or development settings.
 
 ## Install
 

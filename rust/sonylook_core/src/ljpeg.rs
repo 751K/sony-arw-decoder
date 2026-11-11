@@ -268,6 +268,38 @@ unsafe fn tile(d: &[u8], out: OutPtr, rw: usize, rh: usize, trow: usize, tcol: u
     Some(())
 }
 
+/// Called with the number of raw rows, counted from the top, that are fully
+/// decoded.  Calls are serialised and the row count only increases.
+pub type ProgressFn = unsafe extern "C" fn(ctx: *mut std::ffi::c_void, rows: u32);
+
+struct Progress {
+    func: ProgressFn,
+    ctx: *mut std::ffi::c_void,
+    // Tiles finished per tile row, and how many leading tile rows are complete.
+    done: Vec<AtomicUsize>,
+    reported: std::sync::Mutex<usize>,
+}
+unsafe impl Sync for Progress {}
+
+impl Progress {
+    unsafe fn tile_done(&self, row: usize, across: usize, tile_height: usize, raw_height: usize) {
+        if self.done[row].fetch_add(1, Ordering::AcqRel) + 1 != across {
+            return;
+        }
+        // A tile row just completed: report the contiguous prefix, under the
+        // lock so the reported value is monotonic and the calls serialised.
+        let mut reported = self.reported.lock().unwrap();
+        let mut rows = *reported;
+        while rows < self.done.len() && self.done[rows].load(Ordering::Acquire) == across {
+            rows += 1;
+        }
+        if rows > *reported {
+            *reported = rows;
+            (self.func)(self.ctx, (rows * tile_height).min(raw_height) as u32);
+        }
+    }
+}
+
 /// Decode all tiles of a compression-7 raw.  `data` is the whole file;
 /// offsets/counts are TileOffsets/TileByteCounts.  Returns 0, -1 for bad
 /// arguments, or 1 + the index of the first tile that failed to decode.
@@ -284,6 +316,58 @@ pub unsafe extern "C" fn ljpeg_tiles_u16(
     tile_height: usize,
     threads: usize,
     out: *mut u16,
+) -> i32 {
+    decode_tiles(data, data_len, offsets, counts, ntiles, raw_width, raw_height,
+                 tile_width, tile_height, threads, out, None)
+}
+
+/// ljpeg_tiles_u16 that also reports progress: `progress(ctx, rows)` is called
+/// whenever more leading rows of `out` are complete (tiles are taken in
+/// row-major order, so rows arrive roughly top to bottom).  A consumer such as
+/// the GPU can start on the first rows while the rest are still decoding.
+/// The final call reports raw_height only if every tile decoded.
+#[no_mangle]
+pub unsafe extern "C" fn ljpeg_tiles_u16_progress(
+    data: *const u8,
+    data_len: usize,
+    offsets: *const u64,
+    counts: *const u64,
+    ntiles: usize,
+    raw_width: usize,
+    raw_height: usize,
+    tile_width: usize,
+    tile_height: usize,
+    threads: usize,
+    out: *mut u16,
+    progress: Option<ProgressFn>,
+    ctx: *mut std::ffi::c_void,
+) -> i32 {
+    let prog = match progress {
+        Some(func) if tile_height > 0 => Some(Progress {
+            func,
+            ctx,
+            done: (0..(raw_height + tile_height - 1) / tile_height).map(|_| AtomicUsize::new(0)).collect(),
+            reported: std::sync::Mutex::new(0),
+        }),
+        _ => None,
+    };
+    decode_tiles(data, data_len, offsets, counts, ntiles, raw_width, raw_height,
+                 tile_width, tile_height, threads, out, prog.as_ref())
+}
+
+unsafe fn decode_tiles(
+    data: *const u8,
+    data_len: usize,
+    offsets: *const u64,
+    counts: *const u64,
+    ntiles: usize,
+    raw_width: usize,
+    raw_height: usize,
+    tile_width: usize,
+    tile_height: usize,
+    threads: usize,
+    out: *mut u16,
+    progress: Option<&Progress>,
 ) -> i32 {
     if data.is_null() || offsets.is_null() || counts.is_null() || out.is_null() || tile_width == 0
         || tile_height == 0 || raw_width == 0 || raw_height == 0
@@ -322,6 +406,8 @@ pub unsafe extern "C" fn ljpeg_tiles_u16(
                 });
                 if ok.is_none() {
                     failed.fetch_min(t, Ordering::Relaxed);
+                } else if let Some(p) = progress {
+                    p.tile_done(t / across, across, tile_height, raw_height);
                 }
             });
         }

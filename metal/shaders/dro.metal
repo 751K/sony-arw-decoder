@@ -6,6 +6,7 @@ struct DroArgs {
     int black_r,black_g,black_b;
     float log2_max,strength,k_up,k_down,scale;
     uint fix_capacity;                 // dro_apply: size of the deferred-pixel list
+    uint src_stride,src_x,src_y;       // dro_subcells: the raw crop inside a larger buffer
 };
 
 // Correctly rounded float32 division (the reference's numpy float32 '/').
@@ -99,10 +100,10 @@ kernel void dro_subcells(device const ushort *raw [[buffer(0)]], device const fl
     if(p.x>=112||p.y>=84)return;
     float inv=dro_div(1.0f,float(a.per_x*a.per_y)), acc=0.0f;
     for(uint y=0;y<a.per_y;y++)for(uint x=0;x<a.per_x;x++){
-        uint xx=a.org_x+4*(p.x*a.per_x+x),yy=a.org_y+4*(p.y*a.per_y+y),i=yy*a.raw_width+xx;
+        uint xx=a.org_x+4*(p.x*a.per_x+x),yy=a.org_y+4*(p.y*a.per_y+y),s=a.src_stride,i=(yy+a.src_y)*s+xx+a.src_x;
         float r=float(max(int(raw[i])-a.black_r,0));
-        float g=float(max(((int(raw[i+1])+int(raw[i+a.raw_width]))>>1)-a.black_g,0));
-        float b=float(max(int(raw[i+a.raw_width+1])-a.black_b,0));
+        float g=float(max(((int(raw[i+1])+int(raw[i+s]))>>1)-a.black_g,0));
+        float b=float(max(int(raw[i+s+1])-a.black_b,0));
         float v=fma(b+g,0.057f,r*0.1495f);
         acc=fma(dro_log(v,logtab),inv,acc);
     }

@@ -15,8 +15,11 @@ inline void nr_split_value(device const ushort *raw,uint w,uint h,uint x,uint y,
     hpv=as_type<short>(ushort(uint(hv)&0xffffu));basev=ushort(clamp(a.off[k]+c-hv,0,0x7fff));
 }
 // High-pass and base on the image shrunk by 2.
-kernel void nr_split(device const ushort *raw [[buffer(0)]],device short *hp [[buffer(1)]],device ushort *base [[buffer(2)]],constant NrArgs &a [[buffer(3)]],uint2 p [[thread_position_in_grid]]) {
-    uint w=a.width,h=a.height;if(p.x>=w||p.y>=h)return;
+// band = (first row, row count): the kernels run on a row band so a caller can
+// process the image as its rows become available.
+kernel void nr_split(device const ushort *raw [[buffer(0)]],device short *hp [[buffer(1)]],device ushort *base [[buffer(2)]],constant NrArgs &a [[buffer(3)]],constant uint2 &band [[buffer(4)]],uint2 q [[thread_position_in_grid]]) {
+    uint2 p=uint2(q.x,q.y+band.x);
+    uint w=a.width,h=a.height;if(p.x>=w||p.y>=h||q.y>=band.y)return;
     uint i=p.y*w+p.x;
     short hv;ushort bv;nr_split_value(raw,w,h,p.x,p.y,a,hv,bv);hp[i]=hv;base[i]=bv;
 }
@@ -24,8 +27,9 @@ constant int2 nr_gmean[25]={int2(0,0),int2(-4,0),int2(0,-4),int2(0,4),int2(4,0),
     int2(-2,-2),int2(2,-2),int2(-2,2),int2(2,2),int2(-3,-1),int2(-3,1),int2(-1,-3),int2(-1,-1),int2(-1,1),int2(-1,3),
     int2(1,-3),int2(1,-1),int2(1,1),int2(1,3),int2(3,-1),int2(3,1)};          // (dy, dx)
 // Sigma filter of the base, high-pass gain, and the strength blend on the image shrunk by 10.
-kernel void nr_filter(device const ushort *raw [[buffer(0)]],device const short *hp [[buffer(1)]],device const ushort *base [[buffer(2)]],device const int *thr [[buffer(3)]],device ushort *out [[buffer(4)]],constant NrArgs &a [[buffer(5)]],uint2 p [[thread_position_in_grid]]) {
-    uint w=a.width,h=a.height;if(p.x>=w||p.y>=h)return;
+kernel void nr_filter(device const ushort *raw [[buffer(0)]],device const short *hp [[buffer(1)]],device const ushort *base [[buffer(2)]],device const int *thr [[buffer(3)]],device ushort *out [[buffer(4)]],constant NrArgs &a [[buffer(5)]],constant uint2 &band [[buffer(6)]],uint2 q [[thread_position_in_grid]]) {
+    uint2 p=uint2(q.x,q.y+band.x);
+    uint w=a.width,h=a.height;if(p.x>=w||p.y>=h||q.y>=band.y)return;
     uint i=p.y*w+p.x;
     if(p.x<10||p.x>=w-10||p.y<10||p.y>=h-10){out[i]=raw[i];return;}
     #define B(dy,dx) int(base[uint(int(i)+(dy)*int(w)+(dx))])
@@ -42,4 +46,12 @@ kernel void nr_filter(device const ushort *raw [[buffer(0)]],device const short 
     tv=tv<=-long(a.lim[k])?-long(a.lim[k]):tv;tv=tv>long(a.lim[k])?long(a.lim[k]):tv;
     int o=int(clamp(tv-long(a.off[k])+long(acc/n),0L,0x3fffL)),r=int(raw[i]);
     out[i]=ushort(int(trunc(fma(float(o-r),a.s,float(r)))));
+}
+
+// Copy a row band of a crop out of a larger image (the full sensor raw):
+// c = (source stride, source x, source y, crop width), band = (row0, rows).
+kernel void raw_crop_rows(device const ushort *src [[buffer(0)]],device ushort *dst [[buffer(1)]],constant uint4 &c [[buffer(2)]],constant uint2 &band [[buffer(3)]],uint2 q [[thread_position_in_grid]]) {
+    if(q.x>=c.w||q.y>=band.y)return;
+    uint y=q.y+band.x;
+    dst[y*c.w+q.x]=src[(y+c.z)*c.x+q.x+c.y];
 }

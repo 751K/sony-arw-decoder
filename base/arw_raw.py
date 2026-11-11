@@ -131,3 +131,93 @@ def read_raw(path, rust=True):
                                              s.left_margin:s.left_margin + s.width])
         assert r.raw_pattern.tolist() == [[0, 1], [3, 2]], rggb
         return np.array(r.raw_image_visible, np.uint16, copy=True)
+
+
+class RawStream:
+    """Decode a compression-7 raw on a background thread straight into a
+    GPU-resident array, reporting decoded rows to the Metal bridge so GPU
+    stages can start on the top of the image while the rest is decoding.
+
+    full: the (raw_height, raw_width) sensor array; visible: the rawpy
+    raw_image_visible window of it. Neither may be read on the host before
+    finish(). On a decode failure the thread unblocks the GPU (its output is
+    then garbage) and finish() raises.
+    """
+
+    def __init__(self, path, ifd, sizes):
+        import threading
+        import fused_rust as FR
+        import metal_itp as MI
+        import sr2
+        self.ifd, self.sizes = ifd, sizes
+        self.top, self.left = sizes.top_margin, sizes.left_margin
+        self.full = MI.empty((ifd.height, ifd.width))
+        self.visible = self.full[self.top:self.top + sizes.height, self.left:self.left + sizes.width]
+        lib = MI._load()
+        self._lib = lib
+        self.base = int(lib.sonylook_metal_raw_stream_begin())
+        self._data = sr2.file_bytes(path)
+        buf = np.frombuffer(self._data, np.uint8)
+        self._buf = buf
+        self._offs = np.ascontiguousarray(ifd.offsets, np.uint64)
+        self._cnts = np.ascontiguousarray(ifd.counts, np.uint64)
+        if len(self._offs) != len(self._cnts) or int((self._offs + self._cnts).max()) > len(self._data):
+            raise ValueError("raw tile offsets outside the file")
+        fn = FR._load_symbol("ljpeg_tiles_u16_progress")
+        fn.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+                       ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,
+                       ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        fn.restype = ctypes.c_int32
+        self._fn = fn
+        self._progress = ctypes.cast(lib.sonylook_metal_raw_progress, ctypes.c_void_p)
+        self.rc = None
+        self.error = None
+        self._thread = threading.Thread(target=self._run, name="arw-raw-stream", daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        try:
+            # ctypes releases the GIL for the call; progress is a C function in
+            # the bridge, called from the decoder's worker threads.
+            self.rc = self._fn(self._buf.ctypes.data, len(self._data), self._offs.ctypes.data,
+                               self._cnts.ctypes.data, len(self._offs), self.ifd.width, self.ifd.height,
+                               self.ifd.tile_width, self.ifd.tile_height, 0, self.full.ctypes.data,
+                               self._progress, ctypes.c_void_p(self.base))
+        except BaseException as exc:          # never leave the GPU waiting
+            self.error = exc
+        if self.rc != 0:
+            self.release()
+
+    def release(self):
+        """Unblock every GPU wait on this stream."""
+        self._lib.sonylook_metal_raw_release(self.base)
+
+    def finish(self):
+        """Wait for the decoder; raise if it failed."""
+        self._thread.join()
+        if self.error is not None:
+            raise RuntimeError(f"raw decode failed: {self.error}")
+        if self.rc != 0:
+            raise RuntimeError(f"ljpeg_tiles_u16_progress failed on tile {self.rc - 1}"
+                               if self.rc > 0 else f"ljpeg_tiles_u16_progress failed: {self.rc}")
+
+
+def start_stream(path):
+    """A RawStream for an RGGB compression-7 raw, or None when the file needs
+    the regular read_raw path (other formats, CFA patterns or sizes)."""
+    import rawpy
+    ifd = raw_ifd(path)
+    if ifd is None or ifd.compression != 7 or ifd.cfa != b"\x00\x01\x01\x02":
+        return None
+    with rawpy.imread(str(path)) as r:
+        if r.color_desc != b"RGBG":
+            return None
+        s = r.sizes
+    if (s.raw_height, s.raw_width) != (ifd.height, ifd.width):
+        return None
+    try:
+        import fused_rust as FR
+        FR._load_symbol("ljpeg_tiles_u16_progress")
+    except (OSError, AttributeError):                    # Rust library missing or outdated
+        return None
+    return RawStream(path, ifd, s)

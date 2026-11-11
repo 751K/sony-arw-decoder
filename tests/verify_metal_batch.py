@@ -16,6 +16,7 @@ from base.sony_decode import decode
 
 CASES = {
     "metal": dict(metal=True),
+    "metal, RAW read before the GPU starts": dict(metal=True, _env={"SONYLOOK_RAW_STREAM": "0"}),
     "metal, no detail (Metal front + CPU spatial)": dict(metal=True, detail=False),
     "metal_nr only": dict(metal_nr=True, nr=True),
     "metal_itp only": dict(metal_itp=True),
@@ -28,7 +29,10 @@ CASES = {
 
 
 def run(path, kwargs, batch):
-    os.environ["SONYLOOK_METAL_BATCH"] = "1" if batch else "0"
+    kwargs = dict(kwargs)
+    env = {"SONYLOOK_METAL_BATCH": "1" if batch else "0", "SONYLOOK_RAW_STREAM": "1",
+           **kwargs.pop("_env", {})}
+    os.environ.update(env)
     return decode(path, rust=True, **kwargs)
 
 
@@ -37,7 +41,7 @@ def main():
         raise SystemExit(__doc__)
     failed = 0
     for name, kwargs in CASES.items():
-        settings = {k: v for k, v in kwargs.items() if not k.startswith("metal")}
+        settings = {k: v for k, v in kwargs.items() if not k.startswith(("metal", "_"))}
         reference = decode(sys.argv[1], rust=True, **settings)
         batched = run(sys.argv[1], kwargs, True)
         separate = run(sys.argv[1], kwargs, False)

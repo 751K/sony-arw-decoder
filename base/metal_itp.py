@@ -33,7 +33,7 @@ def _load():
         lib.sonylook_metal_itp_image.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
                                                  ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int32,
                                                  ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
-                                                 ctypes.c_void_p, ctypes.c_void_p,
+                                                 ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
                                                  ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
         lib.sonylook_metal_alloc.argtypes = [ctypes.c_size_t]
         lib.sonylook_metal_alloc.restype = ctypes.c_void_p
@@ -48,6 +48,12 @@ def _load():
         lib.sonylook_metal_abort.restype = ctypes.c_int
         lib.sonylook_metal_is_active.argtypes = []
         lib.sonylook_metal_is_active.restype = ctypes.c_int
+        lib.sonylook_metal_flush.argtypes = []
+        lib.sonylook_metal_flush.restype = ctypes.c_int
+        lib.sonylook_metal_raw_stream_begin.argtypes = []
+        lib.sonylook_metal_raw_stream_begin.restype = ctypes.c_uint64
+        lib.sonylook_metal_raw_release.argtypes = [ctypes.c_uint64]
+        lib.sonylook_metal_raw_release.restype = None
         if lib.sonylook_metal_init(str(_DIR / "shaders").encode()):
             raise RuntimeError(lib.sonylook_metal_error().decode())
         _lib = lib
@@ -97,6 +103,23 @@ def abort():
     _load().sonylook_metal_abort()
 
 
+def flush():
+    """Commit the shared command buffer without waiting and keep batching."""
+    lib = _load()
+    if lib.sonylook_metal_flush():
+        raise RuntimeError(lib.sonylook_metal_error().decode())
+
+
+class RawStream(ctypes.Structure):
+    """ITP input cropped on the GPU from a sensor raw that is still decoding.
+
+    Image row y is row y + src_y of `src` (a src_rows x src_stride GPU-resident
+    array) and may be read once the decoder has reported that many rows."""
+    _fields_ = [("src", ctypes.c_void_p), ("src_stride", ctypes.c_uint32),
+                ("src_rows", ctypes.c_uint32), ("src_x", ctypes.c_uint32),
+                ("src_y", ctypes.c_uint32), ("base", ctypes.c_uint64)]
+
+
 def active():
     """True while a shared command buffer is open."""
     return bool(_load().sonylook_metal_is_active())
@@ -142,8 +165,12 @@ def process_tile(raw, black, gains, scale, params):
 
 
 def full_image(raw, black, gains, scale, params, tile=384, halo=12,
-               nr_args=None, nr_thresholds=None):
-    """Run experimental Metal ITP over an RGGB image with Sony's tile edges."""
+               nr_args=None, nr_thresholds=None, stream=None):
+    """Run experimental Metal ITP over an RGGB image with Sony's tile edges.
+
+    stream: optional RawStream. `raw` must then be an empty((h, w)) array that
+    the GPU fills from the stream's source as rows arrive; tiles start as soon
+    as their rows are decoded."""
     raw = np.ascontiguousarray(raw, dtype=np.uint16)
     if raw.ndim != 2 or min(raw.shape) < 12 or tile <= 0 or halo < 10:
         raise ValueError("expected a 2D Bayer image, positive tile and halo >= 10")
@@ -167,6 +194,7 @@ def full_image(raw, black, gains, scale, params, tile=384, halo=12,
                                      gains.ctypes.data, int(scale), p.ctypes.data, tile, halo,
                                      ctypes.byref(nr_args) if nr_args is not None else None,
                                      nr_thresholds.ctypes.data if nr_thresholds is not None else None,
+                                     ctypes.byref(stream) if stream is not None else None,
                                      *(x.ctypes.data for x in out))
     if rc:
         raise RuntimeError(lib.sonylook_metal_error().decode())

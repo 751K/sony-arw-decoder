@@ -73,18 +73,36 @@ def _sr2_tags(arw):
             for k, v in sr2.sr2_subifd(str(arw)).items()}
 
 
+_RAW_STREAMS = []          # RawStream started by the decode() in progress
+
+
 def _abort_metal_batch_on_error(fn):
+    """Clean up GPU batches and RAW streams however decode() exits.
+
+    On an error the stream's GPU waits are released before the batch is
+    discarded (discarding waits for already-committed work). On success the
+    decoder thread is joined and its failure, if any, is raised."""
     @wraps(fn)
     def wrapped(*args, **kwargs):
         try:
-            return fn(*args, **kwargs)
+            result = fn(*args, **kwargs)
         except BaseException:
+            for job in _RAW_STREAMS:
+                job.release()
             try:
                 import metal_itp
                 metal_itp.abort()
             except Exception:
                 pass
+            for job in _RAW_STREAMS:
+                job._thread.join()
+            _RAW_STREAMS.clear()
             raise
+        jobs = list(_RAW_STREAMS)
+        _RAW_STREAMS.clear()
+        for job in jobs:
+            job.finish()
+        return result
     return wrapped
 
 
@@ -171,10 +189,24 @@ def decode(arw, look=None, *, output="srgb", raw=None, nr=None, dro=None, marble
     timings["metadata"] = time.perf_counter() - t0
 
     t = time.perf_counter()
+    raw_stream = None
     if raw is None:
         # Compression-7 (lossless) raws are decoded tile-parallel by the Rust core.
         import arw_raw
-        raw = arw_raw.read_raw(arw, rust=use_rust)
+        # Streaming: when every stage that reads the raw runs on Metal, decode
+        # it on a background thread while the GPU starts on the rows already
+        # done. White-balance mode 3 samples the raw on the CPU first.
+        nr_on = nr if nr is not None else int(st.get(DS.NR_ON, 0)) == 1
+        dro_on = dro if dro is not None else int(st.get(DS.DRO_ON, 0)) == 1
+        if (metal_itp and use_rust and (metal_nr or not nr_on) and (metal_dro or not dro_on)
+                and int(st.get(DS.WB_MODE, 1)) != 3
+                and os.environ.get("SONYLOOK_RAW_STREAM", "1") != "0"):
+            raw_stream = arw_raw.start_stream(arw)
+        if raw_stream is not None:
+            _RAW_STREAMS.append(raw_stream)
+            raw = raw_stream.visible             # filled on the GPU's schedule; not read here
+        else:
+            raw = arw_raw.read_raw(arw, rust=use_rust)
     raw = np.asarray(raw)
     timings["raw_read"] = time.perf_counter() - t
     metal_batch = bool(metal_nr or metal_itp or metal_dro or metal_geo or
@@ -212,11 +244,17 @@ def decode(arw, look=None, *, output="srgb", raw=None, nr=None, dro=None, marble
     ex0, ey0 = max(x0 - pad, 0), max(y0 - pad, 0)
     ex1, ey1 = min(x1 + pad, Wr), min(y1 + pad, Hr)
     ox, oy = ex0 - x0, ey0 - y0               # expanded array origin in crop coords
+    itp_stream = None
     if metal_itp:
         # Crop straight into GPU-visible memory so Metal ITP reads it in place.
         import metal_itp as MI
         cropped = MI.empty((ey1 - ey0, ex1 - ex0), raw.dtype)
-        np.copyto(cropped, raw[ey0:ey1, ex0:ex1])
+        if raw_stream is not None:              # the GPU crops it as rows arrive
+            full = raw_stream.full
+            itp_stream = MI.RawStream(full.ctypes.data, full.shape[1], full.shape[0],
+                                      raw_stream.left + ex0, raw_stream.top + ey0, raw_stream.base)
+        else:
+            np.copyto(cropped, raw[ey0:ey1, ex0:ex1])
         raw = cropped
     else:
         raw = np.ascontiguousarray(raw[ey0:ey1, ex0:ex1])
@@ -232,7 +270,7 @@ def decode(arw, look=None, *, output="srgb", raw=None, nr=None, dro=None, marble
         if dro_pts is None:
             raise NotImplementedError("DRO on but the ARW has no camera curve (0x781b/0x781c)")
         dro_curve = DRO.curve_table(*dro_pts)
-        if metal_dro:
+        if metal_dro and itp_stream is None:
             import metal_dro as MD
             dro_grid = MD.prepare(raw_crop, dro_black, dro_curve, origin=(ox, oy))
 
@@ -260,7 +298,17 @@ def decode(arw, look=None, *, output="srgb", raw=None, nr=None, dro=None, marble
     if metal_itp:
         import metal_itp as MI
         planes = list(MI.full_image(raw, black, gains, s7311, FR.itp_config().params,
-                                    nr_args=nr_args, nr_thresholds=nr_thresholds))
+                                    nr_args=nr_args, nr_thresholds=nr_thresholds, stream=itp_stream))
+        if itp_stream is not None:
+            if dro and metal_dro:
+                # The grid reads the decoder rect of the GPU crop once it is
+                # complete, on the auxiliary queue.
+                import metal_dro as MD
+                dro_grid = MD.prepare_view(raw, (x0 - ex0, y0 - ey0), (x1 - x0, y1 - y0),
+                                           dro_black, dro_curve, origin=(ox, oy),
+                                           wait=raw_stream.base)
+            if metal_batch:
+                MI.flush()                     # start the GPU while rows are decoding
     else:
         metal_sync()                           # raw may be Metal RawNR output
         planes = list(ITP.itp_full_image(raw, black, gains, s7311, rust=use_rust))
