@@ -456,12 +456,12 @@ def decode(arw, look=None, *, output="srgb", raw=None, nr=None, dro=None, marble
                         sscs=sscs_params, marble_inset=16, timings=rt,
                         strip=strip, metal_look=metal_look, metal_spatial=metal_spatial,
                         metal_marble=metal_marble, metal_post=metal_post,
-                        output_bits=output_bits)
+                        output_bits=output_bits, reuse_input=True)   # lin is not needed afterwards
     else:
         img = lk.render(lin, detail=detail_cfg, marble=None,
                         sscs=sscs_params, timings=rt, strip=strip, metal_look=metal_look, metal_spatial=metal_spatial,
                         metal_marble=metal_marble, metal_post=metal_post,
-                        output_bits=output_bits)
+                        output_bits=output_bits, reuse_input=True)   # lin is not needed afterwards
     # crop back to the decoder rectangle
     ty, tx = y0 - ey0, x0 - ex0
     img = CS.reencode(img, output_mode, output_bits)   # ProPhoto: gamma 2.2 -> 1.8 (in place on Metal)

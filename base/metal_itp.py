@@ -79,6 +79,16 @@ def empty(shape, dtype=np.uint16):
     return np.frombuffer(holder, np.uint8, count=n).view(dtype).reshape(shape)
 
 
+def resident(a):
+    """True when `a` is a C-contiguous array in GPU-resident memory (empty()), so
+    Metal stages read and write it in place."""
+    if not (isinstance(a, np.ndarray) and a.flags.c_contiguous and a.flags.writeable and a.size):
+        return False
+    lib = _load()
+    lib.sonylook_metal_resident.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    return bool(lib.sonylook_metal_resident(a.ctypes.data, a.nbytes))
+
+
 def lut_u16(data, lut):
     """data[...] = lut[data] in place on the GPU. False (and nothing done) when the
     array is not GPU-resident or Metal is unavailable or busy batching."""

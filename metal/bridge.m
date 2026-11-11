@@ -120,15 +120,53 @@ static void pool_put(id<MTLBuffer> b) {
         while(pool_bytes>POOL_CAP&&pool_bufs.count){id<MTLBuffer> o=pool_bufs[0];pool_bytes-=o.length;[pool_bufs removeObjectAtIndex:0];}
     }
 }
+// Inside a batch, a call's GPU-only (private) temporaries are free for the
+// calls encoded after it as soon as it returns: every later use is encoded
+// later on the same queue, and Metal's hazard tracking orders a later write
+// after the earlier reads. They wait in batch_free until the batch ends.
+// Shared temporaries are not recycled this way, since the CPU fills them at
+// encode time (in_buf), long before the GPU has read the old contents; nor is
+// batch_free used for work on the auxiliary queue (no_batch_free), which is
+// not ordered against the main queue.
+static NSMutableArray *batch_free;
+static NSUInteger call_mark;            // call_bufs[call_mark..] belong to the current call
+static int no_batch_free;
 // A temporary for this call.
 static id<MTLBuffer> acquire(size_t len,MTLResourceOptions mode) {
-    id<MTLBuffer> b=pool_take(len,mode);if(b){@synchronized(buf_lock){[call_bufs addObject:b];}}
+    id<MTLBuffer> b=nil;
+    if(batch_cmd&&!no_batch_free&&(mode&MTLResourceStorageModeMask)==MTLResourceStorageModePrivate) {
+        size_t want=round_len(len);
+        @synchronized(buf_lock) {
+            NSUInteger best=NSNotFound;size_t bestlen=SIZE_MAX;
+            for(NSUInteger i=0;i<batch_free.count;i++){id<MTLBuffer> x=batch_free[i];
+                if(x.length>=want&&x.length<=2*want&&x.length<bestlen){best=i;bestlen=x.length;}}
+            if(best!=NSNotFound){b=batch_free[best];[batch_free removeObjectAtIndex:best];}
+        }
+    }
+    if(!b)b=pool_take(len,mode);
+    if(b){@synchronized(buf_lock){[call_bufs addObject:b];}}
     return b;
 }
-// Return this call's temporaries to the pool (the command buffer has completed).
+// The end of a call. Outside a batch its command buffer has completed: return
+// its temporaries (and a finished batch's) to the pool. Inside a batch, pass
+// its private temporaries on to the calls encoded after it.
 static int done(int rc) {
-    if(batch_cmd)return rc;
-    @synchronized(buf_lock){for(id<MTLBuffer> b in call_bufs)pool_put(b);[call_bufs removeAllObjects];}
+    @synchronized(buf_lock) {
+        if(!batch_free)batch_free=[NSMutableArray array];
+        if(batch_cmd) {
+            call_mark=MIN(call_mark,call_bufs.count);
+            NSMutableArray *keep=[NSMutableArray array];
+            for(NSUInteger i=call_mark;i<call_bufs.count;i++){id<MTLBuffer> b=call_bufs[i];
+                if(b.storageMode==MTLStorageModePrivate)[batch_free addObject:b];else [keep addObject:b];}
+            [call_bufs removeObjectsInRange:NSMakeRange(call_mark,call_bufs.count-call_mark)];
+            [call_bufs addObjectsFromArray:keep];
+            call_mark=call_bufs.count;
+            return rc;
+        }
+        for(id<MTLBuffer> b in call_bufs)pool_put(b);
+        for(id<MTLBuffer> b in batch_free)pool_put(b);
+        [call_bufs removeAllObjects];[batch_free removeAllObjects];call_mark=0;
+    }
     return rc;
 }
 static id<MTLCommandBuffer> command_buffer(void) {
@@ -199,6 +237,9 @@ void sonylook_metal_raw_release(uint64_t base) {
     raw_event.signaledValue=base+((uint64_t)1<<24)-1;
 }
 int sonylook_metal_is_active(void) { return batch_cmd != nil; }
+static SLBuf *find_resident(const void *p,size_t len);
+// 1 when [p, p + len) lies in a GPU-resident array (bound in place by the stages).
+int sonylook_metal_resident(const void *p,size_t len) { @autoreleasepool { return find_resident(p,len)!=nil; }}
 static SLBuf *find_resident(const void *p,size_t len) {
     @synchronized(buf_lock) {
         for(NSNumber *k in resident){id<MTLBuffer> b=resident[k];uintptr_t s=(uintptr_t)b.contents,q=(uintptr_t)p;
@@ -532,7 +573,9 @@ int sonylook_metal_dro_grid_view(const uint16_t *src,uint32_t src_stride,uint32_
     // read in place, never copied now.
     id rawbuf=wait?find_resident(src,srclen):in_buf(src,srclen),tab=in_buf(logtab,2049*4);
     if(wait&&!rawbuf)return fail(@"Streamed DRO grid needs a GPU-resident source");
+    no_batch_free=1;            // these run on the auxiliary queue
     id sub=acquire(112*84*4,MTLResourceStorageModeShared),hist=acquire(8*6*14*4,MTLResourceStorageModePrivate);
+    no_batch_free=0;
     if(!rawbuf||!tab||!sub||!hist)return fail(@"Metal DRO grid allocation failed");
     // Temporaries live until the aux command buffer completes, not until the
     // next main-queue call's done(): take them out of call_bufs.

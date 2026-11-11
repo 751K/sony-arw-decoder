@@ -253,22 +253,31 @@ def _marble_setup(r, g, b, look, dev, dec, mode, inset):
     return planes, h, w, a, tabs, upw
 
 
+def _packed_out(h, w, out):
+    """The (h, w, 3) uint16 output: `out` when it is a GPU-resident array of that
+    shape (written in place, e.g. over an input the GPU has finished reading), else new."""
+    if out is not None and out.shape == (h, w, 3) and out.dtype == np.uint16 and metal_itp.resident(out):
+        return out
+    return metal_itp.empty((h, w, 3))
+
+
 def marble(r, g, b, look, dev, dec, mode=0, inset=True, post=None, capacity=None, stats=None,
-           packed=False, output_bits=14):
+           packed=False, output_bits=14, out=None):
     """ZcTaskMarble (luma and chroma paths) on whole uint16 planes, as sony_marble.marble with no region.
 
     inset=True keeps the input values outside the 16-px valid region, as render's
     marble_inset does. If post is an active Post, Effect, ToneCurve and
     ShadeCorrection run in the same final kernel; ambiguous pixels still use
     Post.reference and are reported in stats["fixed"]. Returns (R, G, B), or
-    None when marble_supported() is false."""
+    None when marble_supported() is false. With packed=True, `out` may give the
+    (H, W, 3) array to write (see _packed_out)."""
     setup = _marble_setup(r, g, b, look, dev, dec, mode, inset)
     if setup is None:
         return None
     planes, h, w, a, tabs, upw = setup
     if output_bits not in (14, 16):
         raise ValueError("output_bits must be 14 or 16")
-    out = metal_itp.empty((h, w, 3)) if packed else _planes(h, w)
+    out = _packed_out(h, w, out) if packed else _planes(h, w)
     active_post = post is not None and post.active
     fix = fixin = nfix = None
     cap = 0
@@ -307,7 +316,7 @@ def marble(r, g, b, look, dev, dec, mode=0, inset=True, post=None, capacity=None
         if count > cap:                          # rare: rerun with a list large enough
             return marble(planes[0], planes[1], planes[2], look, dev, dec, mode=mode,
                           inset=inset, post=post, capacity=count, stats=stats,
-                          packed=packed, output_bits=output_bits)
+                          packed=packed, output_bits=output_bits, out=out if packed else None)
         return _patch_post(out, planes, post, fix, count, cap, stats, fixed_inputs=fixin,
                            shift=2 if output_bits == 16 else 0)
     return out
@@ -464,8 +473,9 @@ def post(r, g, b, pp: Post, capacity=None, stats=None):
     return _patch_post(out, planes, pp, fix, int(nfix.value), cap, stats)
 
 
-def interleave(r, g, b, output_bits=14):
-    """(H, W, 3) uint16 in GPU-visible memory from three planes.
+def interleave(r, g, b, output_bits=14, out=None):
+    """(H, W, 3) uint16 in GPU-visible memory from three planes (into `out`, see
+    _packed_out, when given).
 
     output_bits=16 writes Edit's TIFF encoding (value << 2) in the interleave
     kernel; 14 leaves the decoder's encoded values unchanged.
@@ -476,7 +486,7 @@ def interleave(r, g, b, output_bits=14):
     h, w = planes[0].shape
     if any(v.shape != (h, w) for v in planes) or not h or not w:
         raise ValueError("planes must be nonempty and the same size")
-    out = metal_itp.empty((h, w, 3))
+    out = _packed_out(h, w, out)
     lib = metal_itp._load()
     lib.sonylook_metal_interleave.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_uint32] * 3 + [ctypes.c_void_p]
     if lib.sonylook_metal_interleave(*(v.ctypes.data for v in planes), w, h,

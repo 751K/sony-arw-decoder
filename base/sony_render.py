@@ -288,7 +288,7 @@ class Look:
     def render(self, lin, detail=None, pointwise=False, marble=None, sscs=None,
                marble_inset=None, timings=None, strip=512, metal_look=False,
                metal_spatial=False, metal_marble=False, metal_post=False,
-               output_bits=14):
+               output_bits=14, reuse_input=False):
         """sscs: None, or sony_sscs.params_from_tags(...) to run ZcTaskSSCS first (Edit always runs it, right
         after GeoCorrection). Integer input uses Sony's u16 path, float input its float32 path.
         detail: None, or dict(sharp=sony_detail.sharpness_params(...), spica=(table, params)) to run
@@ -308,7 +308,10 @@ class Look:
         and the spatial stages on their exact sub-bands.  Marble runs on slabs with a
         12-block halo.  The result is identical to processing the whole array.
         output_bits=16 makes the final Metal interleave write value << 2 directly;
-        other paths apply the same conversion after assembly."""
+        other paths apply the same conversion after assembly.
+        reuse_input=True lets the Metal path write the final image over `lin` (a
+        GPU-resident (H, W, 3) uint16 array) instead of a new one: only for callers
+        that do not need `lin` afterwards (sony_decode). It saves a full-size image."""
         atan, _ = SL.load_static_tables()
         tim = timings if timings is not None else {}
         mark_lock = Lock()
@@ -357,6 +360,7 @@ class Look:
                              and not self.hue and not self.saturation and H >= 7 and W >= 7)
         import metal_itp as MI
         metal_batch = MI.active()
+        reuse_out = None        # set below when the final image may overwrite lin
 
         def close_metal_batch():
             nonlocal metal_batch
@@ -467,7 +471,7 @@ class Look:
                         metal_mb = ML.marble(
                             *pre, look, marble["dev"], marble["dec"],
                             mode=self.output_mode, inset=bool(marble_inset), post=post,
-                            packed=True, output_bits=output_bits)
+                            packed=True, output_bits=output_bits, out=reuse_out)
                         metal_marble_post = metal_mb is not None
                     if metal_mb is None:
                         metal_mb = ML.marble(
@@ -476,7 +480,7 @@ class Look:
                             # Packed output returns straight from finish(): only
                             # valid when no Effect/ToneCurve/Shade stage remains.
                             packed=not cpu_post_needed and (post is None or not post.active),
-                            output_bits=output_bits)
+                            output_bits=output_bits, out=reuse_out)
                 if metal_mb is None:
                     close_metal_batch()        # CPU / Rust Marble reads pre
                 if metal_mb is not None:
@@ -598,7 +602,7 @@ class Look:
                     mark("shade", t)
             if metal_post or metal_marble:      # planes are GPU-resident: interleave on the GPU
                 import metal_look as ML
-                out = ML.interleave(r, g, b, output_bits=output_bits)
+                out = ML.interleave(r, g, b, output_bits=output_bits, out=reuse_out)
                 close_metal_batch()
                 return out
             close_metal_batch()
@@ -616,6 +620,10 @@ class Look:
                 metal_batch = True
             t = time.perf_counter()
             pre = ML.front_spatial(lin, self, atan, ML.Spatial(self, detail))
+            # Only the front reads lin, so with reuse_input the final image can be
+            # written over it (encoded after the front on the same queue).
+            if reuse_input and lin.shape == (H, W, 3) and lin.dtype == np.uint16 and MI.resident(lin):
+                reuse_out = lin
             mark("metal_front_spatial", t)
             return finish(list(pre))
 
