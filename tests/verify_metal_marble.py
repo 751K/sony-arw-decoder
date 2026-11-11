@@ -62,7 +62,7 @@ def cases(with_tab, no_tab, blk8):
     for iso in (100, 3200, 12800, 51200, 102400, 409600, 819200):  # every ISO-factor branch
         for lum in (5, 37, 100, 109):
             out.append(('no-table', 120, 96, no_tab, dev(lum), dict(base, iso=iso), 0, True))
-    for mode in (0, 1):
+    for mode in (0, 1, 3, 4):     # sRGB, AdobeRGB, Display P3, ProPhoto
         for look in (with_tab, no_tab):
             out.append(('mode', 121, 96, look, dev(25), base, mode, True))
             out.append(('dec-None', 122, 96, look, dev(25), None, mode, True))
@@ -184,7 +184,8 @@ def check_chroma(blk4, blk8, path):
         for lum in (0, 10, 60):
             for d224 in (-60, 0, 40, 100):
                 for dec, mode, h in ((base, 0, 200), (dict(base, f0=1, iso=800), 0, 201),
-                                     (dict(base, f0=1, iso=3200), 1, 202), (None, 0, 203)):
+                                     (dict(base, f0=1, iso=3200), 1, 202), (None, 0, 203),
+                                     (base, 3, 200), (dict(base, f0=1, iso=3200), 4, 202)):
                     r, g, b = image(h, 160, 1000 + n)
                     dev = dict(d218=1, d224=d224, d2c0=lum)
                     same(f'chroma {name} lum={lum} d224={d224} mode={mode} h={h}',

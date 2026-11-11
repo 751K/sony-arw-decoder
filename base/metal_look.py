@@ -244,8 +244,8 @@ def _marble_setup(r, g, b, look, dev, dec, mode, inset):
     a.f = float(MB.strength(dev["d224"], dec))
     a.inset = 1 if inset else 0
     T = E.tables()
-    names = ("srgb_dec" if mode == 0 else "gamma_dec", "gamma_enc",
-             "gamma_dec", "srgb_enc" if mode == 0 else "gamma_enc")
+    dec_t, enc_t = E.conv_tables(mode)
+    names = (dec_t, "gamma_enc", "gamma_dec", enc_t)
     tabs = [np.ascontiguousarray(T[k], dtype=np.int16) for k in names]
     if any(t.shape != (0x4000,) for t in tabs):
         raise ValueError("Marble conversion tables must have 0x4000 entries")
@@ -344,7 +344,7 @@ class Post:
         a = PostArgs()
         if self.effect:
             a.effect = 1 if self.look_id == E.LOOK_BW else 2
-            a.conv = 1 if self.mode in (0, 1) else 0
+            a.conv = 1 if self.mode in E.M_FWD else 0
             if a.conv:
                 for i, v in enumerate(int(x) for row in E.M_FWD[self.mode] for x in row):
                     a.m_fwd[i] = v
@@ -370,10 +370,9 @@ class Post:
                 a.lo_one |= (c[i] == 1.0) << i
             a.c10_one = int(c[10] == 1.0)
         self.args = a
-        mode = self.mode if self.mode in (0, 1) else 0
         T = E.tables()
-        names = ("srgb_dec" if mode == 0 else "gamma_dec", "gamma_enc",
-                 "gamma_dec", "srgb_enc" if mode == 0 else "gamma_enc")
+        dec_t, enc_t = E.conv_tables(self.mode if self.mode in E.M_FWD else 0)
+        names = (dec_t, "gamma_enc", "gamma_dec", enc_t)
         self.tables = [np.ascontiguousarray(T[k], dtype=np.int16) for k in names]
         luts = self.tone_luts if self.tone_luts is not None else [np.zeros(0x10000, np.uint16)] * 4
         self.luts = np.ascontiguousarray(np.stack([np.asarray(v, np.uint16) for v in luts]))

@@ -114,10 +114,13 @@ def decode(arw, look=None, *, output="srgb", raw=None, nr=None, dro=None, marble
            output_bits=14):
     """Decode an ARW to the encoded image (H, W, 3) uint16.
 
-    output: "srgb" or "adobe" (AdobeRGB).  The look's LinearMatrix16 table is built
-            with output_mode 0/1, param8 0: the working space stays sRGB (the look
-            tables are authored there) and mode 1 applies Sony's sRGB -> AdobeRGB
-            linear matrix.  BW/Sepia also pass it to the Effect stage (mode 0/1).
+    output: "srgb", "adobe" (AdobeRGB), "p3" (Display P3) or "prophoto".  The look's
+            LinearMatrix16 table is built with output_mode 0/1, param8 0: the working
+            space stays sRGB (the look tables are authored there) and mode 1 applies
+            Sony's sRGB -> AdobeRGB linear matrix.  BW/Sepia also pass it to the Effect
+            stage (mode 0/1).  Display P3 and ProPhoto are not Edit modes; they are
+            built the same way (color_spaces.py), and ProPhoto comes out re-encoded
+            to gamma 1.8.
     look:   look name from arw_looks.look_ifds ("Standard", "FL2", ...); None follows the
             settings (0x8000: 1 = the look the camera shot with, SR2 0x7770; else a look id).
     raw:    optional full visible CFA image (uint16); read with rawpy if None.
@@ -349,9 +352,12 @@ def decode(arw, look=None, *, output="srgb", raw=None, nr=None, dro=None, marble
     t = time.perf_counter()
     sscs_params = SC.params_from_tags(tags) if sscs else None
     fused_geo_sscs = False
+    L = None
     if lens:
+        # None: the file has no lens correction data, so GeoCorr is skipped.
         L = LN.lens_from_arw(arw, dist_setting=int(st.get(DS.DISTORTION, -1)),
                              ca_setting=int(st.get(DS.CA_CORRECTION, 1)))
+    if L is not None:
         H, W = planes[0].shape
         if metal_geo:
             import metal_geo as MG
@@ -435,8 +441,12 @@ def decode(arw, look=None, *, output="srgb", raw=None, nr=None, dro=None, marble
     else:
         fade_level = None
         fade = 0 if look in ("FL2", "FL3") else None
+    import color_spaces as CS
+    if output not in CS.MODES:
+        raise ValueError(f"output must be one of {sorted(CS.MODES)}, got {output!r}")
+    output_mode = CS.MODES[output]
     lk = R.Look(look, looks, fade=fade, fade_level=fade_level,
-                output_mode=1 if output == "adobe" else 0,
+                output_mode=output_mode,
                 tone_curves=tone_curves, shade=shade, use_rust=use_rust, **tone)
     rt = {}
     if marble:
@@ -454,6 +464,7 @@ def decode(arw, look=None, *, output="srgb", raw=None, nr=None, dro=None, marble
                         output_bits=output_bits)
     # crop back to the decoder rectangle
     ty, tx = y0 - ey0, x0 - ex0
+    img = CS.reencode(img, output_mode, output_bits)   # ProPhoto: gamma 2.2 -> 1.8 (in place on Metal)
     img = img[ty:ty + (y1 - y0), tx:tx + (x1 - x0)]
     for k, v in rt.items():
         timings[f"render.{k}"] = v
@@ -464,15 +475,12 @@ def decode(arw, look=None, *, output="srgb", raw=None, nr=None, dro=None, marble
     return img
 
 
-def main():
-    import argparse
-    ap = argparse.ArgumentParser(description="Decode an ARW through the full Sony pipeline")
-    ap.add_argument("arw")
+def add_decode_arguments(ap):
+    """The develop and backend options shared by the single-file and batch CLIs."""
     ap.add_argument("--look", default=None, help="default: the look in the settings / the one shot with")
-    ap.add_argument("--out", default=None,
-                    help="output .tif/.tiff (16-bit), .jpg (8-bit) or .png (8-bit)")
-    ap.add_argument("--color-space", default="srgb", choices=["srgb", "adobe"],
-                    help="output color space (default srgb)")
+    ap.add_argument("--color-space", default="srgb", choices=["srgb", "adobe", "p3", "prophoto"],
+                    help="output color space (default srgb; p3 = Display P3, prophoto = ProPhoto RGB "
+                         "gamma 1.8 -- these two are not Edit options, see base/color_spaces.py)")
     ap.add_argument("--bits", type=int, default=None, choices=[8, 16],
                     help="bit depth (default: 16 for TIFF, 8 otherwise)")
     ap.add_argument("--quality", type=int, default=95, help="JPEG quality 1..100")
@@ -506,24 +514,49 @@ def main():
                     help="run Effect, ToneCurve and ShadeCorrection on Metal")
     ap.add_argument("--metal-nr", action="store_true",
                     help="run RawNR (noise reduction on the raw) on Metal")
+
+
+def output_bits_for(a, suffix):
+    """decode()'s output_bits for writing a `suffix` file: 16 for a 16-bit TIFF
+    (written without a second shift), else the 14-bit decoder values."""
+    if a.bits is not None:
+        return 16 if a.bits == 16 else 14
+    return 16 if suffix and suffix.lower() in (".tif", ".tiff") else 14
+
+
+def decode_kwargs(a, output_bits=14, verbose=False):
+    """decode() keyword arguments from parsed add_decode_arguments() options."""
+    return dict(look=a.look, output=a.color_space,
+                nr=False if a.no_nr else None, dro=False if a.no_dro else None,
+                marble=False if a.no_marble else None, detail=not a.no_detail,
+                lens=not a.no_lens, sscs=not a.no_sscs, pad=a.pad, strip=a.strip, verbose=verbose,
+                rust=True if a.rust else None, metal=a.metal, metal_itp=a.metal_itp,
+                metal_dro=a.metal_dro, metal_geo=a.metal_geo, metal_sscs=a.metal_sscs,
+                metal_look=a.metal_look, metal_spatial=a.metal_spatial, metal_marble=a.metal_marble,
+                metal_post=a.metal_post, metal_nr=a.metal_nr, output_bits=output_bits)
+
+
+def write_kwargs(a, output_bits):
+    """sony_export.write_image() keyword arguments for the same options."""
+    return dict(color_space=a.color_space, bits=a.bits, quality=a.quality, input_bits=output_bits)
+
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser(description="Decode an ARW through the full Sony pipeline "
+                                             "(many files: sony_batch.py)")
+    ap.add_argument("arw")
+    ap.add_argument("--out", default=None,
+                    help="output .tif/.tiff (16-bit), .jpg (8-bit) or .png (8-bit)")
+    add_decode_arguments(ap)
     a = ap.parse_args()
-    output_bits = 16 if a.bits == 16 else 14
-    if a.out and a.bits is None:
-        output_bits = 16 if Path(a.out).suffix.lower() in (".tif", ".tiff") else 14
-    img = decode(a.arw, a.look, output=a.color_space,
-                 nr=False if a.no_nr else None, dro=False if a.no_dro else None,
-                 marble=False if a.no_marble else None, detail=not a.no_detail,
-                 lens=not a.no_lens, sscs=not a.no_sscs, pad=a.pad, strip=a.strip, verbose=True,
-                 rust=True if a.rust else None, metal=a.metal, metal_itp=a.metal_itp, metal_dro=a.metal_dro, metal_geo=a.metal_geo, metal_sscs=a.metal_sscs, metal_look=a.metal_look,
-                 metal_spatial=a.metal_spatial, metal_marble=a.metal_marble,
-                 metal_post=a.metal_post, metal_nr=a.metal_nr,
-                 output_bits=output_bits)
+    output_bits = output_bits_for(a, Path(a.out).suffix if a.out else None)
+    kw = decode_kwargs(a, output_bits, verbose=True)
+    img = decode(a.arw, kw.pop("look"), **kw)
     print(img.shape, img.dtype, int(img.min()), int(img.max()))
     if a.out:
-        out = EXP.write_image(img, a.out, color_space=a.color_space,
-                              bits=a.bits, quality=a.quality, input_bits=output_bits)
+        out = EXP.write_image(img, a.out, **write_kwargs(a, output_bits))
         print("->", out)
-
 
 if __name__ == "__main__":
     main()

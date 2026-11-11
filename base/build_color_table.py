@@ -90,6 +90,9 @@ def select_matrix(output_mode,param8):
     if output_mode==0 and param8!=0: key='mode0_param8_nonzero'
     elif output_mode==1 and param8==0: key='mode1_param8_zero'
     elif output_mode==2: key='mode2_param8_zero' if param8==0 else 'mode2_param8_nonzero'
+    elif output_mode in (3,4) and param8==0:
+        import color_spaces            # Display P3 / ProPhoto, not modes Edit has
+        return list(color_spaces.LM16_MATRIX[output_mode])
     return constants()[key]['values'] if key else None
 
 def _decoded_value(decoded,offset):

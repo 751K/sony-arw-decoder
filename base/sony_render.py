@@ -132,7 +132,9 @@ def front_end_sony(arw, scale=8, lens=True, dro=None, wb_mode=None, temperature=
         lin, _ = DRO.vatr_downscaled(lin, DRO.grid_from_arw(arw), scale)
     if lens:   # ZcTaskGeoCorr: distortion + lateral CA (sony_lens.py, bit-verified per pixel at full res)
         import sony_lens as LN
-        lin = LN.geocorr_downscaled(lin, LN.lens_from_arw(arw), scale) - 0.5
+        L = LN.lens_from_arw(arw)
+        if L is not None:      # None: no lens correction data in the file
+            lin = LN.geocorr_downscaled(lin, L, scale) - 0.5
     return lin
 
 
@@ -160,7 +162,9 @@ class Look:
         is computed as Edit does (interpolated between steps, extrapolated above 90).
         sscs: None, or sony_sscs params to apply ZcTaskSSCS in every render() call (decoder stage, not
         part of the look; the published profiles leave it out).
-        output_mode: 0 = sRGB, 1 = AdobeRGB (render+0x44).  It selects the LinearMatrix16
+        output_mode: 0 = sRGB, 1 = AdobeRGB (render+0x44); 3 = Display P3 and 4 = ProPhoto
+        are this project's additions, built the same way (color_spaces.py; ProPhoto is
+        rendered gamma-2.2 encoded and re-encoded by the caller).  It selects the LinearMatrix16
         static branch: mode 1 / param8 0 is the sRGB -> AdobeRGB linear matrix, so the
         working space (param8 = 0, the look tables are authored in sRGB primaries) is
         unchanged and only the output primaries move.  BW/Sepia also need it: the
@@ -176,8 +180,8 @@ class Look:
         written per shot from the white balance); four ints replace them, e.g.
         (0, 1024, 0, 0) for the daylight set 0x7844 (docs/pipeline.md 4.3).
         All defaults reproduce the old behaviour bit for bit."""
-        if output_mode not in (0, 1):
-            raise ValueError("output_mode must be 0 (sRGB) or 1 (AdobeRGB)")
+        if output_mode not in (0, 1, 3, 4):
+            raise ValueError("output_mode must be 0 (sRGB), 1 (AdobeRGB), 3 (Display P3) or 4 (ProPhoto)")
         self.sscs = sscs
         # optional Rust fused front/spatial (rust/sonylook_core); opt-in.
         # use_rust=None follows SONYLOOK_RUST, otherwise the explicit flag wins.
@@ -712,15 +716,16 @@ def main():
     ap.add_argument("looks", nargs="+")
     ap.add_argument("--scale", type=int, default=4)
     ap.add_argument("--out", default="render_output")
-    ap.add_argument("--color-space", default="srgb", choices=["srgb", "adobe"])
+    ap.add_argument("--color-space", default="srgb", choices=["srgb", "adobe", "p3", "prophoto"])
     a = ap.parse_args()
     out = Path(a.out); out.mkdir(exist_ok=True)
     lin = front_end_sony(a.arw, a.scale)
     looks = load_looks(a.arw)
     from PIL import Image
-    output_mode = 1 if a.color_space == "adobe" else 0
+    import color_spaces as CS
+    output_mode = CS.MODES[a.color_space]
     for name in a.looks:
-        img = Look(name, looks, output_mode=output_mode).render(lin)
+        img = CS.reencode(Look(name, looks, output_mode=output_mode).render(lin), output_mode)
         Image.fromarray((img >> 6).clip(0, 255).astype(np.uint8)).save(out / f"{name}_s{a.scale}.png")
         print(name, img.shape, img.mean(axis=(0, 1)).round(1))
 

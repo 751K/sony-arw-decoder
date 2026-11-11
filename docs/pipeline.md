@@ -425,9 +425,16 @@ RAW → [RawNR] → ITP → [DRO] → [GeoCorr] → SSCS → LinearMatrix16 → 
 
 ### 9.2 输出色彩空间与文件格式（`sony_export.py`）
 
-- **色彩空间**：`output="srgb" | "adobe"`。同一个 render+0x44 同时传给 LinearMatrix16、Marble 和 Effect。
+- **色彩空间**：`output="srgb" | "adobe"`（另有本项目新增的 `"p3"` 和 `"prophoto"`，见下文）。同一个 render+0x44 同时传给 LinearMatrix16、Marble 和 Effect。
 - **位深**：Edit 的 16 位 TIFF 是 14 位值 << 2（最大 65532）；8 位是 14 位值 >> 6，直接截断。Metal 的 16 位路径在最终交错 kernel 中完成移位，不建立全图中间副本。
 - **ICC**：Edit 只在 AdobeRGB 时嵌入 `Sony_AdobeRGB_1998.icc`（EXIF ColorSpace = 0xFFFF），sRGB 导出不嵌（ColorSpace = 1）。本实现两种都嵌，配置文件运行时从本机 Edit 安装目录读取。
+- **Display P3 和 ProPhoto（本项目新增，Edit 没有）**：`output="p3" | "prophoto"`，即 `output_mode` 3 / 4，照 AdobeRGB 的做法构造（`color_spaces.py`）：
+  - LinearMatrix16 乘 sRGB → P3（D65）或 sRGB → ProPhoto（Bradford D65 → D50）线性矩阵。该表作用在白平衡后的相机 RGB 上，所以 sRGB 装不下的颜色在这一步不会被截掉。
+  - Marble 和 BW/Sepia 效果会先转进 Edit 的宽色域工作空间 W 再处理（sRGB → W 就是 mode 2 的矩阵）。新模式所需的 13 位定点矩阵由同一常量推出，每行和为 8192；用同样的方法推 Edit 自己的 sRGB/AdobeRGB 矩阵，误差不超过 2/8192。W 的红原色与 ProPhoto 相同，几乎包含整个 P3，但不包含 ProPhoto 的绿、蓝两角，超出 W 的颜色在这两步会被截断。
+  - P3 输出按 sRGB 传递曲线解释，Marble 和效果用 sRGB 表。ProPhoto 内部像 AdobeRGB 一样按 gamma 2.2（563/256）处理，最后用查找表重新编码为 gamma 1.8（461/256）；Metal 路径在 GPU 上原地完成（`lut_u16`），不增加耗时。
+  - ICC v2 配置文件（矩阵加 TRC）在代码中生成，P3 带 `chad`。LittleCMS 的转换结果与矩阵计算一致，误差在 8 位舍入以内。
+  - 一致性：把输出按自身 ICC 换回 sRGB，与 sRGB 输出比较（只统计在 sRGB 色域内的像素），14 位差的中位数为：P3 1–12，ProPhoto 60–145，Edit 自己的 AdobeRGB 60–113。ProPhoto 与 AdobeRGB 处在同一水平，差别主要来自色调曲线输出按 gamma 2.2 而不是 sRGB 曲线解释。
+  - 没有 Edit 导出图可以对照；Metal、Rust 和 NumPy 三个后端逐位一致（`tests/verify_color_spaces.py`）。
 
 ### 9.3 性能（Mac mini，Apple M6，A7M5 7008×4672）
 

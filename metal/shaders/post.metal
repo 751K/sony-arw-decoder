@@ -182,3 +182,10 @@ kernel void interleave3(device const ushort *r [[buffer(0)]],device const ushort
     uint i=p.y*d.width+p.x;
     o[3*i]=ushort(uint(r[i])<<d.shift);o[3*i+1]=ushort(uint(g[i])<<d.shift);o[3*i+2]=ushort(uint(b[i])<<d.shift);
 }
+
+// In-place 16-bit lookup over a flat array, four values per thread:
+// n = (value count, table length); values past the table read its last entry.
+kernel void lut_u16(device ushort *d [[buffer(0)]],device const ushort *lut [[buffer(1)]],constant uint2 &n [[buffer(2)]],uint q [[thread_position_in_grid]]) {
+    uint last=n.y-1;
+    for(uint k=0;k<4;k++){uint i=q*4+k;if(i<n.x)d[i]=lut[min(uint(d[i]),last)];}
+}

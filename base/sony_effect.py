@@ -38,6 +38,16 @@ M_FWD = {0: ((0x13b2, 0xca2, -0x54), (0x2ec, 0x1abd, 599), (0x73, 0x253, 0x1d39)
          1: ((0x1b89, 0x4ce, -0x57), (0x416, 0x197a, 0x270), (0xa1, 0xe4, 0x1e7b))}     # dd7cc
 M_INV = {0: ((0x37e2, -0x1aa4, 0x2c3), (-0x613, 0x2976, -0x363), (-0x60, -0x2e3, 0x2345)),  # dd5f4
          1: ((0x263e, -0x73f, 0x102), (-0x613, 0x2975, -0x362), (-0x9d, -0x110, 0x21ac))}    # dd9a4
+# Output modes 3 (Display P3) and 4 (ProPhoto), not in Edit: color_spaces.py.
+import color_spaces as _CS                                           # noqa: E402
+for _m, (_f, _i) in _CS.MARBLE_MATRICES.items():
+    M_FWD[_m], M_INV[_m] = _f, _i
+
+
+def conv_tables(mode):
+    """(decode table into the working space, encode table out of it) names for an
+    output mode: the sRGB curve for sRGB / Display P3, Edit's gamma 2.2 otherwise."""
+    return ("srgb_dec", "srgb_enc") if _CS.srgb_trc(mode) else ("gamma_dec", "gamma_enc")
 
 
 def _bits(u):
@@ -118,10 +128,8 @@ def effect_apply(r, g, b, look_id, tr_tb=None, mode=0):
     if look_id & ~1 != 0x10:
         return r, g, b
     T = tables()
-    if mode == 0:
-        r, g, b = _convert((r, g, b), T["srgb_dec"], M_FWD[0], T["gamma_enc"])
-    elif mode == 1:
-        r, g, b = _convert((r, g, b), T["gamma_dec"], M_FWD[1], T["gamma_enc"])
+    if mode in M_FWD:          # mode 2 (Edit's working space) needs no conversion
+        r, g, b = _convert((r, g, b), T[conv_tables(mode)[0]], M_FWD[mode], T["gamma_enc"])
     R, G, B = (np.asarray(p, np.int64) for p in (r, g, b))
     s = R * 0x991 + G * 0x12c9 + B * 0x3a6
     if look_id == LOOK_BW:
@@ -144,8 +152,6 @@ def effect_apply(r, g, b, look_id, tr_tb=None, mode=0):
     go = np.trunc(L).astype(np.int64) - ((np.trunc(wr).astype(np.int64) * 0x104c + np.trunc(wb).astype(np.int64) * 0x636) >> 13)
     cl = lambda v: np.clip(v, 0, 0x3fff).astype(np.uint16)
     out = [cl(ro), cl(go), cl(bo)]
-    if mode == 0:
-        out = _convert(out, T["gamma_dec"], M_INV[0], T["srgb_enc"])
-    elif mode == 1:
-        out = _convert(out, T["gamma_dec"], M_INV[1], T["gamma_enc"])
+    if mode in M_INV:
+        out = _convert(out, T["gamma_dec"], M_INV[mode], T[conv_tables(mode)[1]])
     return tuple(out)

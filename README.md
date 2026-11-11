@@ -13,7 +13,7 @@ RAW -> [RawNR] -> ITP -> [DRO] -> [GeoCorr] -> SSCS
     -> [Marble] -> [Effect] -> [ToneCurve] -> [ShadeCorrection]
 ```
 
-Bracketed stages run according to the development settings stored in the ARW. The output is the image corresponding to the decoder rectangle as 16-bit sRGB or Adobe RGB data and can be written to TIFF, JPEG or PNG.
+Bracketed stages run according to the development settings stored in the ARW. The output is the image corresponding to the decoder rectangle as 16-bit sRGB or Adobe RGB data (plus Display P3 and ProPhoto RGB, which this project adds; Edit has no such options) and can be written to TIFF, JPEG or PNG.
 
 The current implementation uses A7 V samples and development settings as its initial calibration target and has been validated against Sony Imaging Edge Edit 4.0 / 4.1 for RGGB sensor output.
 
@@ -85,6 +85,18 @@ export_image = decode("photo.ARW", metal=True, output_bits=16)
 
 `decode()` returns a `uint16` array shaped `(height, width, 3)` with values 0–16383 by default. `output_bits=16` returns Edit's 16-bit TIFF encoding, exactly the 14-bit result shifted left by two; the Metal path performs that shift in the final interleave kernel. Command-line 16-bit TIFF export selects this path automatically.
 
+`--color-space` (`output=` in Python) is `srgb` (default), `adobe`, `p3` or `prophoto`. Edit offers only the first two. Display P3 and ProPhoto RGB are built the way Edit builds Adobe RGB: an extra matrix in the LinearMatrix16 table, which works on camera RGB so colors outside sRGB survive, plus matching matrices for Marble and the BW/Sepia effect. ProPhoto is re-encoded to gamma 1.8 at the end. The ICC profiles are generated. There is no Edit export to compare these two against; all backends agree bit for bit. Marble and the effect clip to Edit's working gamut, which holds Display P3 but not all of ProPhoto. Details: docs/pipeline.md §9.2. ProPhoto is best written as 16-bit TIFF.
+
+### Many files
+
+```bash
+python3 base/sony_batch.py ~/Pictures/2025 more.ARW --out-dir out --metal
+python3 base/sony_batch.py ~/Pictures/2025 --out-dir out --format tif --metal --skip-existing
+python3 base/sony_batch.py ~/Pictures/2025 --out-dir out-p3 --metal --color-space p3
+```
+
+Folders are searched recursively and the output keeps their subfolders; the default format is 8-bit JPEG (`--format tif` writes 16-bit TIFFs of about 200 MB each). The decode options are those of `sony_decode.py`. Reading the next files, decoding, and encoding/writing the previous images run at the same time, and the output is byte-identical to decoding each file on its own. A file that fails (for example a damaged one) is reported and skipped. On the Mac mini above, with JPEG output and `--metal`, a batch takes about 87 ms per A7M5 file when the files are in the OS cache (151 ms one after another) and 126–162 ms per file from an external USB SSD (267–354 ms one after another), where the disk's ~300 MB/s read is then the limit. The summary line splits the time into decoding and waiting for reads and writes.
+
 ## Verification
 
 ```bash
@@ -94,6 +106,8 @@ python3 tests/verify_metal_itp.py photo.ARW
 python3 tests/verify_metal_geo.py photo.ARW
 python3 tests/verify_metal_geo_sscs.py photo.ARW
 python3 tests/verify_metal_batch.py photo.ARW
+python3 tests/verify_batch.py photo.ARW [more.ARW ...]
+python3 tests/verify_color_spaces.py photo.ARW
 python3 tests/verify_metal_export.py photo.ARW
 python3 tests/verify_metal_sscs.py photo.ARW
 python3 tests/verify_metal_look.py photo.ARW

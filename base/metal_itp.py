@@ -79,6 +79,18 @@ def empty(shape, dtype=np.uint16):
     return np.frombuffer(holder, np.uint8, count=n).view(dtype).reshape(shape)
 
 
+def lut_u16(data, lut):
+    """data[...] = lut[data] in place on the GPU. False (and nothing done) when the
+    array is not GPU-resident or Metal is unavailable or busy batching."""
+    try:
+        lib = _load()
+    except (OSError, RuntimeError):
+        return False
+    lut = np.ascontiguousarray(lut, np.uint16)
+    lib.sonylook_metal_lut_u16.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_uint32]
+    return lib.sonylook_metal_lut_u16(data.ctypes.data, data.size, lut.ctypes.data, lut.size) == 0
+
+
 def trim():
     """Release the idle buffers held by the Metal buffer pool."""
     _load().sonylook_metal_trim()

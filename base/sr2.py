@@ -67,7 +67,7 @@ def file_key(path):
     return os.path.abspath(path), st.st_mtime_ns, st.st_size
 
 
-@lru_cache(maxsize=2)
+@lru_cache(maxsize=4)          # the file being decoded and those a batch has read ahead
 def _file_bytes(key):
     with open(key[0], "rb") as f:
         return f.read()

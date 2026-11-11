@@ -26,22 +26,29 @@ from pathlib import Path
 import numpy as np
 
 SPACES = {"srgb": "Sony_sRGB.icc", "adobe": "Sony_AdobeRGB_1998.icc"}
-ALIASES = {"srgb": "srgb", "adobergb": "adobe", "adobergb1998": "adobe", "adobe": "adobe"}
+ALIASES = {"srgb": "srgb", "adobergb": "adobe", "adobergb1998": "adobe", "adobe": "adobe",
+           "p3": "p3", "displayp3": "p3", "prophoto": "prophoto", "prophotorgb": "prophoto",
+           "romm": "prophoto", "rommrgb": "prophoto"}
 
 
 def normalize_space(space="srgb"):
-    """'sRGB', 'AdobeRGB', 'Adobe RGB 1998', ... -> 'srgb' / 'adobe'."""
+    """'sRGB', 'AdobeRGB', 'Display P3', 'ProPhoto RGB', ... -> 'srgb' / 'adobe' / 'p3' / 'prophoto'."""
     key = str(space).strip().lower().replace(" ", "").replace("-", "").replace("_", "")
     if key in ALIASES:
         return ALIASES[key]
-    raise ValueError(f"unknown color space {space!r}; use 'srgb' or 'adobe'")
+    raise ValueError(f"unknown color space {space!r}; use 'srgb', 'adobe', 'p3' or 'prophoto'")
 
 
-@lru_cache(maxsize=2)
+@lru_cache(maxsize=4)
 def icc_profile(space="srgb"):
-    """Bytes of Edit's bundled profile for this output space."""
+    """Bytes of the profile for this output space: Edit's bundled one for sRGB and
+    AdobeRGB, a generated ICC v2 profile for Display P3 and ProPhoto (color_spaces.py)."""
+    space = normalize_space(space)
+    if space not in SPACES:
+        import color_spaces as CS
+        return CS.icc_profile(CS.MODES[space])
     import edit_binary
-    name = SPACES[normalize_space(space)]
+    name = SPACES[space]
     p = edit_binary.resources_path() / name
     if not p.exists():
         raise FileNotFoundError(

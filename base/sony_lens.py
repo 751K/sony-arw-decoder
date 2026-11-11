@@ -186,6 +186,9 @@ def lens_struct_from_tags(dist, ca_r, ca_b, rect, p5=1, look8=0, dist_on=True, c
                 off=[offR, (f32(0.0), f32(0.0)), offB])
 
 
+LENS_TAGS = (0x7984, 0x7980, 0x7922, 0x7983, 0x78a2, 0x78a3)
+
+
 def lens_from_arw(arw, rect=None, dist_setting=None, ca_setting=None, p5=1, f0=False, zoom2=False):
     """Lens struct for an ARW.
 
@@ -196,8 +199,14 @@ def lens_from_arw(arw, rect=None, dist_setting=None, ca_setting=None, p5=1, f0=F
     which is exact for cropped modes too.  dist_setting/ca_setting are dev+0x278/+0x27c
     (settings 0x8040 / 0x900d); None reads them from an Edit-saved ARW's develop
     settings, falling back to -1 (auto/on) and 1 (on).
+
+    Returns None when the file has no lens correction data (e.g. ILCE-7M4 raws
+    carry no 0x7984/0x7922/0x7983/0x78a2/0x78a3); GeoCorr is then skipped.
     """
     import sr2
+    tags = sr2.sr2_subifd(str(arw))
+    if any(t not in tags for t in LENS_TAGS):
+        return None
     if dist_setting is None or ca_setting is None:
         import develop_settings as DS
         st = DS.read_settings(arw)
@@ -205,7 +214,6 @@ def lens_from_arw(arw, rect=None, dist_setting=None, ca_setting=None, p5=1, f0=F
             dist_setting = int(st.get(DS.DISTORTION, -1))
         if ca_setting is None:
             ca_setting = int(st.get(DS.CA_CORRECTION, 1))
-    tags = sr2.sr2_subifd(str(arw))
     dist = tags[0x7984][1][1:]
     ca = tags[0x7980][1][1:]
     half = len(ca) // 2

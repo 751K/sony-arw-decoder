@@ -52,7 +52,7 @@ def main(path):
     looks = sony_render.load_looks(path)
     n = fixed = 0
     for name in ('Standard', 'BW', 'Sepia'):
-        for mode in (0, 1):
+        for mode in (0, 1, 3, 4):     # sRGB, AdobeRGB, Display P3, ProPhoto
             for ci, curves in enumerate(CURVES):
                 for si, shade in enumerate(SHADES):
                     look = sony_render.Look(name, looks, output_mode=mode, tone_curves=curves, shade=shade)

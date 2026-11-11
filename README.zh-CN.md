@@ -14,7 +14,7 @@ RAW → [RawNR] → ITP → [DRO] → [GeoCorr] → SSCS
 ```
 
 方括号中的阶段根据 ARW 中保存的显影设置运行。输出为解码器矩形对应的
-16 位 sRGB 或 Adobe RGB 图像，可写入 TIFF、JPEG 或 PNG。
+16 位 sRGB 或 Adobe RGB 图像（另可输出本项目新增的 Display P3 和 ProPhoto RGB，Edit 没有这两个选项），可写入 TIFF、JPEG 或 PNG。
 
 当前实现使用 A7 V 样张和显影设置作为初始标定目标，并已对 Sony Imaging
 Edge Edit 4.0 / 4.1 的 RGGB 传感器结果进行验证。
@@ -87,6 +87,18 @@ export_image = decode("photo.ARW", metal=True, output_bits=16)
 
 `decode()` 默认返回形状为 `(height, width, 3)`、范围 0–16383 的 `uint16` 数组。`output_bits=16` 返回 Edit 的 16 位 TIFF 编码，即每个值严格等于 14 位结果左移两位；Metal 路径在最终交错 kernel 中直接完成这一步。命令行导出 16 位 TIFF 时自动采用该路径。
 
+`--color-space`（Python 中为 `output=`）可选 `srgb`（默认）、`adobe`、`p3`、`prophoto`。Edit 只提供前两种。Display P3 和 ProPhoto RGB 按 Edit 构造 Adobe RGB 的方式实现：在 LinearMatrix16 表中多乘一个矩阵（这张表作用在相机 RGB 上，所以 sRGB 之外的颜色能保留下来），并给 Marble 和 BW/Sepia 效果配上对应的矩阵；ProPhoto 最后重新编码为 gamma 1.8。ICC 配置文件由代码生成。这两种没有 Edit 导出图可以对照，各后端之间逐位一致。Marble 和效果会截到 Edit 的工作色域，它包含 Display P3，但不能完整包含 ProPhoto。细节见 docs/pipeline.md §9.2。ProPhoto 建议输出 16 位 TIFF。
+
+### 批量处理
+
+```bash
+python3 base/sony_batch.py ~/Pictures/2025 more.ARW --out-dir out --metal
+python3 base/sony_batch.py ~/Pictures/2025 --out-dir out --format tif --metal --skip-existing
+python3 base/sony_batch.py ~/Pictures/2025 --out-dir out-p3 --metal --color-space p3
+```
+
+文件夹会递归查找，输出保留原来的子目录结构；默认输出 8 位 JPEG（`--format tif` 输出 16 位 TIFF，每张约 200 MB）。解码选项与 `sony_decode.py` 相同。读取后面的文件、解码、编码写出前面的图片三者同时进行，输出与逐张单独解码逐字节相同。出错的文件（例如损坏的文件）会报告并跳过。在上面的 Mac mini 上，输出 JPEG 并使用 `--metal` 时：文件已在系统缓存中，每张约 87 ms（逐张串行为 151 ms）；从外接 USB 固态硬盘读取，每张 126–162 ms（串行为 267–354 ms），此时瓶颈是硬盘约 300 MB/s 的读取速度。结束时的汇总行会把时间拆分为解码、等待读取和等待写出。
+
 ## 验证
 
 ```bash
@@ -96,6 +108,8 @@ python3 tests/verify_metal_itp.py photo.ARW
 python3 tests/verify_metal_geo.py photo.ARW
 python3 tests/verify_metal_geo_sscs.py photo.ARW
 python3 tests/verify_metal_batch.py photo.ARW
+python3 tests/verify_batch.py photo.ARW [more.ARW ...]
+python3 tests/verify_color_spaces.py photo.ARW
 python3 tests/verify_metal_export.py photo.ARW
 python3 tests/verify_metal_sscs.py photo.ARW
 python3 tests/verify_metal_look.py photo.ARW

@@ -557,7 +557,8 @@ def marble_config(look, dev, dec, mode) -> MarbleConfig:
     tabs = [np.ascontiguousarray(T[k], np.int16)
             for k in ("srgb_dec", "gamma_dec", "srgb_enc", "gamma_enc")]
     p = MarbleParams()
-    p.mode = int(mode)
+    import color_spaces as CS
+    p.mode = 0 if CS.srgb_trc(mode) else 1      # the Rust side only picks the curve tables
     p.d218 = int(dev["d218"])
     p.d224 = int(dev["d224"])
     p.d2c0 = int(dev["d2c0"])

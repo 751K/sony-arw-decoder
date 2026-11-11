@@ -115,6 +115,7 @@ python3 tests/verify_metal_dro.py
 python3 tests/verify_metal_geo.py photo.ARW
 python3 tests/verify_metal_geo_sscs.py photo.ARW
 python3 tests/verify_metal_batch.py photo.ARW
+python3 tests/verify_batch.py photo.ARW [more.ARW ...]
 python3 tests/verify_metal_export.py photo.ARW
 python3 tests/verify_metal_sscs.py photo.ARW
 python3 tests/verify_metal_look.py photo.ARW

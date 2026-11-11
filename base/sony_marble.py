@@ -230,10 +230,7 @@ def marble(r, g, b, look, dev, dec, region=None, mode=0):
     T = E.tables()
     sl = (slice(y0, y1), slice(x0, x1))
     planes = [np.array(p, np.int64) for p in (r, g, b)]
-    if mode == 0:
-        conv = E._convert([p[sl] for p in planes], T["srgb_dec"], E.M_FWD[0], T["gamma_enc"])
-    else:
-        conv = E._convert([p[sl] for p in planes], T["gamma_dec"], E.M_FWD[1], T["gamma_enc"])
+    conv = E._convert([p[sl] for p in planes], T[E.conv_tables(mode)[0]], E.M_FWD[mode], T["gamma_enc"])
     for p, c in zip(planes, conv):
         p[sl] = c
     Y, Cb, Cr = to_ycc(*planes)
@@ -301,10 +298,7 @@ def marble(r, g, b, look, dev, dec, region=None, mode=0):
     Cbo = blend(Cbo, origCb)
     R, G, Bp = from_ycc(Yo, Cbo, Cro)
     vs = (slice(vr[1], vr[3]), slice(vr[0], vr[2]))
-    if mode == 0:
-        back = E._convert([p[vs] for p in (R, G, Bp)], T["gamma_dec"], E.M_INV[0], T["srgb_enc"])
-    else:
-        back = E._convert([p[vs] for p in (R, G, Bp)], T["gamma_dec"], E.M_INV[1], T["gamma_enc"])
+    back = E._convert([p[vs] for p in (R, G, Bp)], T["gamma_dec"], E.M_INV[mode], T[E.conv_tables(mode)[1]])
     outs = [R.copy(), G.copy(), Bp.copy()]
     for o, c in zip(outs, back):
         o[vs] = c

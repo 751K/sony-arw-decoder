@@ -16,7 +16,7 @@ static id<MTLSharedEvent> raw_event;
 static uint64_t raw_stream_base;
 static uint64_t grid_event_value;
 static uint64_t pending_grid_value;
-#define NPIPE 57
+#define NPIPE 58
 static id<MTLComputePipelineState> pipelines[NPIPE];
 static char error_text[2048];
 const char *sonylook_metal_error(void) { return error_text; }
@@ -267,7 +267,7 @@ int sonylook_metal_init(const char *path) { @autoreleasepool {
         }
         library=[d newLibraryWithSource:source options:opts error:&err]; if(!library) return fail(err.description);
     }
-    NSArray *names=@[@"scale_raw",@"differences",@"candidates",@"weights",@"green_inputs",@"green_five",@"average_pairs",@"direction_errors",@"direction",@"green_finish",@"chroma_inputs",@"chroma_finish",@"load_tile",@"store_tile",@"dro_subcells",@"dro_histogram",@"dro_smooth",@"dro_weights",@"dro_apply",@"geo_apply",@"sscs_apply",@"look_lm_gamma",@"look_front",@"encoded_front",@"sharp_hblur",@"sharp_apply",@"spica_ycc",@"marble_in",@"marble_blocks",@"marble_sigma",@"marble_binom",@"marble_out",@"post_apply",@"nr_split",@"nr_filter",@"marble_halfc",@"marble_cblocks",@"marble_csigma",@"marble_cup",@"dro_math_test",@"interleave3",@"geo_sscs_apply",@"candidates_both",@"green_inputs_five",@"green_finish_fused",@"dro_smooth_weights",@"marble_out_post",@"load_scale_tile",@"weights_candidates",@"marble_out_packed",@"dro_fix_args",@"dro_apply_fix",@"dro_apply_exact",@"itp_edges",@"itp_final",@"marble_in_half",@"spatial_fused"];
+    NSArray *names=@[@"scale_raw",@"differences",@"candidates",@"weights",@"green_inputs",@"green_five",@"average_pairs",@"direction_errors",@"direction",@"green_finish",@"chroma_inputs",@"chroma_finish",@"load_tile",@"store_tile",@"dro_subcells",@"dro_histogram",@"dro_smooth",@"dro_weights",@"dro_apply",@"geo_apply",@"sscs_apply",@"look_lm_gamma",@"look_front",@"encoded_front",@"sharp_hblur",@"sharp_apply",@"spica_ycc",@"marble_in",@"marble_blocks",@"marble_sigma",@"marble_binom",@"marble_out",@"post_apply",@"nr_split",@"nr_filter",@"marble_halfc",@"marble_cblocks",@"marble_csigma",@"marble_cup",@"dro_math_test",@"interleave3",@"geo_sscs_apply",@"candidates_both",@"green_inputs_five",@"green_finish_fused",@"dro_smooth_weights",@"marble_out_post",@"load_scale_tile",@"weights_candidates",@"marble_out_packed",@"dro_fix_args",@"dro_apply_fix",@"dro_apply_exact",@"itp_edges",@"itp_final",@"marble_in_half",@"spatial_fused",@"lut_u16"];
     if(names.count!=NPIPE) return fail(@"Metal kernel table size mismatch");
     pipeline_names=names;
     id<MTLComputePipelineState> ps[NPIPE];
@@ -937,6 +937,21 @@ int sonylook_metal_rawnr(const uint16_t *raw,uint32_t w,uint32_t h,const NrArgs 
     copy_back(ob,out,n*2);return done(0);
 }}
 
+// data[i] = lut[data[i]] in place on a GPU-resident uint16 array (an output
+// re-encode, e.g. ProPhoto's gamma 1.8). Runs on its own; not inside a batch.
+int sonylook_metal_lut_u16(uint16_t *data,size_t n,const uint16_t *lut,uint32_t lut_len) { @autoreleasepool {
+    if(!device||!data||!lut||!n||!lut_len||n>0xffffffffu)return fail(@"Invalid Metal LUT arguments");
+    id db=find_resident(data,n*2);
+    if(!db)return fail(@"Metal LUT needs a GPU-resident array");
+    id lb=in_buf(lut,(size_t)lut_len*2);
+    if(!lb)return fail(@"Metal LUT allocation failed");
+    id<MTLCommandBuffer> cmd=own_command_buffer();if(!cmd)return -1;
+    uint32_t args[2]={(uint32_t)n,lut_len};
+    id<MTLComputeCommandEncoder> e=new_encoder(cmd,57);[e setComputePipelineState:pipelines[57]];
+    bind(e,db,0);bind(e,lb,1);[e setBytes:args length:sizeof(args) atIndex:2];
+    [e dispatchThreads:MTLSizeMake((n+3)/4,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];[e endEncoding];
+    int rc=submit_command(cmd);return done(rc);
+}}
 // Three uint16 planes -> one H x W x 3 interleaved image. shift=2 writes
 // Edit's 16-bit TIFF values directly (14-bit encoded value << 2).
 int sonylook_metal_interleave(const uint16_t *r,const uint16_t *g,const uint16_t *b,uint32_t w,uint32_t h,uint32_t shift,uint16_t *out) { @autoreleasepool {
