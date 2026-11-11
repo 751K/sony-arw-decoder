@@ -39,8 +39,8 @@ Rust 与 Metal 可选，也可以组合使用。NumPy 始终作为逐阶段和�
 | --- | ---: | ---: |
 | NumPy | 24.92 秒 | 1.0× |
 | Rust | 1.79 秒 | 13.9× |
-| Metal | 0.110 秒 | 226.5× |
-| Rust + Metal | 0.110 秒 | 226.5× |
+| Metal | 0.090 秒 | 276.9× |
+| Rust + Metal | 0.090 秒 | 276.9× |
 
 使用 `--metal` 时，如果 Rust 库可用，会自动使用 Rust 读取 RAW 并构建外观表。GPU 阶段分为 RAW 链和渲染链两条 command buffer 提交；GeoCorr 与 SSCS、Marble 与 Effect/ToneCurve/ShadeCorrection 分别在同一个 kernel 内完成。压缩 RAW 在后台线程解码，GPU 同时处理已经解出的行（`SONYLOOK_RAW_STREAM=0` 改为先解码完再开始）。设置 `SONYLOOK_METAL_BATCH=0` 可恢复逐阶段提交。四种路径的整图输出哈希完全一致。新进程中的首次解码还会包含初始化、表构建和 Metal 着色器编译，因此耗时更高。以上数据基于一张合成 ARW，不代表所有相机型号或显影设置下的通用性能。
 

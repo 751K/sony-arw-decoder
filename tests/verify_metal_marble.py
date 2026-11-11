@@ -192,6 +192,24 @@ def check_chroma(blk4, blk8, path):
                          metal_look.marble(r, g, b, look, dev, dec, mode=mode, inset=False))
                     n += 1
     print(f'chroma path: {n} cases (B 4/8, Clarity 0/10/60, d224, dec, mode, H % 4) identical to NumPy')
+    # Widths that are not a multiple of 4 (the NumPy chroma path only takes
+    # those): the fused marble_in_half must equal marble_in + marble_halfc,
+    # including halfc's last-column and repeated-last-row rules.
+    import os
+    m = 0
+    for name, look in (('B=4', blk4), ('B=8', blk8)):
+        for w in (161, 162, 163, 165):
+            for h in (200, 203):
+                r, g, b = image(h, w, 3000 + m)
+                dev = dict(d218=1, d224=40, d2c0=10)
+                outs = []
+                for separate in ('1', '0'):
+                    os.environ['SONYLOOK_MARBLE_HALFC'] = separate
+                    outs.append(metal_look.marble(r, g, b, look, dev, base, mode=0, inset=False))
+                os.environ.pop('SONYLOOK_MARBLE_HALFC')
+                same(f'chroma {name} w={w} h={h} fused vs separate', outs[0], outs[1])
+                m += 1
+    print(f'chroma path: {m} odd/unaligned widths, fused Y/Cb/Cr + half chroma identical to separate kernels')
     rl = sony_render.load_looks(path)
     for rust in (False, True):
         look = sony_render.Look('Standard', rl, use_rust=rust)

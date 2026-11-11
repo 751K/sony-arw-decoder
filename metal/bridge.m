@@ -17,11 +17,63 @@ static id<MTLSharedEvent> raw_event,crop_event;
 static uint64_t raw_stream_base;
 static uint64_t grid_event_value;
 static uint64_t pending_grid_value;
-#define NPIPE 54
+#define NPIPE 57
 static id<MTLComputePipelineState> pipelines[NPIPE];
 static char error_text[2048];
 const char *sonylook_metal_error(void) { return error_text; }
 static int fail(NSString *s) { snprintf(error_text,sizeof(error_text),"%s",s.UTF8String); return -1; }
+// ---------------------------------------------------------------------------
+// GPU profiling (SONYLOOK_GPU_PROFILE=1): every encoder records GPU timestamps
+// at its start and end; sonylook_metal_profile_report() sums them per kernel
+// (label = pipeline index; 100/101 = a whole ITP tile encoder). Only valid
+// once the profiled work has completed. Off by default: no sampling at all.
+#define PROF_CAP 4096          // the sample buffer holds at most 32 KB
+static int prof_on=-1;static id<MTLCounterSampleBuffer> prof_sb;static uint32_t prof_n;static int prof_label[PROF_CAP/2];
+static double prof_ticks[128];static uint64_t prof_calls[128];static MTLTimestamp prof_c0,prof_g0;static NSArray *pipeline_names;
+static int prof_init(void){
+    if(prof_on>=0)return prof_on;
+    prof_on=0;
+    if(!getenv("SONYLOOK_GPU_PROFILE")||![device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary])return 0;
+    id<MTLCounterSet> ts=nil;for(id<MTLCounterSet> c in device.counterSets)if([c.name isEqualToString:MTLCommonCounterSetTimestamp])ts=c;
+    if(!ts)return 0;
+    MTLCounterSampleBufferDescriptor *d=[MTLCounterSampleBufferDescriptor new];d.counterSet=ts;d.sampleCount=PROF_CAP;d.storageMode=MTLStorageModeShared;
+    prof_sb=[device newCounterSampleBufferWithDescriptor:d error:nil];if(!prof_sb)return 0;
+    [device sampleTimestamps:&prof_c0 gpuTimestamp:&prof_g0];
+    prof_on=1;return 1;
+}
+static id<MTLComputeCommandEncoder> new_encoder(id<MTLCommandBuffer> cmd,int label){
+    if(!prof_init()||prof_n+2>PROF_CAP)return [cmd computeCommandEncoder];
+    MTLComputePassDescriptor *d=[MTLComputePassDescriptor computePassDescriptor];
+    d.sampleBufferAttachments[0].sampleBuffer=prof_sb;
+    d.sampleBufferAttachments[0].startOfEncoderSampleIndex=prof_n;d.sampleBufferAttachments[0].endOfEncoderSampleIndex=prof_n+1;
+    prof_label[prof_n/2]=label;prof_n+=2;
+    return [cmd computeCommandEncoderWithDescriptor:d];
+}
+// Fold completed samples into the per-kernel totals (call after the GPU work finished).
+void sonylook_metal_profile_collect(void){
+    if(prof_on!=1||!prof_n)return;
+    NSData *r=[prof_sb resolveCounterRange:NSMakeRange(0,prof_n)];
+    const MTLCounterResultTimestamp *t=(const MTLCounterResultTimestamp *)r.bytes;
+    for(uint32_t k=0;k+1<prof_n;k+=2){int l=prof_label[k/2];if(l<0||l>=128)continue;
+        if(t[k].timestamp==MTLCounterErrorValue||t[k+1].timestamp==MTLCounterErrorValue||t[k+1].timestamp<t[k].timestamp)continue;
+        prof_ticks[l]+=(double)(t[k+1].timestamp-t[k].timestamp);prof_calls[l]++;}
+    prof_n=0;
+}
+// Print per-kernel GPU milliseconds divided by `runs`, then reset.
+void sonylook_metal_profile_report(uint32_t runs){
+    sonylook_metal_profile_collect();
+    if(prof_on!=1){fprintf(stderr,"GPU profiling unavailable (set SONYLOOK_GPU_PROFILE=1)\n");return;}
+    MTLTimestamp c1,g1;[device sampleTimestamps:&c1 gpuTimestamp:&g1];
+    // sampleTimestamps' CPU value is in nanoseconds; GPU ticks are scaled to it.
+    double ns_per_tick=g1>prof_g0?(double)(c1-prof_c0)/(double)(g1-prof_g0):1.0;
+    double total=0;for(int l=0;l<128;l++)total+=prof_ticks[l];
+    fprintf(stderr,"GPU time per run (%u runs), total %.2f ms\n",runs,total*ns_per_tick/1e6/(runs?runs:1));
+    for(int l=0;l<128;l++)if(prof_calls[l]){
+        NSString *n=l==100?@"itp tile (9 kernels)":l==101?@"itp tile (3 passes)":(l<(int)pipeline_names.count?pipeline_names[l]:@"?");
+        fprintf(stderr,"  %-24s %8.2f ms  %6llu encoders\n",n.UTF8String,prof_ticks[l]*ns_per_tick/1e6/(runs?runs:1),(unsigned long long)(prof_calls[l]/(runs?runs:1)));
+        prof_ticks[l]=0;prof_calls[l]=0;}
+}
+
 static void encode_grid(id<MTLCommandBuffer> cmd,int kernel,NSArray *buffers,const void *args,size_t len,uint32_t w,uint32_t h);
 static void encode_band(id<MTLCommandBuffer> cmd,int kernel,NSArray *buffers,const void *args,size_t len,uint32_t w,uint32_t row0,uint32_t rows);
 // The ITP input streamed from a larger sensor raw that is still being decoded:
@@ -217,8 +269,9 @@ int sonylook_metal_init(const char *path) { @autoreleasepool {
         }
         library=[d newLibraryWithSource:source options:opts error:&err]; if(!library) return fail(err.description);
     }
-    NSArray *names=@[@"scale_raw",@"differences",@"candidates",@"weights",@"green_inputs",@"green_five",@"average_pairs",@"direction_errors",@"direction",@"green_finish",@"chroma_inputs",@"chroma_finish",@"load_tile",@"store_tile",@"dro_subcells",@"dro_histogram",@"dro_smooth",@"dro_weights",@"dro_apply",@"geo_apply",@"sscs_apply",@"look_lm_gamma",@"look_front",@"encoded_front",@"sharp_hblur",@"sharp_apply",@"spica_ycc",@"marble_in",@"marble_blocks",@"marble_sigma",@"marble_binom",@"marble_out",@"post_apply",@"nr_split",@"nr_filter",@"marble_halfc",@"marble_cblocks",@"marble_csigma",@"marble_cup",@"dro_math_test",@"interleave3",@"geo_sscs_apply",@"candidates_both",@"green_inputs_five",@"green_finish_fused",@"dro_smooth_weights",@"marble_out_post",@"load_scale_tile",@"weights_candidates",@"marble_out_packed",@"dro_fix_args",@"dro_apply_fix",@"dro_apply_exact",@"raw_crop_rows"];
+    NSArray *names=@[@"scale_raw",@"differences",@"candidates",@"weights",@"green_inputs",@"green_five",@"average_pairs",@"direction_errors",@"direction",@"green_finish",@"chroma_inputs",@"chroma_finish",@"load_tile",@"store_tile",@"dro_subcells",@"dro_histogram",@"dro_smooth",@"dro_weights",@"dro_apply",@"geo_apply",@"sscs_apply",@"look_lm_gamma",@"look_front",@"encoded_front",@"sharp_hblur",@"sharp_apply",@"spica_ycc",@"marble_in",@"marble_blocks",@"marble_sigma",@"marble_binom",@"marble_out",@"post_apply",@"nr_split",@"nr_filter",@"marble_halfc",@"marble_cblocks",@"marble_csigma",@"marble_cup",@"dro_math_test",@"interleave3",@"geo_sscs_apply",@"candidates_both",@"green_inputs_five",@"green_finish_fused",@"dro_smooth_weights",@"marble_out_post",@"load_scale_tile",@"weights_candidates",@"marble_out_packed",@"dro_fix_args",@"dro_apply_fix",@"dro_apply_exact",@"raw_crop_rows",@"itp_edges",@"itp_final",@"marble_in_half"];
     if(names.count!=NPIPE) return fail(@"Metal kernel table size mismatch");
+    pipeline_names=names;
     id<MTLComputePipelineState> ps[NPIPE];
     for(int i=0;i<NPIPE;i++) { id<MTLFunction> f=[library newFunctionWithName:names[i]]; if(!f) return fail(@"Missing Metal function"); ps[i]=[d newComputePipelineStateWithFunction:f error:&err]; if(!ps[i]) return fail(err.description); }
     queue=[d newCommandQueue]; if(!queue) return fail(@"Cannot create Metal command queue");
@@ -229,7 +282,7 @@ int sonylook_metal_init(const char *path) { @autoreleasepool {
     for(int i=0;i<NPIPE;i++) pipelines[i]=ps[i]; device=d; return 0;
 }}
 static void dispatch(id<MTLCommandBuffer> cmd,int kernel,NSArray *buffers,Args *args) {
-    id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder]; [e setComputePipelineState:pipelines[kernel]];
+    id<MTLComputeCommandEncoder> e=new_encoder(cmd,kernel); [e setComputePipelineState:pipelines[kernel]];
     for(NSUInteger i=0;i<buffers.count;i++) bind(e,buffers[i],i);
     [e setBytes:args length:sizeof(*args) atIndex:buffers.count];
     [e dispatchThreads:MTLSizeMake(args->width,args->height,1) threadsPerThreadgroup:MTLSizeMake(16,16,1)]; [e endEncoding];
@@ -275,7 +328,7 @@ static void itp_dispatch_encoder(id<MTLComputeCommandEncoder> e,int kernel,NSArr
     [e dispatchThreads:MTLSizeMake(a->width,a->height,1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];
 }
 static void encode_tile_scaled(id<MTLCommandBuffer> cmd, id source, NSArray *v, Args *a) {
-    id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];
+    id<MTLComputeCommandEncoder> e=new_encoder(cmd,100);
     if(source){itp_dispatch_encoder(e,47,@[source,v[0]],a);[e memoryBarrierWithScope:MTLBarrierScopeBuffers];}
     itp_dispatch_encoder(e,1,@[v[0],v[1],v[2]],a);[e memoryBarrierWithScope:MTLBarrierScopeBuffers];
     itp_dispatch_encoder(e,48,@[v[1],v[2],v[5],v[6]],a);[e memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -285,6 +338,19 @@ static void encode_tile_scaled(id<MTLCommandBuffer> cmd, id source, NSArray *v, 
     itp_dispatch_encoder(e,44,@[v[8],v[9],v[10],v[11],v[5],v[6],v[12],v[15],v[16]],a);[e memoryBarrierWithScope:MTLBarrierScopeBuffers];
     itp_dispatch_encoder(e,10,@[v[0],v[17],v[18],v[19],v[20]],a);[e memoryBarrierWithScope:MTLBarrierScopeBuffers];
     itp_dispatch_encoder(e,11,@[v[17],v[18],v[19],v[20],v[5],v[16],v[22],v[23],v[24]],a);
+    [e endEncoding];
+}
+// Default ITP: three passes per tile (see itp_final in itp.metal); the last
+// writes the tile's RGB straight into the image planes.
+static void encode_tile_three(id<MTLCommandBuffer> cmd,id source,NSArray *v,Args *a,id R,id G,id B) {
+    id<MTLComputeCommandEncoder> e=new_encoder(cmd,101);
+    itp_dispatch_encoder(e,47,@[source,v[0]],a);[e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    itp_dispatch_encoder(e,54,@[v[0],v[1],v[2],v[13],v[14],v[3],v[4]],a);[e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    NSArray *fin=@[v[0],v[1],v[2],v[13],v[14],v[3],v[4],R,G,B];
+    [e setComputePipelineState:pipelines[55]];
+    for(NSUInteger i=0;i<fin.count;i++)bind(e,fin[i],i);
+    [e setBytes:a length:sizeof(*a) atIndex:fin.count];
+    [e dispatchThreads:MTLSizeMake(a->tile_width,a->tile_height,1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];
     [e endEncoding];
 }
 int sonylook_metal_itp_tile(const uint16_t *raw, uint32_t w, uint32_t h, const int32_t *black, const float *gains, int32_t scale, const float *params, uint16_t *r, uint16_t *g, uint16_t *b) { @autoreleasepool {
@@ -334,7 +400,9 @@ int sonylook_metal_itp_image(const uint16_t *raw, uint32_t w, uint32_t h, const 
     Args a={.image_width=w,.image_height=h,.halo=halo,.scale=scale};memcpy(a.black,black,sizeof(a.black));memcpy(a.gains,gains,sizeof(a.gains));
     a.blend_k=params[0];a.blend_lo=params[1];a.blend_hi=params[2];a.blend_half=params[3];a.k1=params[4];a.k2=params[5];a.k3=params[6];a.k4=params[7];a.k5=params[8];a.k6=params[9];
     id<MTLCommandBuffer> cmd=command_buffer();
-    int fused_itp=getenv("SONYLOOK_ITP_FUSED")==NULL||strcmp(getenv("SONYLOOK_ITP_FUSED"),"0")!=0;
+    // SONYLOOK_ITP_FUSED: unset/2 = three passes, 1 = the nine-kernel encoder, 0 = separate kernels.
+    const char *fused_env=getenv("SONYLOOK_ITP_FUSED");
+    int itp_mode=fused_env?atoi(fused_env):2;
     // Row frontiers: before each row of tiles, make sure its input rows exist.
     // ITP reads rows [y - halo, y + tile + halo) (mirrored inside the image);
     // nr_filter row r reads base/hp rows r +- 8, nr_split row r raw rows r +- 2.
@@ -359,9 +427,13 @@ int sonylook_metal_itp_image(const uint16_t *raw, uint32_t w, uint32_t h, const 
         a.tile_x=x;a.tile_y=y;a.tile_width=MIN(tile,w-x);a.tile_height=MIN(tile,h-y);
         a.width=a.tile_width+2*halo;a.height=a.tile_height+2*halo;
         id<MTLCommandBuffer> tile_cmd=cmd;
+        if(itp_mode==2) {
+            encode_tile_three(tile_cmd,nr_args?nr_image:image,v,&a,red,green,blue);
+            continue;
+        }
         if(nr_args) {
             encode_tile_scaled(tile_cmd,nr_image,v,&a);
-        } else if(fused_itp) {
+        } else if(itp_mode) {
             encode_tile_scaled(tile_cmd,image,v,&a);
         } else {
             dispatch(tile_cmd,12,@[image,input],&a);
@@ -384,7 +456,7 @@ typedef struct {
     uint32_t src_stride,src_x,src_y;
 } DroArgs;
 static void dispatch_dro(id<MTLCommandBuffer> cmd,int kernel,NSArray *buffers,DroArgs *args, uint32_t w,uint32_t h) {
-    id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];[e setComputePipelineState:pipelines[kernel]];
+    id<MTLComputeCommandEncoder> e=new_encoder(cmd,kernel);[e setComputePipelineState:pipelines[kernel]];
     for(NSUInteger i=0;i<buffers.count;i++)bind(e,buffers[i],i);
     [e setBytes:args length:sizeof(*args) atIndex:buffers.count];
     [e dispatchThreads:MTLSizeMake(w,h,1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];[e endEncoding];
@@ -404,7 +476,7 @@ static int encode_dro_apply(id<MTLCommandBuffer> cmd,NSArray *io,DroArgs *a,uint
     dispatch_dro(cmd,18,all,a,w,h);
     dispatch_dro(cmd,50,@[count,ind],a,1,1);
     for(int pass=0;pass<2;pass++){
-        id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];[e setComputePipelineState:pipelines[pass?52:51]];
+        id<MTLComputeCommandEncoder> e=new_encoder(cmd,(pass?52:51));[e setComputePipelineState:pipelines[pass?52:51]];
         for(NSUInteger i=0;i<all.count;i++)bind(e,all[i],i);
         [e setBytes:a length:sizeof(*a) atIndex:all.count];
         [e dispatchThreadgroupsWithIndirectBuffer:ind indirectBufferOffset:pass?12:0
@@ -541,7 +613,7 @@ int sonylook_metal_geo(const uint16_t *r,const uint16_t *g,const uint16_t *b,uin
     id<MTLBuffer> bt=in_buf(tb,n*4);
     id R=out_buf(ro,outcount*2),G=out_buf(go,outcount*2),B=out_buf(bo,outcount*2);
     if(!rb||!gb||!bb||!rt||!gt||!bt||!R||!G||!B)return fail(@"Metal GeoCorr buffer allocation failed");
-    id<MTLCommandBuffer> cmd=command_buffer();id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];
+    id<MTLCommandBuffer> cmd=command_buffer();id<MTLComputeCommandEncoder> e=new_encoder(cmd,19);
     [e setComputePipelineState:pipelines[19]];NSArray *buffers=@[rb,gb,bb,rt,gt,bt,R,G,B];
     for(NSUInteger i=0;i<buffers.count;i++)bind(e,buffers[i],i);
     [e setBytes:&a length:sizeof(a) atIndex:buffers.count];
@@ -560,7 +632,7 @@ int sonylook_metal_sscs(const uint16_t *r,const uint16_t *g,const uint16_t *b,ui
     id<MTLBuffer> bb=in_buf(b,n*2);
     id result=out_buf(out,n*6);
     if(!rb||!gb||!bb||!result)return fail(@"Metal SSCS buffer allocation failed");
-    id<MTLCommandBuffer> cmd=command_buffer();id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];
+    id<MTLCommandBuffer> cmd=command_buffer();id<MTLComputeCommandEncoder> e=new_encoder(cmd,20);
     [e setComputePipelineState:pipelines[20]];NSArray *buffers=@[rb,gb,bb,result];
     for(NSUInteger i=0;i<buffers.count;i++)bind(e,buffers[i],i);
     [e setBytes:&a length:sizeof(a) atIndex:buffers.count];
@@ -591,7 +663,7 @@ int sonylook_metal_geo_sscs(const uint16_t *r,const uint16_t *g,const uint16_t *
     id<MTLBuffer> bt=in_buf(tb,n*4);
     id result=out_buf(out,outcount*6);
     if(!rb||!gb||!bb||!rt||!gt||!bt||!result)return fail(@"Metal GeoCorr+SSCS buffer allocation failed");
-    id<MTLCommandBuffer> cmd=command_buffer();id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];
+    id<MTLCommandBuffer> cmd=command_buffer();id<MTLComputeCommandEncoder> e=new_encoder(cmd,41);
     [e setComputePipelineState:pipelines[41]];NSArray *buffers=@[rb,gb,bb,rt,gt,bt,result];
     for(NSUInteger i=0;i<buffers.count;i++)bind(e,buffers[i],i);
     [e setBytes:&a length:sizeof(a) atIndex:buffers.count];
@@ -610,7 +682,7 @@ int sonylook_metal_look(const uint16_t *rgb,uint32_t w,uint32_t h,const float *t
     id<MTLBuffer> ab=in_buf(atan,512*4);
     id result=out_buf(out,n*6);
     if(!rgbb||!tab||!gb||!ab||!result)return fail(@"Metal Look buffer allocation failed");
-    id<MTLCommandBuffer> cmd=own_command_buffer();if(!cmd)return -1;id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];
+    id<MTLCommandBuffer> cmd=own_command_buffer();if(!cmd)return -1;id<MTLComputeCommandEncoder> e=new_encoder(cmd,21);
     [e setComputePipelineState:pipelines[21]];NSArray *buffers=@[rgbb,tab,gb,ab,result];
     for(NSUInteger i=0;i<buffers.count;i++)bind(e,buffers[i],i);
     [e setBytes:&a length:sizeof(a) atIndex:buffers.count];[e dispatchThreads:MTLSizeMake(w,h,1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];[e endEncoding];
@@ -623,7 +695,7 @@ static int run_front(int kernel,NSArray *inputs,uint32_t w,uint32_t h,const Fron
     id yb=out_buf(y,n*2),crb=out_buf(cr,n*2),cbb=out_buf(cb,n*2);
     if(!yb||!crb||!cbb)return fail(@"Metal front buffer allocation failed");
     NSArray *buffers=[inputs arrayByAddingObjectsFromArray:@[yb,crb,cbb]];
-    id<MTLCommandBuffer> cmd=own_command_buffer();if(!cmd)return -1;id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];
+    id<MTLCommandBuffer> cmd=own_command_buffer();if(!cmd)return -1;id<MTLComputeCommandEncoder> e=new_encoder(cmd,22);
     [e setComputePipelineState:pipelines[kernel]];
     for(NSUInteger i=0;i<buffers.count;i++)bind(e,buffers[i],i);
     [e setBytes:&a length:sizeof(a) atIndex:buffers.count];[e dispatchThreads:MTLSizeMake(w,h,1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];[e endEncoding];
@@ -651,7 +723,7 @@ int sonylook_metal_encoded_front(const int16_t *enc,uint32_t w,uint32_t h,const 
 
 typedef struct { uint32_t width,height; float sharp_thr,sharp_s0,sharp_s1,sharp_s9,sharp_k; float yg_s0,yg_s1,yg_s2,yg_s3; uint32_t spica_thr; int32_t spica_full,spica_gain_on; float spica_s,spica_k; float s[25]; } SpatialArgs;
 static void encode_grid(id<MTLCommandBuffer> cmd,int kernel,NSArray *buffers,const void *args,size_t len,uint32_t w,uint32_t h) {
-    id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];[e setComputePipelineState:pipelines[kernel]];
+    id<MTLComputeCommandEncoder> e=new_encoder(cmd,kernel);[e setComputePipelineState:pipelines[kernel]];
     for(NSUInteger i=0;i<buffers.count;i++)bind(e,buffers[i],i);
     [e setBytes:args length:len atIndex:buffers.count];[e dispatchThreads:MTLSizeMake(w,h,1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];[e endEncoding];
 }
@@ -660,7 +732,7 @@ static void encode_grid(id<MTLCommandBuffer> cmd,int kernel,NSArray *buffers,con
 static void encode_band(id<MTLCommandBuffer> cmd,int kernel,NSArray *buffers,const void *args,size_t len,uint32_t w,uint32_t row0,uint32_t rows) {
     if(!rows)return;
     uint32_t band[2]={row0,rows};
-    id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];[e setComputePipelineState:pipelines[kernel]];
+    id<MTLComputeCommandEncoder> e=new_encoder(cmd,kernel);[e setComputePipelineState:pipelines[kernel]];
     for(NSUInteger i=0;i<buffers.count;i++)bind(e,buffers[i],i);
     [e setBytes:args length:len atIndex:buffers.count];[e setBytes:band length:sizeof(band) atIndex:buffers.count+1];
     [e dispatchThreads:MTLSizeMake(w,rows,1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];[e endEncoding];
@@ -760,8 +832,10 @@ int sonylook_metal_marble(const uint16_t *r,const uint16_t *g,const uint16_t *b,
         if(!mab||!lb||!fb||!fib||!cb)return fail(@"Metal fused Post buffer allocation failed");
     }
     id<MTLCommandBuffer> cmd=command_buffer();
-    encode_grid(cmd,27,[@[rb,gb,bb,t[0],t[1]] arrayByAddingObjectsFromArray:ycc],&a,sizeof(a),w,h);
-    encode_grid(cmd,35,@[ycc[1],ycc[2],half[0],half[1]],&a,sizeof(a),a.w4/2,a.h4);
+    if(getenv("SONYLOOK_MARBLE_HALFC")&&strcmp(getenv("SONYLOOK_MARBLE_HALFC"),"0")!=0){   // separate passes, for comparison
+        encode_grid(cmd,27,[@[rb,gb,bb,t[0],t[1]] arrayByAddingObjectsFromArray:ycc],&a,sizeof(a),w,h);
+        encode_grid(cmd,35,@[ycc[1],ycc[2],half[0],half[1]],&a,sizeof(a),a.w4/2,a.h4);
+    } else encode_grid(cmd,56,[[@[rb,gb,bb,t[0],t[1]] arrayByAddingObjectsFromArray:ycc] arrayByAddingObjectsFromArray:half],&a,sizeof(a),a.w4/2,a.h4);
     if(a.lum_on) {
         encode_grid(cmd,28,@[ycc[0],m],&a,sizeof(a),a.n8w,a.n8h);
         encode_grid(cmd,29,@[m,q],&a,sizeof(a),a.n8w+4,a.n8h+4);
@@ -791,7 +865,7 @@ int sonylook_metal_marble(const uint16_t *r,const uint16_t *g,const uint16_t *b,
                           arrayByAddingObjectsFromArray:outs];
         buffers=[buffers arrayByAddingObjectsFromArray:@[fb,cb,fib]];
         uint32_t layout[2]={packed?1u:0u,shift};
-        id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];[e setComputePipelineState:pipelines[46]];
+        id<MTLComputeCommandEncoder> e=new_encoder(cmd,46);[e setComputePipelineState:pipelines[46]];
         for(NSUInteger i=0;i<buffers.count;i++)bind(e,buffers[i],i);
         [e setBytes:&pa length:sizeof(pa) atIndex:buffers.count];
         [e setBytes:layout length:sizeof(layout) atIndex:buffers.count+1];
@@ -869,7 +943,7 @@ int sonylook_metal_dro_math(const float *a,const float *b,uint32_t n,float *e2,f
     if(!device||!a||!b||!e2||!q||!n)return fail(@"Invalid Metal DRO math arguments");
     id ab=in_buf(a,(size_t)n*4),bb=in_buf(b,(size_t)n*4),eb=out_buf(e2,(size_t)n*4),qb=out_buf(q,(size_t)n*4);
     if(!ab||!bb||!eb||!qb)return fail(@"Metal DRO math buffer allocation failed");
-    id<MTLCommandBuffer> cmd=own_command_buffer();if(!cmd)return -1;id<MTLComputeCommandEncoder> e=[cmd computeCommandEncoder];
+    id<MTLCommandBuffer> cmd=own_command_buffer();if(!cmd)return -1;id<MTLComputeCommandEncoder> e=new_encoder(cmd,39);
     [e setComputePipelineState:pipelines[39]];NSArray *bufs=@[ab,bb,eb,qb];
     for(NSUInteger i=0;i<bufs.count;i++)bind(e,bufs[i],i);
     [e setBytes:&n length:4 atIndex:4];[e dispatchThreads:MTLSizeMake(n,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];[e endEncoding];

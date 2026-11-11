@@ -20,7 +20,30 @@ inline ushort marble_conv(device const ushort *r,device const ushort *g,device c
     long o=(long(m[3*row])*s0+long(m[3*row+1])*s1+long(m[3*row+2])*s2)>>13;
     return ushort(enc[clamp(o,0L,0x3fffL)]);
 }
-// Initial colour conversion and RGB -> YCbCr.
+// Initial colour conversion and RGB -> YCbCr for one pixel.
+inline void marble_ycc(device const ushort *r,device const ushort *g,device const ushort *b,uint i,device const short *dec,device const short *enc,constant MarbleArgs &a,thread ushort &yv,thread ushort &cbv,thread ushort &crv) {
+    long rr=marble_conv(r,g,b,i,dec,a.m_fwd,enc,0),gg=marble_conv(r,g,b,i,dec,a.m_fwd,enc,1),bb=marble_conv(r,g,b,i,dec,a.m_fwd,enc,2);
+    yv=ushort(min((rr*0xb44+gg*0xdc3+bb*0x271)>>11,0xefffL)+0x1000);
+    cbv=ushort(clamp(wrap32(rr*-0x6ab+gg*-0x964+bb*0x1011)>>11,-0x8000,0x7fff)+0x8000);
+    crv=ushort(clamp(wrap32(rr*0x1acc+gg*-0x1ac0+bb*-9)>>11,-0x8000,0x7fff)+0x8000);
+}
+// marble_in and marble_halfc in one pass: one thread per half-width column
+// (w4/2 x h4) converts its pixel pair, stores Y/Cb/Cr for real pixels and the
+// pair's half-width chroma. halfc's edge rules (last column past the pairs,
+// last row below the image) are met by converting that pixel again here, so
+// no thread reads another thread's output.
+kernel void marble_in_half(device const ushort *r [[buffer(0)]],device const ushort *g [[buffer(1)]],device const ushort *b [[buffer(2)]],device const short *dec [[buffer(3)]],device const short *enc [[buffer(4)]],device ushort *yo [[buffer(5)]],device ushort *cbo [[buffer(6)]],device ushort *cro [[buffer(7)]],device ushort *hcb [[buffer(8)]],device ushort *hcr [[buffer(9)]],constant MarbleArgs &a [[buffer(10)]],uint2 p [[thread_position_in_grid]]) {
+    uint half4=a.w4/2;if(p.x>=half4||p.y>=a.h4)return;
+    int w=int(a.width),h=int(a.height),x=int(p.x);bool real=int(p.y)<h;
+    uint row=uint(min(int(p.y),h-1)*w),o=p.y*half4+p.x;
+    ushort y0=0,cb0=0,cr0=0,y1=0,cb1=0,cr1=0;
+    bool has0=2*x<w,has1=2*x+1<w;
+    if(has0){marble_ycc(r,g,b,row+uint(2*x),dec,enc,a,y0,cb0,cr0);if(real){yo[row+uint(2*x)]=y0;cbo[row+uint(2*x)]=cb0;cro[row+uint(2*x)]=cr0;}}
+    if(has1){marble_ycc(r,g,b,row+uint(2*x+1),dec,enc,a,y1,cb1,cr1);if(real){yo[row+uint(2*x+1)]=y1;cbo[row+uint(2*x+1)]=cb1;cro[row+uint(2*x+1)]=cr1;}}
+    if(x<w/2){hcb[o]=ushort((int(cb0)+int(cb1))>>1);hcr[o]=ushort((int(cr0)+int(cr1))>>1);}
+    else if(2*x==w-1){hcb[o]=cb0;hcr[o]=cr0;}
+    else {ushort yl,cbl,crl;marble_ycc(r,g,b,row+uint(w-1),dec,enc,a,yl,cbl,crl);hcb[o]=cbl;hcr[o]=crl;}
+}
 kernel void marble_in(device const ushort *r [[buffer(0)]],device const ushort *g [[buffer(1)]],device const ushort *b [[buffer(2)]],device const short *dec [[buffer(3)]],device const short *enc [[buffer(4)]],device ushort *yo [[buffer(5)]],device ushort *cbo [[buffer(6)]],device ushort *cro [[buffer(7)]],constant MarbleArgs &a [[buffer(8)]],uint2 p [[thread_position_in_grid]]) {
     if(p.x>=a.width||p.y>=a.height)return;
     uint i=p.y*a.width+p.x;
