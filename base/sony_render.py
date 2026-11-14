@@ -262,6 +262,10 @@ class Look:
             "maingamma", (tuple(xs), tuple(ys), 128, second), build_main_gamma,
             (0x10000,), np.int16)
         arrays = {t: ints(g[t]) for t in ("0x7842", "0x7843", "0x7844", "0x7845", "0x7846")}
+        camera_sepia = (LOOK_IDS.get(name, 0) == EF.LOOK_SEPIA
+                        and EF.CAMERA_SEPIA.get(int(MAIN.get("SonyModelID", 0))))
+        if camera_sepia:   # the camera's Sepia keeps the BW luma (sony_effect.py)
+            arrays.update({t: [0] * len(arrays[t]) for t in EF.SEPIA_DROPPED})
         arrays.update({t: ints(MAIN[t]) for t in ("0x7841", "0x7847", "0x7848")})
         arrays["0x7848"] = weights
         self.ycc_params = SY.select_params(arrays, 1)
@@ -306,9 +310,12 @@ class Look:
         self.cs = self.chroma_params(self.exposure)
         # AreaComp: inserted for ARW format code 0x3600 (0xb000 = ARW 6.0); 0x7770 look id
         self.area_comp = SS.area_comp_params(0x3600, True, LOOK_IDS.get(name, 0))
-        # Effect (BW / Sepia, sony_effect.py): Sepia tint from 0x74c5 unless SonyModelID is an old body
+        # Effect (BW / Sepia, sony_effect.py): Sepia tint from 0x74c5 unless SonyModelID is an old body,
+        # or the measured camera tint for the bodies in EF.CAMERA_SEPIA
         self.look_id = LOOK_IDS.get(name, 0)
         self.tint = EF.tint(int(MAIN["SonyModelID"]), ints(MAIN["0x74c5"])) if self.look_id == EF.LOOK_SEPIA else None
+        if camera_sepia:
+            self.tint = tuple(np.float32(v) for v in camera_sepia)
 
     def chroma_params(self, render_exposure):
         r18ee = int(np.exp2(render_exposure * 0.0033333333333333335) * 64.0)

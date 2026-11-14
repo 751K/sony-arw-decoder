@@ -17,6 +17,12 @@ FUN_1000a31c8; the look IFDs do not carry it), unless SonyModelID (MakerNote 0xb
 look+0x2c) is < 3 or one of 0x100, 0x102..0x105, which use the built-in (-1152, 832).
 A7M5: SonyModelID 407, 0x74c5 = -15 14 -> tB = -960, tR = +896.
 
+The camera's own Sepia differs from Edit (measured on the α7 V, ColorChecker under 2600/4200/6500K,
+against the camera HEIF): it leaves out the Sepia look IFD's RGB2YCC offset tables (0x7842, 0x7844,
+0x7845; zero in the BW IFD), so the luma is the BW one, and its tint is (tR, tB) = (848, -1088)
+instead of the 0x74c5 value.  CAMERA_SEPIA lists the bodies with measured values; sony_render.py
+applies both for them.  Mean ΔE2000 over 50 patches: 3.1-3.4 with Edit's Sepia, 0.47-0.52 with this.
+
 The four 1D tables come from FUN_1000db9f4 (libm powf, as in the binary).
 """
 import ctypes
@@ -32,6 +38,8 @@ _libm.powf.restype = ctypes.c_float
 
 f32 = np.float32
 LOOK_BW, LOOK_SEPIA = 0x10, 0x11
+CAMERA_SEPIA = {407: (848.0, -1088.0)}          # SonyModelID: camera tint (tR, tB), measured
+SEPIA_DROPPED = ("0x7842", "0x7844", "0x7845")  # Sepia IFD tables the camera does not apply
 
 # 3x3 matrices (Q13) of the colour-space helpers, rows = output R, G, B
 M_FWD = {0: ((0x13b2, 0xca2, -0x54), (0x2ec, 0x1abd, 599), (0x73, 0x253, 0x1d39)),      # dd41c
