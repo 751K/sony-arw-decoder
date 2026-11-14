@@ -78,7 +78,28 @@ def load_looks(arw):
     main = AL.main_tags(arw)
     out["_main"] = {t: main[t] for t in MAIN_TAGS}
     out["_main"]["SonyModelID"] = AL.sony_model_id(arw)
+    # The shot look's LinearMatrix16 as the camera used it: blended by 0x7848 like RGB2YCC
+    # (the look IFDs hold the daylight tables only).
+    for t in ("0x7770", "0x780f"):
+        if t in main:
+            out["_main"][t] = main[t]
     return out
+
+
+WARM_780F = HERE / "warm_780f.json"
+_WARM = None
+
+
+def warm_780f(model_id, name):
+    """Warm LinearMatrix16 blob (base64 string) of a look, or None.  The look IFDs only hold the
+    daylight tables; the camera blends the warm and daylight tables with the RGB2YCC weights 0x7848
+    and writes the result for the shot look alone (main IFD 0x780f).  warm_780f.json keeps the main-IFD
+    tables of shots with weights 1024 0 0 0, per SonyModelID."""
+    global _WARM
+    if _WARM is None:
+        import json
+        _WARM = json.loads(WARM_780F.read_text()) if WARM_780F.exists() else {}
+    return _WARM.get(str(model_id), {}).get({"ST": "Standard"}.get(name, name))
 
 
 def front_end_sony(arw, scale=8, lens=True, dro=None, wb_mode=None, temperature=None,
@@ -153,6 +174,14 @@ def _spica_dev(detail):
 
 
 class Look:
+    def _lm16(self, b64):
+        blob = base64.b64decode(b64.removeprefix("base64:"))
+        return TCACHE.load_or_build(
+            "lm16", (blob, self.output_mode, 0, _edit_sha()),
+            lambda: np.array(BT.build_table(D.decode_blob(blob), output_mode=self.output_mode,
+                                            param8=0, correction_matrix=None), np.float32),
+            (1024, 18), np.float32)
+
     def __init__(self, name, looks, fade=None, sscs=None, output_mode=0,
                  contrast=0, highlight=0, shadow=0, hue=0, saturation=0,
                  exposure=0, white_level=0, black_level=0, tone_curves=None, shade=None,
@@ -203,12 +232,18 @@ class Look:
         g = looks[name]
         self.name = name
         MAIN = self.main = looks["_main"]
-        blob = base64.b64decode(g["0x780f"].removeprefix("base64:"))
-        self.table = TCACHE.load_or_build(
-            "lm16", (blob, self.output_mode, 0, _edit_sha()),
-            lambda: np.array(BT.build_table(D.decode_blob(blob), output_mode=self.output_mode,
-                                            param8=0, correction_matrix=None), np.float32),
-            (1024, 18), np.float32)
+        # LinearMatrix16: the look IFD holds the daylight table; the camera blends in the warm table
+        # with the RGB2YCC weight w0 (0x7848) and stores the result for the shot look in the main IFD.
+        weights = ints(MAIN["0x7848"]) if ycc_weights is None else [int(v) for v in ycc_weights]
+        shot = MAIN.get("0x7770")
+        if ycc_weights is None and "0x780f" in MAIN and shot is not None and looks.get(str(shot).strip()) is g:
+            self.table = self._lm16(MAIN["0x780f"])
+        else:
+            self.table = self._lm16(g["0x780f"])
+            warm = warm_780f(MAIN.get("SonyModelID"), name)
+            if warm is not None and weights[0]:
+                self.table = (self.table + np.float32(weights[0] / 1024)
+                              * (self._lm16(warm) - self.table)).astype(np.float32)
         # MainGamma's second stage: Sony always calls 0x10011e174 for this model
         # (look+0x1d0 != 0, model generation >= 2).  At (0,0,0) it is row 18, which
         # produces the same LUT as passing no second stage at all (verified bit-exact).
@@ -228,8 +263,7 @@ class Look:
             (0x10000,), np.int16)
         arrays = {t: ints(g[t]) for t in ("0x7842", "0x7843", "0x7844", "0x7845", "0x7846")}
         arrays.update({t: ints(MAIN[t]) for t in ("0x7841", "0x7847", "0x7848")})
-        if ycc_weights is not None:
-            arrays["0x7848"] = [int(v) for v in ycc_weights]
+        arrays["0x7848"] = weights
         self.ycc_params = SY.select_params(arrays, 1)
         self.luma = ints(g.get("0x7801", "19 38 7"))
         knee, slope = int(g.get("0x780c", 0)), int(g.get("0x780d", 0))
