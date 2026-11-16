@@ -7,6 +7,9 @@ struct DroArgs {
     float log2_max,strength,k_up,k_down,scale;
     uint fix_capacity;                 // dro_apply: size of the deferred-pixel list
     uint src_stride,src_x,src_y;       // dro_subcells: the raw crop inside a larger buffer
+    uint model;                        // grid analysis: 0 Edit, 1 camera (sony_dro.MODELS)
+    float coef_g;                      // camera: G weight of the grid samples
+    float kw[9];                       // camera: range kernel by bin distance
 };
 
 // Correctly rounded float32 division (the reference's numpy float32 '/').
@@ -104,7 +107,7 @@ kernel void dro_subcells(device const ushort *raw [[buffer(0)]], device const fl
         float r=float(max(int(raw[i])-a.black_r,0));
         float g=float(max(((int(raw[i+1])+int(raw[i+s]))>>1)-a.black_g,0));
         float b=float(max(int(raw[i+s+1])-a.black_b,0));
-        float v=fma(b+g,0.057f,r*0.1495f);
+        float v=a.model?fma(0.057f,b,fma(a.coef_g,g,r*0.1495f)):fma(b+g,0.057f,r*0.1495f);
         acc=fma(dro_log(v,logtab),inv,acc);
     }
     sub[p.y*112+p.x]=acc;
@@ -113,7 +116,9 @@ kernel void dro_histogram(device const float *sub [[buffer(0)]],device float *hi
     if(p.x>=8||p.y>=6)return;
     float bins[14]={0};float inc=dro_div(1.0f,196.0f),inv=dro_div(1.0f,a.log2_max);
     for(uint y=0;y<14;y++)for(uint x=0;x<14;x++){
-        float v=sub[(p.y*14+y)*112+p.x*14+x];int b=int(max((v*14.0f)*inv,0.0f));if(b==14)b--;
+        float v=sub[(p.y*14+y)*112+p.x*14+x];int b;
+        if(a.model)b=min(int(max(v,0.0f)),13);                   // camera: one bin per log2 unit
+        else{b=int(max((v*14.0f)*inv,0.0f));if(b==14)b--;}
         bins[clamp(b,0,13)]+=inc;
     }
     for(uint j=0;j<14;j++)hist[(p.y*8+p.x)*14+j]=bins[j];
@@ -139,7 +144,7 @@ kernel void dro_weights(device const float *sm [[buffer(0)]],device float *W [[b
     constexpr float weight[9]={0.8828129768371582f,0.6054689884185791f,0.3242189884185791f,0.1367190033197403f,0.04296899959445f,0.011718999594449997f,0.0039059999398887157f,0.0039059999398887157f,0.0039059999398887157f};
     constexpr float blend[14]={1,.75,.5,.25,0,0,0,0,0,.25,.5,.75,1,1};
     int pos=(p.y*8+p.x)*14;
-    for(int j=0;j<14;j++){float w=0,s=0;for(int k=0;k<14;k++){float hk=sm[pos+k],wt=weight[min(abs(j-k),8)];w=fma(hk,wt,w);s=fma(hk*wt,float(k),s);}S[pos+j]=fma(blend[j],fma(w,float(j),-s),s);W[pos+j]=w;}
+    for(int j=0;j<14;j++){float w=0,s=0;for(int k=0;k<14;k++){float hk=sm[pos+k],wt=a.model?a.kw[min(abs(j-k),8)]:weight[min(abs(j-k),8)];w=fma(hk,wt,w);s=fma(hk*wt,float(k),s);}S[pos+j]=fma(blend[j],fma(w,float(j),-s),s);W[pos+j]=w;}
 }
 // Smooth and weights share only the same 8x6 cell. Keep the intermediate
 // fourteen-bin vector in registers and write W/S directly.
@@ -162,7 +167,7 @@ kernel void dro_smooth_weights(device const float *hist [[buffer(0)]],device flo
     constexpr float weight[9]={0.8828129768371582f,0.6054689884185791f,0.3242189884185791f,0.1367190033197403f,0.04296899959445f,0.011718999594449997f,0.0039059999398887157f,0.0039059999398887157f,0.0039059999398887157f};
     constexpr float blend[14]={1,.75,.5,.25,0,0,0,0,0,.25,.5,.75,1,1};
     int pos=(y*8+x)*14;
-    for(int j=0;j<14;j++){float w=0,s=0;for(int k=0;k<14;k++){float hk=sm[k],wt=weight[min(abs(j-k),8)];w=fma(hk,wt,w);s=fma(hk*wt,float(k),s);}S[pos+j]=fma(blend[j],fma(w,float(j),-s),s);W[pos+j]=w;}
+    for(int j=0;j<14;j++){float w=0,s=0;for(int k=0;k<14;k++){float hk=sm[k],wt=a.model?a.kw[min(abs(j-k),8)]:weight[min(abs(j-k),8)];w=fma(hk,wt,w);s=fma(hk*wt,float(k),s);}S[pos+j]=fma(blend[j],fma(w,float(j),-s),s);W[pos+j]=w;}
 }
 inline int4 dro_axis(int p,int c,int cw,int n){
     int i0=p<c?0:(p<c+(n-1)*cw?(p-c)/max(cw,1):n-1);

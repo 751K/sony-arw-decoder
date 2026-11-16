@@ -88,6 +88,8 @@ export_image = decode("photo.ARW", metal=True, output_bits=16)
 
 `--highlights` (`highlights=` in Python) is `camera` (default) or `edit`. The camera's own JPEG and HEIF skip Edit's near-saturation colour suppression (SSCS) and ChromaSuppress. With them, bright colours whose green channel has clipped turn white: in a chart exposure bracket, +2 EV is 1.93 ΔE2000 from the camera HEIF with them and 0.43 without. `edit` keeps both and reproduces Edit's export bit for bit. Details: docs/pipeline.md §10.3.
 
+`--dro-model` (`dro_model=`) is `camera` (default) or `edit` and only matters when DRO is on. The two share the curve stored in the ARW and the per-pixel operator; they differ in how the local brightness is estimated. `camera` uses the grid fitted to the camera's own HEIFs (luma-weighted samples, bins one stop wide, a wider range kernel): on a colour chart at Lv1–Lv5 the error against the camera HEIF falls from 0.55–1.86 to 0.31–0.79 ΔE2000. `edit` reproduces Edit's grid bit for bit. Both read the whole sensor buffer, as Edit does. Details: docs/pipeline.md §3.3.
+
 ### Many files
 
 ```bash

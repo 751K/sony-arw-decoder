@@ -89,6 +89,8 @@ export_image = decode("photo.ARW", metal=True, output_bits=16)
 
 `--highlights`（Python 中为 `highlights=`）可选 `camera`（默认）或 `edit`。相机直出的 JPEG 和 HEIF 不做 Edit 的近饱和色彩抑制（SSCS）和 ChromaSuppress。若做这两步，G 通道已饱和的亮色会偏白：色卡曝光包围中，+2 EV 与相机 HEIF 的 ΔE2000 为 1.93，不做时为 0.43。`edit` 保留这两步，与 Edit 导出逐位一致。细节见 docs/pipeline.md §10.3。
 
+`--dro-model`（Python 中为 `dro_model=`）可选 `camera`（默认）或 `edit`，只在 DRO 开启时起作用。两者使用同一条 ARW 曲线和同一个逐像素算子，区别在于局部亮度的估计：`camera` 采用按相机 HEIF 拟合的网格（按亮度加权的样本、1 档宽的 bin、更宽的亮度维核），色卡 Lv1–Lv5 与相机 HEIF 的 ΔE2000 由 0.55–1.86 降至 0.31–0.79；`edit` 与 Edit 的网格逐位一致。两者都读取整个传感器缓冲区，与 Edit 相同。细节见 docs/pipeline.md §3.3。
+
 ### 批量处理
 
 ```bash

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare Metal DRO's analysis grid and tone mapping with NumPy (bit-exact)."""
+"""Compare Metal DRO's analysis grid and tone mapping with NumPy (bit-exact), for both grid models."""
 import ctypes
 import sys
 from pathlib import Path
@@ -65,25 +65,26 @@ def main():
     rng = np.random.default_rng(78)
     knots = np.linspace(0, float(sony_dro.LOG2_MAX), 10, dtype=np.float32)
     black = (512, 500, 530)
-    for index, origin in enumerate(((-32, -32), (250, 190), (550, 440))):
+    for model, (index, origin) in ((m, io) for m in sony_dro.MODELS
+                                   for io in enumerate(((-32, -32), (250, 190), (550, 440)))):
         raw = rng.integers(0, 16384, (421, 533), dtype=np.uint16)
         ctrl = (np.linspace(0, float(sony_dro.LOG2_MAX), 28) ** (0.9 + index * 0.1)).astype(np.float32)
-        grid = sony_dro.build_grid(raw, knots, ctrl, black=black)
+        grid = sony_dro.build_grid(raw, knots, ctrl, black=black, model=model)
         planes = [rng.integers(0, 16384, (256, 333), dtype=np.uint16) for _ in range(3)]
         x, y = np.meshgrid(np.arange(origin[0], origin[0] + 333), np.arange(origin[1], origin[1] + 256))
         for st, ku, kd in ((1.0, 1.0, 1.0), (.8, .7, .9), (.5, 1.3, .6)):
             expected = sony_dro.vatr(planes, x, y, grid, strength=np.float32(st),
                                      k_up=np.float32(ku), k_down=np.float32(kd))
             actual, debug = metal_dro.apply(raw, planes, black, grid['curve'], origin=origin,
-                                            strength=st, k_up=ku, k_down=kd, debug=True)
+                                            strength=st, k_up=ku, k_down=kd, debug=True, model=model)
             for name, cpu, gpu in zip(('subcells', 'W', 'S'), (grid['sub'], grid['W'], grid['S']), debug):
                 if not np.array_equal(cpu, gpu):
-                    raise AssertionError(f'{origin} {name}: max difference {np.max(np.abs(cpu-gpu))}')
+                    raise AssertionError(f'{model} {origin} {name}: max difference {np.max(np.abs(cpu-gpu))}')
             for name, cpu, gpu in zip('RGB', expected, actual):
                 difference = np.abs(cpu.astype(np.int32) - gpu.astype(np.int32))
                 if difference.any():
                     raise AssertionError(f'{origin} {st} {ku} {kd} {name}: {np.count_nonzero(difference)} differ, max {difference.max()}')
-        print(f'{origin} strength/k variants: grid and RGB identical')
+        print(f'{model} {origin} strength/k variants: grid and RGB identical')
 
 
 if __name__ == '__main__':

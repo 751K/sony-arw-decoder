@@ -499,7 +499,18 @@ typedef struct {
     float log2_max,strength,k_up,k_down,scale;
     uint32_t fix_capacity;
     uint32_t src_stride,src_x,src_y;
+    uint32_t model;
+    float coef_g;
+    float kw[9];
 } DroArgs;
+// DRO grid model for the following grid calls: 0 Edit, 1 camera (sony_dro.MODELS).
+static uint32_t dro_model=0;static float dro_coef_g=0.0f,dro_kw[9];
+int sonylook_metal_dro_model(uint32_t model,float coef_g,const float *kw) {
+    if(model>1||(model&&!kw))return fail(@"Invalid DRO model");
+    dro_model=model;dro_coef_g=coef_g;
+    for(int i=0;i<9;i++)dro_kw[i]=model?kw[i]:0.0f;
+    return 0;
+}
 static void dispatch_dro(id<MTLCommandBuffer> cmd,int kernel,NSArray *buffers,DroArgs *args, uint32_t w,uint32_t h) {
     id<MTLComputeCommandEncoder> e=new_encoder(cmd,kernel);[e setComputePipelineState:pipelines[kernel]];
     for(NSUInteger i=0;i<buffers.count;i++)bind(e,buffers[i],i);
@@ -539,6 +550,7 @@ static DroArgs make_dro_args(uint32_t raww,uint32_t rawh,uint32_t w,uint32_t h,c
     a.subpx_x=((raww>>2)/112)*4;a.subpx_y=((rawh>>2)/84)*4;a.per_x=a.subpx_x/4;a.per_y=a.subpx_y/4;
     a.org_x=((raww-a.subpx_x*112)>>1)&~1u;a.org_y=((rawh-a.subpx_y*84)>>1)&~1u;
     a.src_stride=raww;a.src_x=0;a.src_y=0;
+    a.model=dro_model;a.coef_g=dro_coef_g;memcpy(a.kw,dro_kw,sizeof(a.kw));
     return a;
 }
 // The grid from a raww x rawh crop at (src_x, src_y) of a GPU-resident

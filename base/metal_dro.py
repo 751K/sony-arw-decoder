@@ -8,6 +8,17 @@ import metal_itp
 import sony_dro
 
 
+def set_model(model):
+    """Grid model for the following grid calls: "edit" (bit-exact) or "camera" (sony_dro.MODELS)."""
+    if model not in sony_dro.MODELS:
+        raise ValueError(f"unknown DRO model {model!r}")
+    lib = metal_itp._load()
+    lib.sonylook_metal_dro_model.argtypes = [ctypes.c_uint32, ctypes.c_float, ctypes.c_void_p]
+    kw = np.ascontiguousarray(sony_dro.CAMERA_W, np.float32)
+    if lib.sonylook_metal_dro_model(int(model == "camera"), float(sony_dro.CAMERA_G), kw.ctypes.data):
+        raise RuntimeError(lib.sonylook_metal_error().decode())
+
+
 def _common(raw, black, curve, origin):
     raw = np.ascontiguousarray(raw, dtype=np.uint16)
     black = np.ascontiguousarray(black, dtype=np.int32)
@@ -22,9 +33,10 @@ def _common(raw, black, curve, origin):
 
 
 def prepare(raw, black, curve, *, origin=(0, 0), strength=1.0,
-            k_up=1.0, k_down=1.0, scale=1.0):
+            k_up=1.0, k_down=1.0, scale=1.0, model="edit"):
     """Start DRO grid analysis on the auxiliary Metal queue and return W/S arrays."""
     raw, black, curve = _common(raw, black, curve, origin)
+    set_model(model)
     weights = metal_itp.empty((6, 8, 14), np.float32)
     sums = metal_itp.empty((6, 8, 14), np.float32)
     lib = metal_itp._load()
@@ -44,7 +56,7 @@ def prepare(raw, black, curve, *, origin=(0, 0), strength=1.0,
 
 
 def prepare_view(source, offset, size, black, curve, *, origin=(0, 0), strength=1.0,
-                 k_up=1.0, k_down=1.0, scale=1.0, wait=0):
+                 k_up=1.0, k_down=1.0, scale=1.0, wait=0, model="edit"):
     """prepare() on the size = (w, h) crop at offset = (x, y) of a GPU-resident
     2D array, read in place. wait: a RAW stream value (stream base + sensor rows);
     the grid then starts on the GPU only once that many rows are decoded."""
@@ -56,6 +68,7 @@ def prepare_view(source, offset, size, black, curve, *, origin=(0, 0), strength=
     w, h = map(int, size)
     if w < 448 or h < 336:
         raise ValueError("DRO raw grid requires at least 448 x 336 pixels")
+    set_model(model)
     weights = metal_itp.empty((6, 8, 14), np.float32)
     sums = metal_itp.empty((6, 8, 14), np.float32)
     lib = metal_itp._load()
@@ -108,9 +121,10 @@ def apply_prepared(planes, grid, black, curve, *, origin=(0, 0), strength=1.0,
 
 
 def apply(raw, planes, black, curve, *, origin=(0, 0), strength=1.0,
-          k_up=1.0, k_down=1.0, scale=1.0, debug=False):
+          k_up=1.0, k_down=1.0, scale=1.0, debug=False, model="edit"):
     """Build the DRO grid from raw and apply it to three uint16 ITP planes."""
     raw, black, curve = _common(raw, black, curve, origin)
+    set_model(model)
     if len(planes) != 3 or planes[0].ndim != 2 or any(p.shape != planes[0].shape for p in planes):
         raise ValueError("expected three identically shaped 2D planes")
     out = [metal_itp.empty(p.shape) for p in planes]

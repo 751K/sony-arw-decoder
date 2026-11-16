@@ -32,6 +32,17 @@ BIN_W = np.array([0.8828129768371582, 0.6054689884185791, 0.3242189884185791, 0.
                   0.0039059999398887157], f32)           # 0x1002ecff8 -> dro+0xe0
 BLEND = np.array([1, .75, .5, .25, 0, 0, 0, 0, 0, .25, .5, .75, 1, 1], f32)   # 0x1002ed088 -> dro+0x104
 
+# The camera's grid (model="camera"), fitted to the local brightness the camera's own HEIFs imply
+# (2026-11-16: a colour chart and three room scenes, Lv1-Lv5 inverted jointly; not Edit).  Same cells,
+# smoothing, end-bin blend and per-pixel operator as Edit; three differences in the analysis:
+#   samples   log2(0.1495 R + 0.32 G + 0.057 B)   (Edit: 0.1495 R + 0.057 (G + B))
+#   bins      one log2 unit wide, matching Vatr's lookup of L   (Edit: 14 / log2(8191) per unit)
+#   kernel    Gaussian, sigma 2.4 bins   (Edit: BIN_W, about 1.4)
+MODELS = ("camera", "edit")
+CAMERA_G = f32(0.32)
+CAMERA_SIGMA = 2.4
+CAMERA_W = np.exp(-np.arange(9, dtype=np.float64) ** 2 / (2 * CAMERA_SIGMA ** 2)).astype(f32)
+
 
 
 def log_table():
@@ -77,8 +88,9 @@ def grid_geometry(w, h, nx=8, ny=6, nsub=14, step=4):
                 ns_x=used_x // step, ns_y=used_y // step, per_x=subpx_x // step, per_y=subpx_y // step)
 
 
-def raw_samples(raw, geo, black=(512, 512, 512)):
-    """FUN_1000fc734 (u16 raw, dro+0x46 = 1): log-luminance of every step-th RGGB quad."""
+def raw_samples(raw, geo, black=(512, 512, 512), model="edit"):
+    """FUN_1000fc734 (u16 raw, dro+0x46 = 1): log-luminance of every step-th RGGB quad.
+    model="camera" weights G with CAMERA_G instead (see MODELS)."""
     p = raw.astype(np.int64)
     ys = geo["org_y"] + geo["step"] * np.arange(geo["ns_y"])
     xs = geo["org_x"] + geo["step"] * np.arange(geo["ns_x"])
@@ -86,7 +98,10 @@ def raw_samples(raw, geo, black=(512, 512, 512)):
     r = np.maximum((p[Y, X] - black[0]).astype(f32), f32(0))
     g = np.maximum((((p[Y + 1, X] + p[Y, X + 1]) >> 1) - black[1]).astype(f32), f32(0))
     b = np.maximum((p[Y + 1, X + 1] - black[2]).astype(f32), f32(0))
-    v = (fma32((b + g).astype(f32), COEF[2], (r * COEF[0]).astype(f32)) * K54).astype(f32)
+    if model == "camera":
+        v = (fma32(COEF[2], b, fma32(CAMERA_G, g, (r * COEF[0]).astype(f32))) * K54).astype(f32)
+    else:
+        v = (fma32((b + g).astype(f32), COEF[2], (r * COEF[0]).astype(f32)) * K54).astype(f32)
     return log_lookup(v)
 
 
@@ -158,11 +173,16 @@ def curve_table(knots, ctrl):
     return out
 
 
-def build_grid(raw, knots, ctrl, black=(512, 512, 512)):
-    """Full analysis for a decoded raw buffer (uint16, h x w). Returns the grid dict used by vatr()."""
+def build_grid(raw, knots, ctrl, black=(512, 512, 512), model="edit"):
+    """Full analysis for a decoded raw buffer (uint16, h x w): the whole sensor buffer, as Edit reads it
+    (7168 x 5120 for full-frame α7 V files), not the decoder rect.  Returns the grid dict used by vatr().
+    model: "edit" (bit-exact to Edit) or "camera" (MODELS)."""
+    if model not in MODELS:
+        raise ValueError(f"unknown DRO model {model!r}")
+    cam = model == "camera"
     h, w = raw.shape
     geo = grid_geometry(w, h)
-    samples = raw_samples(raw, geo, black)
+    samples = raw_samples(raw, geo, black, model)
     sub = subcell_means(samples, geo)
     ny, nx, n = geo["ny"], geo["nx"], geo["nsub"]
     nb = 14
@@ -172,8 +192,11 @@ def build_grid(raw, knots, ctrl, black=(512, 512, 512)):
     inv70 = f32(f32(1.0) / LOG2_MAX)
     for i in range(n * n):
         v = cells[..., i]
-        b = np.maximum(((v * f32(nb)).astype(f32) * inv70).astype(f32), f32(0)).astype(np.int64)
-        b = b - (b == nb)
+        if cam:
+            b = np.minimum(np.maximum(v, f32(0)).astype(np.int64), nb - 1)
+        else:
+            b = np.maximum(((v * f32(nb)).astype(f32) * inv70).astype(f32), f32(0)).astype(np.int64)
+            b = b - (b == nb)
         for yy in range(ny):
             for xx in range(nx):
                 hist[yy, xx, b[yy, xx]] = f32(hist[yy, xx, b[yy, xx]] + inc)
@@ -182,7 +205,7 @@ def build_grid(raw, knots, ctrl, black=(512, 512, 512)):
     for j in range(nb):
         w_ = np.zeros((ny, nx), f32); s_ = np.zeros((ny, nx), f32)
         for k in range(nb):
-            wt = BIN_W[min(abs(j - k), 8)]
+            wt = (CAMERA_W if cam else BIN_W)[min(abs(j - k), 8)]
             hk = sm[..., k]
             w_ = fma32(hk, wt, w_)
             s_ = fma32((hk * wt).astype(f32), f32(k), s_)
@@ -310,10 +333,10 @@ def curve_points_from_arw(arw):
     return k.astype(f32), c.astype(f32)
 
 
-def grid_from_arw(arw, black=(512, 512, 512)):
+def grid_from_arw(arw, black=(512, 512, 512), model="edit"):
     import rawpy
     with rawpy.imread(str(arw)) as r:
         raw = r.raw_image.copy()
     pts = curve_points_from_arw(arw)
     assert pts is not None, "no camera DRO curve (0x781b/0x781c)"
-    return build_grid(raw, *pts, black=black)
+    return build_grid(raw, *pts, black=black, model=model)

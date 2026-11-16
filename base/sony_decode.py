@@ -108,7 +108,7 @@ def _abort_metal_batch_on_error(fn):
 
 @_abort_metal_batch_on_error
 def decode(arw, look=None, *, output="srgb", raw=None, nr=None, dro=None, marble=None,
-           detail=True, lens=True, sscs=True, highlights="camera", pad=32, strip=512, verbose=False,
+           detail=True, lens=True, sscs=True, highlights="camera", dro_model="camera", pad=32, strip=512, verbose=False,
            rust=None, metal=False, metal_itp=False, metal_dro=False, metal_geo=False, metal_sscs=False, metal_look=False,
            metal_spatial=False, metal_marble=False, metal_post=False, metal_nr=False,
            output_bits=14):
@@ -127,6 +127,10 @@ def decode(arw, look=None, *, output="srgb", raw=None, nr=None, dro=None, marble
     highlights: "camera" (default) skips SSCS and ChromaSuppress, as the camera's own JPEG/HEIF
             does (2026-11-16 chart bracket: -3..+3 EV within 0.43 ΔE of the HEIF, against 1.93 at
             +2 EV with them); "edit" runs both, bit-exact to Edit's export.  "camera" overrides sscs.
+    dro_model: "camera" (default) builds the DRO grid as the camera's own HEIFs imply (sony_dro.MODELS:
+            luma samples, 1-EV bins, wider range kernel; Lv1-Lv5 on a chart and three room scenes about
+            half the error of Edit's grid); "edit" is Edit's grid, bit-exact.  Both read the whole
+            sensor buffer, as Edit does, not the decoder rect.
     nr/dro/marble/lens/sscs: None = follow the develop settings: Edit's saved session
             when present, else the values Edit starts from for an unsaved ARW
             (develop_settings.camera_defaults).  SSCS always runs unless disabled.  detail: True/False (or
@@ -245,7 +249,7 @@ def decode(arw, look=None, *, output="srgb", raw=None, nr=None, dro=None, marble
     x0, y0, x1, y1 = DP.crop_rect(arw)
     if (x0 | y0) & 1:
         raise ValueError("odd decoder-rect origin breaks the RGGB phase")
-    raw_crop = raw[y0:y1, x0:x1]              # decoder rect, for the DRO grid
+    raw_dro = raw                             # whole sensor buffer, for the DRO grid (as Edit)
     Hr, Wr = raw.shape
     ex0, ey0 = max(x0 - pad, 0), max(y0 - pad, 0)
     ex1, ey1 = min(x1 + pad, Wr), min(y1 + pad, Hr)
@@ -281,7 +285,7 @@ def decode(arw, look=None, *, output="srgb", raw=None, nr=None, dro=None, marble
         dro_curve = DRO.curve_table(*dro_pts)
         if metal_dro and itp_stream is None:
             import metal_dro as MD
-            dro_grid = MD.prepare(raw_crop, dro_black, dro_curve, origin=(ox, oy))
+            dro_grid = MD.prepare(raw_dro, dro_black, dro_curve, origin=(ox, oy), model=dro_model)
 
     # --- RawNR (dev+0x218 / 0x801e) -------------------------------------------
     t = time.perf_counter()
@@ -310,13 +314,12 @@ def decode(arw, look=None, *, output="srgb", raw=None, nr=None, dro=None, marble
                                     nr_args=nr_args, nr_thresholds=nr_thresholds, stream=itp_stream))
         if itp_stream is not None:
             if dro and metal_dro:
-                # The grid reads the decoder rect of the sensor raw in place on
-                # the auxiliary queue, once its last row is decoded.
+                # The grid reads the whole sensor raw in place on the auxiliary
+                # queue, once its last row is decoded.
                 import metal_dro as MD
-                top, left = raw_stream.top + y0, raw_stream.left + x0
-                dro_grid = MD.prepare_view(raw_stream.full, (left, top), (x1 - x0, y1 - y0),
+                dro_grid = MD.prepare_view(raw_stream.full, (raw_stream.left, raw_stream.top), (Wr, Hr),
                                            dro_black, dro_curve, origin=(ox, oy),
-                                           wait=raw_stream.base + raw_stream.top + y1)
+                                           wait=raw_stream.base + raw_stream.top + Hr, model=dro_model)
             if metal_batch:
                 MI.flush()                     # start the GPU while rows are decoding
     else:
@@ -331,14 +334,14 @@ def decode(arw, look=None, *, output="srgb", raw=None, nr=None, dro=None, marble
             import metal_dro as MD
             planes = list(MD.apply_prepared(
                 planes, dro_grid, dro_black, dro_curve,
-                origin=(ox, oy), raw_size=raw_crop.shape[::-1]))
+                origin=(ox, oy), raw_size=raw_dro.shape[::-1]))
         elif use_rust and FR.available():
             metal_sync()
-            G = DRO.build_grid(raw_crop, *dro_pts, black=dro_black)
+            G = DRO.build_grid(raw_dro, *dro_pts, black=dro_black, model=dro_model)
             planes = FR.dro_vatr(planes, (ox, oy), G)
         else:
             metal_sync()
-            G = DRO.build_grid(raw_crop, *dro_pts, black=dro_black)
+            G = DRO.build_grid(raw_dro, *dro_pts, black=dro_black, model=dro_model)
             H, W = planes[0].shape
             out = [np.empty((H, W), np.uint16) for _ in range(3)]
             for ya in range(0, H, DRO_STRIP):
@@ -499,6 +502,8 @@ def add_decode_arguments(ap):
     ap.add_argument("--no-sscs", action="store_true")
     ap.add_argument("--highlights", default="camera", choices=["camera", "edit"],
                     help="camera: no SSCS / ChromaSuppress, as the camera's JPEG (default); edit: both, as Edit")
+    ap.add_argument("--dro-model", default="camera", choices=["camera", "edit"],
+                    help="DRO grid: camera (default, fitted to the camera's HEIFs) or edit (bit-exact to Edit)")
     ap.add_argument("--pad", type=int, default=32, help="expand the decoder rect by N px of raw margin")
     ap.add_argument("--strip", type=int, default=512, help="row-band height for the render (0 = whole image)")
     ap.add_argument("--rust", action="store_true",
@@ -540,7 +545,7 @@ def decode_kwargs(a, output_bits=14, verbose=False):
     return dict(look=a.look, output=a.color_space,
                 nr=False if a.no_nr else None, dro=False if a.no_dro else None,
                 marble=False if a.no_marble else None, detail=not a.no_detail,
-                lens=not a.no_lens, sscs=not a.no_sscs, highlights=a.highlights, pad=a.pad, strip=a.strip, verbose=verbose,
+                lens=not a.no_lens, sscs=not a.no_sscs, highlights=a.highlights, dro_model=a.dro_model, pad=a.pad, strip=a.strip, verbose=verbose,
                 rust=True if a.rust else None, metal=a.metal, metal_itp=a.metal_itp,
                 metal_dro=a.metal_dro, metal_geo=a.metal_geo, metal_sscs=a.metal_sscs,
                 metal_look=a.metal_look, metal_spatial=a.metal_spatial, metal_marble=a.metal_marble,
