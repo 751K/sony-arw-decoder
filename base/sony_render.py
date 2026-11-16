@@ -101,7 +101,7 @@ def load_looks(arw, neutral=False):
     # The shot look's LinearMatrix16 as the camera used it: warm, daylight and fluorescent tables
     # blended by 0x7848 like RGB2YCC (the look IFDs hold the daylight tables only); and its MainGamma
     # knots 0x7805/0x7806 with the camera's Contrast / Highlights / Shadows already applied.
-    for t in ("0x7770", "0x780f", "0x7805", "0x7806"):
+    for t in ("0x7770", "0x780f", "0x7805", "0x7806", "0x74c6"):
         if t in main:
             out["_main"][t] = main[t]
     return out
@@ -205,12 +205,15 @@ def _spica_dev(detail):
 
 
 class Look:
-    def _lm16(self, b64):
+    def _lm16(self, b64, param8=0):
+        """param8: the table's working space, 0 sRGB, 1 AdobeRGB.  With output_mode it selects the
+        static matrix: mode 1 / param8 0 sRGB -> AdobeRGB, mode 0 / param8 1 AdobeRGB -> sRGB,
+        equal spaces none."""
         blob = base64.b64decode(b64.removeprefix("base64:"))
         return TCACHE.load_or_build(
-            "lm16", (blob, self.output_mode, 0, _edit_sha()),
+            "lm16", (blob, self.output_mode, param8, _edit_sha()),
             lambda: np.array(BT.build_table(D.decode_blob(blob), output_mode=self.output_mode,
-                                            param8=0, correction_matrix=None), np.float32),
+                                            param8=param8, correction_matrix=None), np.float32),
             (1024, 18), np.float32)
 
     def __init__(self, name, looks, fade=None, sscs=None, output_mode=0,
@@ -277,7 +280,10 @@ class Look:
         shot = MAIN.get("0x7770")
         as_shot = ycc_weights is None and shot is not None and looks.get(str(shot).strip()) is g
         if as_shot and "0x780f" in MAIN:
-            self.table = self._lm16(MAIN["0x780f"])
+            # The main IFD table is the one the camera rendered with: in an AdobeRGB shot (SR2 0x74c6
+            # = 1) it already holds the sRGB -> AdobeRGB matrix (2026-11-16 chart shots: through
+            # mode 1 / param8 0 it was converted twice).  The look IFD tables stay sRGB.
+            self.table = self._lm16(MAIN["0x780f"], param8=int(int(str(MAIN.get("0x74c6", "0")).split()[0]) == 1))
         else:
             self.table = day = self._lm16(g["0x780f"])
             for w, blob in ((weights[0], warm_780f(MAIN.get("SonyModelID"), name)),
