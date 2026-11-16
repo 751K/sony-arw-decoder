@@ -78,28 +78,39 @@ def load_looks(arw):
     main = AL.main_tags(arw)
     out["_main"] = {t: main[t] for t in MAIN_TAGS}
     out["_main"]["SonyModelID"] = AL.sony_model_id(arw)
-    # The shot look's LinearMatrix16 as the camera used it: blended by 0x7848 like RGB2YCC
-    # (the look IFDs hold the daylight tables only).
-    for t in ("0x7770", "0x780f"):
+    # The shot look's LinearMatrix16 as the camera used it: warm, daylight and fluorescent tables
+    # blended by 0x7848 like RGB2YCC (the look IFDs hold the daylight tables only); and its MainGamma
+    # knots 0x7805/0x7806 with the camera's Contrast / Highlights / Shadows already applied.
+    for t in ("0x7770", "0x780f", "0x7805", "0x7806"):
         if t in main:
             out["_main"][t] = main[t]
     return out
 
 
 WARM_780F = HERE / "warm_780f.json"
-_WARM = None
+FLUOR_780F = HERE / "fluor_780f.json"
+_TABLES = {}
+
+
+def _measured_780f(path, model_id, name):
+    if path not in _TABLES:
+        import json
+        _TABLES[path] = json.loads(path.read_text()) if path.exists() else {}
+    return _TABLES[path].get(str(model_id), {}).get({"ST": "Standard"}.get(name, name))
 
 
 def warm_780f(model_id, name):
     """Warm LinearMatrix16 blob (base64 string) of a look, or None.  The look IFDs only hold the
-    daylight tables; the camera blends the warm and daylight tables with the RGB2YCC weights 0x7848
-    and writes the result for the shot look alone (main IFD 0x780f).  warm_780f.json keeps the main-IFD
-    tables of shots with weights 1024 0 0 0, per SonyModelID."""
-    global _WARM
-    if _WARM is None:
-        import json
-        _WARM = json.loads(WARM_780F.read_text()) if WARM_780F.exists() else {}
-    return _WARM.get(str(model_id), {}).get({"ST": "Standard"}.get(name, name))
+    daylight tables; the camera blends the warm, daylight and fluorescent tables with the RGB2YCC
+    weights 0x7848 and writes the result for the shot look alone (main IFD 0x780f).  warm_780f.json
+    keeps the main-IFD tables of shots with weights 1024 0 0 0, per SonyModelID."""
+    return _measured_780f(WARM_780F, model_id, name)
+
+
+def fluor_780f(model_id, name):
+    """Fluorescent LinearMatrix16 blob of a look, or None: the main-IFD tables of shots with weights
+    0 0 1024 0 (Fluor.CoolWhite preset), per SonyModelID (fluor_780f.json)."""
+    return _measured_780f(FLUOR_780F, model_id, name)
 
 
 def front_end_sony(arw, scale=8, lens=True, dro=None, wb_mode=None, temperature=None,
@@ -129,7 +140,7 @@ def front_end_sony(arw, scale=8, lens=True, dro=None, wb_mode=None, temperature=
     main = AL.main_tags(arw)
     black = ints(main["0x7310"])                                        # BlackLevel
     levels = ints(main["0x7313"])                                       # WB_RGGBLevels
-    k7809 = int(main["0x7809"])
+    k7809 = int(main.get("0x7809", 256))          # Edit default when absent (older bodies)
     s7311 = int(main["0x7311"])
     with rawpy.imread(str(arw)) as r:
         assert r.raw_pattern.tolist() == [[0, 1], [3, 2]] and r.color_desc == b"RGBG"
@@ -207,7 +218,14 @@ class Look:
         radius, strength, flag, angle) for ZcTaskShadeCorrection.
         ycc_weights: None uses the file's as-shot RGB2YCC blend weights (main IFD 0x7848,
         written per shot from the white balance); four ints replace them, e.g.
-        (0, 1024, 0, 0) for the daylight set 0x7844 (docs/pipeline.md 4.3).
+        (0, 1024, 0, 0) for the daylight set 0x7844 (docs/pipeline.md 4.3).  The same weights
+        blend the LinearMatrix16 table: daylight (look IFD 0x780f) + w0/1024 x (warm - daylight)
+        + w2/1024 x (fluorescent - daylight), with the warm and fluorescent tables from
+        warm_780f.json and fluor_780f.json (daylight only for cameras without them).  With
+        ycc_weights None the shot look uses the main IFD 0x780f, the camera's own blend, and the main
+        IFD MainGamma knots 0x7805/0x7806, which carry the camera's Contrast / Highlights / Shadows
+        (the camera's Saturation is already in the RGB2YCC tags).  contrast/highlight/shadow here are
+        Edit units, 5 x the camera's slider steps (one family curve per step), added on top.
         All defaults reproduce the old behaviour bit for bit."""
         if output_mode not in (0, 1, 3, 4):
             raise ValueError("output_mode must be 0 (sRGB), 1 (AdobeRGB), 3 (Display P3) or 4 (ProPhoto)")
@@ -236,20 +254,23 @@ class Look:
         # with the RGB2YCC weight w0 (0x7848) and stores the result for the shot look in the main IFD.
         weights = ints(MAIN["0x7848"]) if ycc_weights is None else [int(v) for v in ycc_weights]
         shot = MAIN.get("0x7770")
-        if ycc_weights is None and "0x780f" in MAIN and shot is not None and looks.get(str(shot).strip()) is g:
+        as_shot = ycc_weights is None and shot is not None and looks.get(str(shot).strip()) is g
+        if as_shot and "0x780f" in MAIN:
             self.table = self._lm16(MAIN["0x780f"])
         else:
-            self.table = self._lm16(g["0x780f"])
-            warm = warm_780f(MAIN.get("SonyModelID"), name)
-            if warm is not None and weights[0]:
-                self.table = (self.table + np.float32(weights[0] / 1024)
-                              * (self._lm16(warm) - self.table)).astype(np.float32)
+            self.table = day = self._lm16(g["0x780f"])
+            for w, blob in ((weights[0], warm_780f(MAIN.get("SonyModelID"), name)),
+                            (weights[2], fluor_780f(MAIN.get("SonyModelID"), name))):
+                if blob is not None and w:
+                    self.table = (self.table + np.float32(w / 1024)
+                                  * (self._lm16(blob) - day)).astype(np.float32)
         # MainGamma's second stage: Sony always calls 0x10011e174 for this model
         # (look+0x1d0 != 0, model generation >= 2).  At (0,0,0) it is row 18, which
         # produces the same LUT as passing no second stage at all (verified bit-exact).
         _, family = SL.load_static_tables()
         second = SL.contrast_table(family, self.contrast, self.highlight, self.shadow)
-        xs, ys = ints(g["0x7805"]), ints(g["0x7806"])
+        knots = MAIN if as_shot and "0x7806" in MAIN else g
+        xs, ys = ints(knots["0x7805"]), ints(knots["0x7806"])
 
         def build_main_gamma():
             if self._use_rust:
