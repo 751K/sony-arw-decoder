@@ -200,7 +200,7 @@ def decode(arw, look=None, *, output="srgb", raw=None, nr=None, dro=None, marble
         # it on a background thread while the GPU starts on the rows already
         # done. White-balance mode 3 samples the raw on the CPU first.
         nr_on = nr if nr is not None else int(st.get(DS.NR_ON, 0)) == 1
-        dro_on = dro if dro is not None else int(st.get(DS.DRO_ON, 0)) == 1
+        dro_on = dro if dro is not None else DS.dro_on(st)
         if (metal_itp and use_rust and (metal_nr or not nr_on) and (metal_dro or not dro_on)
                 and int(st.get(DS.WB_MODE, 1)) != 3
                 and os.environ.get("SONYLOOK_RAW_STREAM", "1") != "0"):
@@ -268,7 +268,7 @@ def decode(arw, look=None, *, output="srgb", raw=None, nr=None, dro=None, marble
     # DRO's analysis grid depends on the raw crop only. Start it on the
     # auxiliary GPU queue while RawNR and ITP run on the main queue.
     if dro is None:
-        dro = int(st.get(DS.DRO_ON, 0)) == 1
+        dro = DS.dro_on(st)
     dro_pts = dro_grid = dro_curve = None
     dro_black = (black[0], black[1], black[3])
     if dro:

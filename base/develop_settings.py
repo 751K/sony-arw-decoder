@@ -181,6 +181,13 @@ def _lens_switch_default(h):
     return -1 if lo == 0x11 else 2 if lo == 0 else 1
 
 
+def dro_on(st) -> bool:
+    """DRO runs for 0x8022 = 1 (camera DRO Auto) and 2 (camera Lv1-Lv5): both use the camera's curve
+    (SR2 0x781b/0x781c) at strength 1.  Edit's own handling of 2 is not reverse-engineered; the
+    2026-11-16 chart shots (in-camera Lv1-Lv5 HEIF) match this, not DRO off."""
+    return int(st.get(DRO_ON, 0)) in (1, 2)
+
+
 def camera_defaults(arw) -> dict:
     """The settings Edit 4.0 starts from for an ARW it has never saved (FUN_1000a6e9c).
 

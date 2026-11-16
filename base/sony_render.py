@@ -156,7 +156,7 @@ def front_end_sony(arw, scale=8, lens=True, dro=None, wb_mode=None, temperature=
     if rb_factor is None:
         rb_factor = int(st.get(DS.RB_FACTOR, 0))
     if dro is None:
-        dro = int(st.get(DS.DRO_ON, 0)) == 1
+        dro = DS.dro_on(st)
     main = AL.main_tags(arw)
     black = ints(main["0x7310"])                                        # BlackLevel
     levels = ints(main["0x7313"])                                       # WB_RGGBLevels
