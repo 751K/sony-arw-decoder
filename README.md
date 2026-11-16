@@ -86,6 +86,8 @@ export_image = decode("photo.ARW", metal=True, output_bits=16)
 
 `--color-space` (`output=` in Python) is `srgb` (default), `adobe`, `p3` or `prophoto`. Edit offers only the first two. Display P3 and ProPhoto RGB are built the way Edit builds Adobe RGB: an extra matrix in the LinearMatrix16 table, which works on camera RGB so colors outside sRGB survive, plus matching matrices for Marble and the BW/Sepia effect. ProPhoto is re-encoded to gamma 1.8 at the end. The ICC profiles are generated. There is no Edit export to compare these two against; all backends agree bit for bit. Marble and the effect clip to Edit's working gamut, which holds Display P3 but not all of ProPhoto. Details: docs/pipeline.md §9.2. ProPhoto is best written as 16-bit TIFF.
 
+`--highlights` (`highlights=` in Python) is `camera` (default) or `edit`. The camera's own JPEG and HEIF skip Edit's near-saturation colour suppression (SSCS) and ChromaSuppress. With them, bright colours whose green channel has clipped turn white: in a chart exposure bracket, +2 EV is 1.93 ΔE2000 from the camera HEIF with them and 0.43 without. `edit` keeps both and reproduces Edit's export bit for bit. Details: docs/pipeline.md §10.3.
+
 ### Many files
 
 ```bash

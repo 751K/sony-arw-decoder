@@ -108,7 +108,7 @@ def _abort_metal_batch_on_error(fn):
 
 @_abort_metal_batch_on_error
 def decode(arw, look=None, *, output="srgb", raw=None, nr=None, dro=None, marble=None,
-           detail=True, lens=True, sscs=True, pad=32, strip=512, verbose=False,
+           detail=True, lens=True, sscs=True, highlights="camera", pad=32, strip=512, verbose=False,
            rust=None, metal=False, metal_itp=False, metal_dro=False, metal_geo=False, metal_sscs=False, metal_look=False,
            metal_spatial=False, metal_marble=False, metal_post=False, metal_nr=False,
            output_bits=14):
@@ -124,6 +124,9 @@ def decode(arw, look=None, *, output="srgb", raw=None, nr=None, dro=None, marble
     look:   look name from arw_looks.look_ifds ("Standard", "FL2", ...); None follows the
             settings (0x8000: 1 = the look the camera shot with, SR2 0x7770; else a look id).
     raw:    optional full visible CFA image (uint16); read with rawpy if None.
+    highlights: "camera" (default) skips SSCS and ChromaSuppress, as the camera's own JPEG/HEIF
+            does (2026-11-16 chart bracket: -3..+3 EV within 0.43 ΔE of the HEIF, against 1.93 at
+            +2 EV with them); "edit" runs both, bit-exact to Edit's export.  "camera" overrides sscs.
     nr/dro/marble/lens/sscs: None = follow the develop settings: Edit's saved session
             when present, else the values Edit starts from for an unsaved ARW
             (develop_settings.camera_defaults).  SSCS always runs unless disabled.  detail: True/False (or
@@ -350,6 +353,10 @@ def decode(arw, look=None, *, output="srgb", raw=None, nr=None, dro=None, marble
 
     # --- GeoCorr (distortion + lateral CA), optionally fused with SSCS -------
     t = time.perf_counter()
+    if highlights not in ("edit", "camera"):
+        raise ValueError(f"highlights must be 'edit' or 'camera', not {highlights!r}")
+    if highlights == "camera":
+        sscs = False
     sscs_params = SC.params_from_tags(tags) if sscs else None
     fused_geo_sscs = False
     L = None
@@ -446,7 +453,7 @@ def decode(arw, look=None, *, output="srgb", raw=None, nr=None, dro=None, marble
         raise ValueError(f"output must be one of {sorted(CS.MODES)}, got {output!r}")
     output_mode = CS.MODES[output]
     lk = R.Look(look, looks, fade=fade, fade_level=fade_level,
-                output_mode=output_mode,
+                output_mode=output_mode, chroma_suppress=highlights != "camera",
                 tone_curves=tone_curves, shade=shade, use_rust=use_rust, **tone)
     rt = {}
     if marble:
@@ -490,6 +497,8 @@ def add_decode_arguments(ap):
     ap.add_argument("--no-detail", action="store_true")
     ap.add_argument("--no-lens", action="store_true")
     ap.add_argument("--no-sscs", action="store_true")
+    ap.add_argument("--highlights", default="camera", choices=["camera", "edit"],
+                    help="camera: no SSCS / ChromaSuppress, as the camera's JPEG (default); edit: both, as Edit")
     ap.add_argument("--pad", type=int, default=32, help="expand the decoder rect by N px of raw margin")
     ap.add_argument("--strip", type=int, default=512, help="row-band height for the render (0 = whole image)")
     ap.add_argument("--rust", action="store_true",
@@ -531,7 +540,7 @@ def decode_kwargs(a, output_bits=14, verbose=False):
     return dict(look=a.look, output=a.color_space,
                 nr=False if a.no_nr else None, dro=False if a.no_dro else None,
                 marble=False if a.no_marble else None, detail=not a.no_detail,
-                lens=not a.no_lens, sscs=not a.no_sscs, pad=a.pad, strip=a.strip, verbose=verbose,
+                lens=not a.no_lens, sscs=not a.no_sscs, highlights=a.highlights, pad=a.pad, strip=a.strip, verbose=verbose,
                 rust=True if a.rust else None, metal=a.metal, metal_itp=a.metal_itp,
                 metal_dro=a.metal_dro, metal_geo=a.metal_geo, metal_sscs=a.metal_sscs,
                 metal_look=a.metal_look, metal_spatial=a.metal_spatial, metal_marble=a.metal_marble,

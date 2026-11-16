@@ -88,6 +88,8 @@ export_image = decode("photo.ARW", metal=True, output_bits=16)
 
 `--color-space`（Python 中为 `output=`）可选 `srgb`（默认）、`adobe`、`p3`、`prophoto`。Edit 只提供前两种。Display P3 和 ProPhoto RGB 按 Edit 构造 Adobe RGB 的方式实现：在 LinearMatrix16 表中多乘一个矩阵（这张表作用在相机 RGB 上，所以 sRGB 之外的颜色能保留下来），并给 Marble 和 BW/Sepia 效果配上对应的矩阵；ProPhoto 最后重新编码为 gamma 1.8。ICC 配置文件由代码生成。这两种没有 Edit 导出图可以对照，各后端之间逐位一致。Marble 和效果会截到 Edit 的工作色域，它包含 Display P3，但不能完整包含 ProPhoto。细节见 docs/pipeline.md §9.2。ProPhoto 建议输出 16 位 TIFF。
 
+`--highlights`（Python 中为 `highlights=`）可选 `camera`（默认）或 `edit`。相机直出的 JPEG 和 HEIF 不做 Edit 的近饱和色彩抑制（SSCS）和 ChromaSuppress。若做这两步，G 通道已饱和的亮色会偏白：色卡曝光包围中，+2 EV 与相机 HEIF 的 ΔE2000 为 1.93，不做时为 0.43。`edit` 保留这两步，与 Edit 导出逐位一致。细节见 docs/pipeline.md §10.3。
+
 ### 批量处理
 
 ```bash

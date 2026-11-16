@@ -219,7 +219,7 @@ class Look:
     def __init__(self, name, looks, fade=None, sscs=None, output_mode=0,
                  contrast=0, highlight=0, shadow=0, hue=0, saturation=0,
                  exposure=0, white_level=0, black_level=0, tone_curves=None, shade=None,
-                 use_rust=None, fade_level=None, ycc_weights=None):
+                 use_rust=None, fade_level=None, ycc_weights=None, chroma_suppress=True):
         """fade: Creative Look Fade slider 0..9; None = the shot's Fade (MakerNote 0x2034) for the
         as-shot look, otherwise the camera default for this look.
         fade_level: dev+0x2bc directly (normally 10 x fade); overrides `fade`.  Any level >= 0
@@ -360,6 +360,10 @@ class Look:
         # exposure factor render+0x18ee = exp2(EV/300)*64, then forward MainGamma + YGamma LUT
         # (no 0x780e gain). Exposure-compensation slider at 0 -> 0x18ee = 64.
         self.cs = self.chroma_params(self.exposure)
+        if not chroma_suppress:
+            # Thresholds out of reach: the stage passes every pixel unchanged (Python, Rust and
+            # Metal all read look.cs).  The camera's own JPEG/HEIF has no such suppression.
+            self.cs = (0, 0x7FFF, 0, 0)
         # AreaComp: inserted for ARW format code 0x3600 (0xb000 = ARW 6.0); 0x7770 look id
         self.area_comp = SS.area_comp_params(0x3600, True, LOOK_IDS.get(name, 0))
         # Effect (BW / Sepia, sony_effect.py): Sepia tint from 0x74c5 unless SonyModelID is an old body,
