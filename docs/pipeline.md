@@ -4,6 +4,7 @@
 
 - **目标程序**：Imaging Edge Edit 4.0.00.10312，arm64 切片 SHA-256 `a03b2449…5da442`。4.1.00.03062 的颜色链与之相同（§10.2）；`base/edit_binary.py` 以 4.0 地址为准，并为 4.1 的常量表地址做了映射。
 - **验证方式**：在 Unicorn 模拟器里运行 Edit 的原始 ARM64 函数，使用 Sony 自己的 ARW 解析器和对象，与 Python 移植逐位比较；整图再与 Edit 的导出图比较。
+- **参照**：各阶段以 Edit 为蓝本逐位复现；整体输出以相机直出为准。两者不一致时按相机处理，并保留与 Edit 一致的选项（§9.1、§10.3）。
 - **函数地址**均指 4.0.00.10312。`dev+X` 是显影参数结构，`look+X` 是解析器生成的外观结构，`render+X` 是渲染上下文。
 
 ## 0. 现状
@@ -15,9 +16,10 @@
 | ITP 去马赛克 | `sony_itp.py` | 是 | 否 | §3.2 |
 | DRO（ZcTaskVatr） | `sony_dro.py` | 按设置 | 否 | §3.3 |
 | GeoCorr（畸变 + 横向色差） | `sony_lens.py` | 按设置 | 否 | §3.4 |
-| SSCS | `sony_sscs.py` | 是 | 是 | §3.5 |
+| SSCS | `sony_sscs.py` | 否（`highlights="edit"` 时运行） | 否 | §3.5 |
 | LinearMatrix16、MainGamma | `sony_look.py` | 是 | 是 | §4.1、§4.2 |
-| RGB2YCC、AreaComp、ChromaSuppress | `sony_ycc.py`、`sony_ycc_stages.py` | 是 | 是 | §4.3–§4.5 |
+| RGB2YCC、AreaComp | `sony_ycc.py`、`sony_ycc_stages.py` | 是 | 是 | §4.3、§4.4 |
+| ChromaSuppress | `sony_ycc_stages.py` | 否（`highlights="edit"` 时运行） | 否 | §4.5 |
 | YGamma（含褪色） | `sony_ycc_stages.py` | 是 | 是 | §4.6 |
 | HueSaturation | `sony_ycc_stages.py` | 滑块非 0 时 | 否 | §4.7 |
 | 3DLut | 只有应用部分 | 否（0x8026 = 0） | — | §4.8 |
@@ -32,7 +34,7 @@
 
 不运行、也没有移植的阶段：TrinityLPF（需要存储类型 4）、YNR（dev+0x22c = 0）、`FUN_1000b83e8` 降噪任务（本机型条件不满足）、ZcTaskDemosaic（只用于 GRBG 传感器）。
 
-**与 Edit 导出图的对照**（DSC03591，Edit 保存过的会话设置，ST 外观）：全图 7008×4672 的 8 位 MAE **0.125**（sRGB），AdobeRGB 为 **0.133**。10 块全分辨率裁块（含 4 块最亮区域）：ST 0.153、FL2 0.138、FL3 0.138。2026-10-25 的整图重测在 8× 缩小后为 ST 0.078、FL2 0.082、FL3 0.093。上述误差单位为 8 位 RGB MAE。其余 9 种外观没有 Edit 参考图，只验证了与 Sony 函数逐位一致。
+**与 Edit 导出图的对照**（DSC03591，Edit 保存过的会话设置，`highlights="edit"`，ST 外观）：全图 7008×4672 的 8 位 MAE **0.125**（sRGB），AdobeRGB 为 **0.133**。10 块全分辨率裁块（含 4 块最亮区域）：ST 0.153、FL2 0.138、FL3 0.138。2026-10-25 的整图重测在 8× 缩小后为 ST 0.078、FL2 0.082、FL3 0.093。上述误差单位为 8 位 RGB MAE。其余 9 种外观没有 Edit 参考图，只验证了与 Sony 函数逐位一致。
 
 **仍未完成**：3DLut 表的构建链；自定义白平衡（模式 0xd）的数据来源；非 RGGB 传感器；更多参考图（其余外观、NR/DRO 开启、调过滑块、高 ISO）。
 

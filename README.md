@@ -2,20 +2,20 @@
 
 English | [中文](README.zh-CN.md)
 
-A standalone complete Sony RAW decoder based on the Imaging Edge Edit development pipeline, with Rust and Metal acceleration backends for the CPU and the GPU. It decodes a 33-megapixel RAW in 88 ms, 3–4× faster than macOS's own RAW decoder (Core Image); peak memory for one image is about 1.05 GB, below Core Image's 1.48 GB; and it writes sRGB, Adobe RGB, Display P3 and ProPhoto RGB as TIFF, JPEG, PNG or HEIF.
+A standalone complete Sony RAW decoder that reproduces the Imaging Edge Edit development pipeline stage by stage and takes the camera's own output as the reference, with Rust and Metal acceleration backends for the CPU and the GPU. It decodes a 33-megapixel RAW in 88 ms, 3–4× faster than macOS's own RAW decoder (Core Image); peak memory for one image is about 1.05 GB, below Core Image's 1.48 GB; and it writes sRGB, Adobe RGB, Display P3 and ProPhoto RGB as TIFF, JPEG, PNG or HEIF.
 
 ## Pipeline
 
 ```text
-RAW -> [RawNR] -> ITP -> [DRO] -> [GeoCorr] -> SSCS
-    -> LinearMatrix16 -> MainGamma -> RGB2YCC -> AreaComp -> ChromaSuppress
+RAW -> [RawNR] -> ITP -> [DRO] -> [GeoCorr] -> [SSCS]
+    -> LinearMatrix16 -> MainGamma -> RGB2YCC -> AreaComp -> [ChromaSuppress]
     -> Sharpness -> YGamma -> [HueSaturation] -> Spica -> YCC2RGB
     -> [Marble] -> [Effect] -> [ToneCurve] -> [ShadeCorrection]
 ```
 
-Bracketed stages run according to the development settings stored in the ARW. The output is the image corresponding to the decoder rectangle as 16-bit sRGB or Adobe RGB data (plus Display P3 and ProPhoto RGB, which this project adds; Edit has no such options) and can be written to TIFF, JPEG, PNG or HEIF (`.hif`, 10-bit, as Sony's cameras save it).
+Bracketed stages run according to the development settings stored in the ARW. SSCS and ChromaSuppress are the exception: the camera's own output skips them, so they run only with `--highlights edit`. The output is the image corresponding to the decoder rectangle as 16-bit sRGB or Adobe RGB data (plus Display P3 and ProPhoto RGB, which this project adds; Edit has no such options) and can be written to TIFF, JPEG, PNG or HEIF (`.hif`, 10-bit, as Sony's cameras save it).
 
-The current implementation uses A7 V samples and development settings as its initial calibration target and has been validated against Sony Imaging Edge Edit 4.0 / 4.1 for RGGB sensor output.
+The current implementation uses A7 V samples and development settings as its initial calibration target. Each stage has been checked bit for bit against Sony Imaging Edge Edit 4.0 / 4.1 (RGGB sensors); the output as a whole takes the camera's own JPEG and HEIF as the reference and is validated with charts and real photos (docs/pipeline.md §10.3).
 
 ## Backends
 

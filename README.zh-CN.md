@@ -2,22 +2,21 @@
 
 [English](README.md) | 中文
 
-本仓库为 Sony RAW 完整解码器，基于 Imaging Edge Edit 的显影管线构建，针对 CPU 与 GPU 分别提供基于 Rust 和 Metal 的加速后端。在速度上，解码一张 3300 万像素的 RAW 仅需 88 ms，比 macOS 自带的 RAW 解码（Core Image）快 3–4 倍；在内存占用上，单张峰值约 1.05 GB，低于 Core Image 的 1.48 GB；并支持 sRGB、Adobe RGB、Display P3、ProPhoto RGB 多种色彩空间，以及 TIFF、JPEG、PNG、HEIF 多种格式输出。
+本仓库为 Sony RAW 完整解码器：以 Imaging Edge Edit 的显影管线为蓝本逐阶段复现，输出以相机直出为参照，针对 CPU 与 GPU 分别提供基于 Rust 和 Metal 的加速后端。在速度上，解码一张 3300 万像素的 RAW 仅需 88 ms，比 macOS 自带的 RAW 解码（Core Image）快 3–4 倍；在内存占用上，单张峰值约 1.05 GB，低于 Core Image 的 1.48 GB；并支持 sRGB、Adobe RGB、Display P3、ProPhoto RGB 多种色彩空间，以及 TIFF、JPEG、PNG、HEIF 多种格式输出。
 
 ## 处理管线
 
 ```text
-RAW → [RawNR] → ITP → [DRO] → [GeoCorr] → SSCS
-    → LinearMatrix16 → MainGamma → RGB2YCC → AreaComp → ChromaSuppress
+RAW → [RawNR] → ITP → [DRO] → [GeoCorr] → [SSCS]
+    → LinearMatrix16 → MainGamma → RGB2YCC → AreaComp → [ChromaSuppress]
     → Sharpness → YGamma → [HueSaturation] → Spica → YCC2RGB
     → [Marble] → [Effect] → [ToneCurve] → [ShadeCorrection]
 ```
 
-方括号中的阶段根据 ARW 中保存的显影设置运行。输出为解码器矩形对应的
+方括号中的阶段根据 ARW 中保存的显影设置运行；SSCS 与 ChromaSuppress 例外，相机直出不做这两步，因此默认不运行，`--highlights edit` 时运行。输出为解码器矩形对应的
 16 位 sRGB 或 Adobe RGB 图像（另可输出本项目新增的 Display P3 和 ProPhoto RGB，Edit 没有这两个选项），可写入 TIFF、JPEG、PNG 或 HEIF（`.hif`，10 位，和 Sony 相机保存的格式相同）。
 
-当前实现使用 A7 V 样张和显影设置作为初始标定目标，并已对 Sony Imaging
-Edge Edit 4.0 / 4.1 的 RGGB 传感器结果进行验证。
+当前实现以 A7 V 样张和显影设置为初始标定目标。各阶段已与 Sony Imaging Edge Edit 4.0 / 4.1 逐位核对（RGGB 传感器）；整体输出以相机直出为参照，用色卡和实拍照片验证，详见 docs/pipeline.md §10.3。
 
 ## 后端
 
