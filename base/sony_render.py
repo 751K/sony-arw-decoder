@@ -71,13 +71,33 @@ def ints(s):
     return [int(v) for v in str(s).split()]
 
 
-def load_looks(arw):
-    """{name: look tags} from the ARW; '_main' holds the main SR2SubIFD values looks do not override."""
-    out = dict(AL.look_ifds(arw))
+def _neutral_saturation(looks, main, sat):
+    """Undo the camera's Saturation slider: it scales the RGB2YCC gain entries of every look IFD
+    (0x7842-0x7846) and of main 0x7841 by 0x1002e6950[sat+9]; Edit divides them back at parse
+    time (sony_ycc.descale_gains, FUN_1000a74bc).  Recovers the saturation-0 values to one gain step."""
+    import sony_ycc as YC
+    table = YC.sat_table()
+    fix = lambda v: " ".join(str(x) for x in YC.descale_gains(ints(v), sat, table))
+    for g in looks.values():
+        for t in ("0x7841", "0x7842", "0x7843", "0x7844", "0x7845", "0x7846"):
+            if t in g:
+                g[t] = fix(g[t])
+    main["0x7841"] = fix(main["0x7841"])
+
+
+def load_looks(arw, neutral=False):
+    """{name: look tags} from the ARW; '_main' holds the main SR2SubIFD values looks do not override,
+    and '_main'['settings'] the camera's Creative Look sliders for the shot look (MakerNote).
+    neutral=True removes the shot's Saturation from every look (for profiles built from a sample)."""
+    out = {k: dict(v) for k, v in AL.look_ifds(arw).items()}
     out["ST"] = out["Standard"]
     main = AL.main_tags(arw)
     out["_main"] = {t: main[t] for t in MAIN_TAGS}
     out["_main"]["SonyModelID"] = AL.sony_model_id(arw)
+    out["_main"]["settings"] = settings = AL.look_settings(arw)
+    if neutral and settings.get("saturation", 0):
+        _neutral_saturation({k: v for k, v in out.items() if k not in ("ST", "_main")}, out["_main"],
+                            settings["saturation"])
     # The shot look's LinearMatrix16 as the camera used it: warm, daylight and fluorescent tables
     # blended by 0x7848 like RGB2YCC (the look IFDs hold the daylight tables only); and its MainGamma
     # knots 0x7805/0x7806 with the camera's Contrast / Highlights / Shadows already applied.
@@ -197,7 +217,8 @@ class Look:
                  contrast=0, highlight=0, shadow=0, hue=0, saturation=0,
                  exposure=0, white_level=0, black_level=0, tone_curves=None, shade=None,
                  use_rust=None, fade_level=None, ycc_weights=None):
-        """fade: Creative Look Fade slider 0..9; None = the camera default for this look.
+        """fade: Creative Look Fade slider 0..9; None = the shot's Fade (MakerNote 0x2034) for the
+        as-shot look, otherwise the camera default for this look.
         fade_level: dev+0x2bc directly (normally 10 x fade); overrides `fade`.  Any level >= 0
         is computed as Edit does (interpolated between steps, extrapolated above 90).
         sscs: None, or sony_sscs params to apply ZcTaskSSCS in every render() call (decoder stage, not
@@ -299,7 +320,11 @@ class Look:
             (0x10000,), np.int16)
         # Edit's Fade slider is 0..9 and dev+0x2bc is 10 x that.  A negative level would
         # index below FUN_1000d71fc's 10-entry gain table; ygamma_* raise ValueError.
-        self.fade = CAMERA_FADE.get({"Standard": "ST"}.get(name, name), 0) if fade is None else int(fade)
+        # fade None: the shot's own Fade (MakerNote 0x2034) for the as-shot look, else the camera default.
+        shot_fade = MAIN.get("settings", {}).get("fade") if as_shot else None
+        if fade is None:
+            fade = shot_fade if shot_fade is not None else CAMERA_FADE.get({"Standard": "ST"}.get(name, name), 0)
+        self.fade = int(fade)
         level = 10 * self.fade if fade_level is None else int(fade_level)
         self.fade_level = level
         t780e = ints(g.get("0x780e", "16384 " * 10))

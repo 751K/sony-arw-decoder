@@ -233,7 +233,13 @@ def camera_defaults(arw) -> dict:
 
     name = str(AL.main_tags(str(arw)).get("0x7770", "Standard")).strip()
     look_id = R.LOOK_IDS.get(name, 0)
-    fade = 10 * R.CAMERA_FADE.get(name, 0) if look_id not in (0x16, 0x17) else 0
+    # Fade: the camera's own setting (MakerNote 0x2034) when recorded.  Without it, Edit's start
+    # value: the camera default, except FL2 / FL3 (look ids 0x16 / 0x17), which Edit opens at 0.
+    shot_fade = AL.look_settings(str(arw)).get("fade")
+    if shot_fade is not None:
+        fade = 10 * shot_fade
+    else:
+        fade = 10 * R.CAMERA_FADE.get(name, 0) if look_id not in (0x16, 0x17) else 0
     return {LOOK_SELECT: 1, WB_MODE: 1, NR_ON: nr, DRO_ON: dro, DRO_LEVEL: level,
             DISTORTION: dist, CA_CORRECTION: ca, CLARITY: MB.clarity_default(look_id), FADE: fade,
             SHARPNESS_FINENESS: 50, SHADE_AMOUNT: 80, SHADE_RADIUS: 0, SHADE_STRENGTH: 0,

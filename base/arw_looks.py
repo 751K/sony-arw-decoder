@@ -38,13 +38,33 @@ def sony_model_id(path):
 
 
 @lru_cache(maxsize=8)
-def _sony_model_id(key):
+def _makernote(key):
     data = sr2._file_bytes(key)
     ifd0 = sr2.ifd(data, struct.unpack_from("<I", data, 4)[0])
     exif = sr2.ifd(data, struct.unpack("<I", ifd0[0x8769][2])[0])
     mn = struct.unpack("<I", exif[0x927c][2])[0]
-    note = sr2.ifd(data, mn + 12 if data[mn:mn + 4] == b"SONY" else mn)
-    return note[0xb001][1][0]
+    return sr2.ifd(data, mn + 12 if data[mn:mn + 4] == b"SONY" else mn)
+
+
+def _sony_model_id(key):
+    return _makernote(key)[0xb001][1][0]
+
+
+# Plain (not enciphered) MakerNote tags holding the shot look's Creative Look sliders.
+LOOK_SETTINGS = {"contrast": 0x2004, "saturation": 0x2005, "shadows": 0x2032, "highlights": 0x2033,
+                 "fade": 0x2034}
+
+
+def look_settings(path):
+    """The camera's Creative Look sliders for the shot look, {name: int}; absent tags are left out
+    (Creative Style bodies have contrast and saturation only)."""
+    note = _makernote(sr2.file_key(path))
+    out = {}
+    for name, tag in LOOK_SETTINGS.items():
+        if tag in note:
+            v = note[tag][1][0] & 0xffffffff
+            out[name] = v - (1 << 32) if v & 0x80000000 else v
+    return out
 
 
 def look_ifds(path):
