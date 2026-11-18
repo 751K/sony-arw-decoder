@@ -20,6 +20,11 @@ import numpy as np
 f32 = np.float32
 DEFAULT_WEIGHTS = (32, 32, 32, 32)          # look+0x1207 when 0x78f7 is absent (Sony's parser, DSC03591)
 
+# Thresholds no uint16 value exceeds, so every pixel passes through unchanged.
+# The Metal path uses these when SSCS is off, so the SSCS kernel (or the fused
+# GeoCorr+SSCS kernel) only interleaves the planes on the GPU.
+PASSTHROUGH = dict(T=65535, tR=65535, tG=65535, tB=65535, w=(0, 0, 0))
+
 
 def params_from_tags(tags, cfa=(0, 1, 1, 2)):
     """tags: {int tag: list of ints} (SR2SubIFD). Returns dict(T, tR, tG, tB, w=(wR, wG, wB))."""

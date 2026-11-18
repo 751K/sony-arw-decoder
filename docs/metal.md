@@ -80,13 +80,13 @@ NumPy 中的部分运算在 float64 下进行，或依赖 NumPy 的正确舍入�
 
 Metal 阶段按两条 command buffer 提交：RawNR → ITP → DRO → GeoCorr/SSCS 为 RAW 链；front/spatial → Marble/Post → interleave 为渲染链。Post 需要 CPU 回填时会在融合调用前完成已排队的 command buffer。设置 `SONYLOOK_METAL_BATCH=0` 可恢复逐阶段提交。
 
-ITP 每个分块只用 3 个 kernel：`load_scale_tile` 生成 s；`itp_edges` 一次算出 ah/av 和 eh/ev/e1/e2 六个平面（马赛克平面就是奇数相位上的 s，各抽头与中心同相位，因此不再单独存储）；`itp_final` 在每个像素上就地计算权重、方向、绿色插值和色度插值（色度输入在它读取的 ±1 邻点上由 s 重算），直接写入整图。原先只在本像素读取的十余个中间平面不再落地，ITP 由约 45 ms 降到约 25 ms，结果逐位不变。`SONYLOOK_ITP_FUSED=1` 使用原来的 9 个 kernel，`=0` 使用逐个 kernel，用于对照。
+ITP 每个分块只用 3 个 kernel：`load_scale_tile` 生成 s；`itp_edges` 一次算出 ah/av 和 eh/ev/e1/e2 六个平面（马赛克平面就是奇数相位上的 s，各抽头与中心同相位，因此不再单独存储）；`itp_final` 在每个像素上就地计算权重、方向、绿色插值和色度插值（色度输入在它读取的 ±1 邻点上由 s 重算），直接写入整图。原先只在本像素读取的十余个中间平面不再落地，ITP 由约 45 ms 降到约 25 ms，结果逐位不变。`itp_final` 只算分块自己的像素，它们距分块边缘至少一个 halo（≥ 10），而所有抽头最远只到 4：分离 kernel 里的越界判断和分块边缘规则在这里全是常量，所以它用的是把这些判断消掉之后的同一组表达式（按像素奇偶各一份）。另外 ah/av/eh/ev/e1/e2 是棋盘格——`(x ^ y)` 为偶数的位置恒为 `+0.0f`——因此 `itp_edges` 只对奇格点派发线程，写成半宽平面；`itp_final` 读到偶格点抽头时直接用常量 0（与原平面里的值相同），每像素约 97 次读取减掉一半。这两项使 ITP 由约 25 ms 降到约 16.5 ms。`tests/verify_metal_itp.py` 在奇数尺寸、末块只有 1 像素宽或高、多种分块尺寸上逐位比较它与分离 kernel（`SONYLOOK_ITP_FUSED=0`）。`SONYLOOK_ITP_FUSED=1` 使用原来的 9 个 kernel，`=0` 使用逐个 kernel，用于对照。
 
 Marble 的颜色转换与半宽色度合为一个 kernel（`marble_in_half`）：每个线程转换一对像素，写出 Y/Cb/Cr 和这对像素的半宽色度，不再整平面重读 Cb/Cr；GPU 时间由 7.6 ms 降到 5.5 ms。`SONYLOOK_MARBLE_HALFC=1` 恢复两个独立 kernel。
 
-Sharpness、YGamma、Spica 和 YCC2RGB 合为一个 kernel（`spatial_fused`）。每个线程组负责 32×32 的输出块：先把带 6 像素边的 Y（44×44）读进线程组内存，再依次算水平模糊（44×38）、竖直模糊 + Sharpness + YGamma（38×38），最后做 Spica 和 YCC2RGB。这样不再生成整幅的 float `hb` 平面和 `yg` 平面（共约 200 MB 临时缓冲），运算顺序与原来三个 kernel 相同。这几步主要受计算限制，合并本身只快约 0.2 ms；省时间的是 Spica 改用 32 位整数：GPU 上的 64 位整数是软件模拟的，而截断结果只要落在 int 范围内就与 64 位相同，超出时最后的 clamp 也得到同样的值（增益曲线在参数端点超过 2^30 时退回 64 位）。合计由 14.5 ms 降到 12.4 ms。`SONYLOOK_SPATIAL_FUSED=0` 恢复三个独立 kernel。其余只在本像素读取的中间平面已检查过：RawNR 的 hp 平面改为在滤波时重算没有收益（两个 kernel 受计算限制）；空间阶段的 Cr/Cb 和 Marble 输出读取的 Y/Cb/Cr 若就地重算，需要重复整个 front 或颜色转换，计算量大于省下的内存流量，因此保留。
+Sharpness、YGamma、Spica 和 YCC2RGB 合为一个 kernel（`spatial_fused`）。每个线程组负责 32×32 的输出块：先把带 6 像素边的 Y（44×44）读进线程组内存，再依次算水平模糊（44×38）、竖直模糊 + Sharpness + YGamma（38×38），最后做 Spica 和 YCC2RGB。这样不再生成整幅的 float `hb` 平面和 `yg` 平面（共约 200 MB 临时缓冲），运算顺序与原来三个 kernel 相同。这几步主要受计算限制，合并本身只快约 0.2 ms；省时间的是 Spica 改用 32 位整数：GPU 上的 64 位整数是软件模拟的，而截断结果只要落在 int 范围内就与 64 位相同，超出时最后的 clamp 也得到同样的值（增益曲线在参数端点超过 2^30 时退回 64 位）。合计由 14.5 ms 降到 12.4 ms。`SONYLOOK_SPATIAL_FUSED=0` 恢复三个独立 kernel。其余只在本像素读取的中间平面已检查过：RawNR 的 hp 平面改为在滤波时重算没有收益（两个 kernel 受计算限制）；GeoCorr + SSCS 并进了 front（`geo_front`）：front 的色相模糊只读本行 ±2 列，所以每个 64×4 的线程组把 68×4 个像素的 GeoCorr/SSCS 结果算进线程组内存（只多算 6%），再从那里算 front，两个阶段之间那幅交错 RGB 不再写出和读回；原来 `geo_sscs_apply` 4.4 ms + `look_front` 5.2 ms，合并后 7.3 ms，整张墙钟时间少 2–3 ms。实现上 `sony_decode` 调 `metal_geo.defer_sscs` 只登记参数，`sony_render` 走整图 Metal front 时取走记录交给 `front_spatial(geo=)`，其他路径则先 `resolve()`（按原 kernel 执行）；`SONYLOOK_GEO_FRONT=0` 关闭。同样的做法不适用于 front → spatial：那里需要四周各 6 像素。Marble 的逐像素整数运算改成 32 位没有收益（`marble_in_half`、`marble_out_packed` 受内存流量限制，改前改后都是 5–5.6 ms）；DRO 的 `dro_div` 只试余数符号一侧的候选反而更慢（多出的分支妨碍展开，7.1 → 8.3 ms）；空间阶段的 Cr/Cb 和 Marble 输出读取的 Y/Cb/Cr 若就地重算，需要重复整个 front 或颜色转换，计算量大于省下的内存流量，因此保留（实测：front 并进 `spatial_fused` 要在 44×44 的块上算 32×32 的输出，多出 0.89 倍 front 计算，约 +5.5 ms，而省下的 Y/Cr/Cb 写入和读取约 3 ms）。front 本身受计算限制，其中色相索引原用 64 位整数除法 `(ni·1024+di)/(2di)`；现在先用 float 估商（误差至多 1），再用 32 位回绕运算求精确余数修正（`di < 2^29` 时余数的真值在 ±2^31 内，回绕结果即真值；更大的差值仍走 64 位除法），Y 的加权和本来只取低 32 位，也改为 32 位回绕乘法。look_front 由 7.7 ms 降到 5.2 ms。
 
-内存：单张 A7M5（7008×4672，DSC03591）解码的峰值内存（含 GPU）约为 16 位 TIFF 1.05 GB、JPEG 1.28 GB、强制 NR+DRO 1.48 GB；同一进程连续解码约 1.5 GB，其中约 1.3 GB 是留给下一张复用的空闲缓冲池（`metal_itp.trim()` 可清空）；`sony_batch.py` 批量 12 张的峰值约 2.55 GB。三项措施：bridge 的每个入口都有自己的 `@autoreleasepool`，否则批处理的命令缓冲区及其用过的全部显存永远不会释放（每张约 300 MB）；批处理中，一个阶段用过的私有临时显存在它返回后就交给后面的阶段复用（同一队列上按顺序执行，Metal 的依赖追踪保证后写在前读之后），而 CPU 会写入的共享缓冲区和辅助队列上的 DRO 网格不参与复用；最终图像直接写进 GeoCorr+SSCS 的输出数组（只有 front 读它），省掉一张全尺寸图。作为对照，Apple Core Image 解码同一张到 16 位 RGBA 约 1.48 GB，rawpy/LibRaw 约 0.61 GB。
+内存：单张 A7M5（7008×4672，DSC03591）解码的峰值内存（含 GPU）约为 16 位 TIFF 1.05 GB、JPEG 1.28 GB、强制 NR+DRO 1.48 GB；同一进程连续解码约 1.5 GB，其中约 1.3 GB 是留给下一张复用的空闲缓冲池（`metal_itp.trim()` 可清空）；`sony_batch.py` 批量 12 张的峰值约 2.55 GB（一个写出线程）；默认两个写出线程时多占一张待写图像，另一组 12 张 A7M5 文件实测为 3.1 GB（一个写出线程 2.9 GB）。三项措施：bridge 的每个入口都有自己的 `@autoreleasepool`，否则批处理的命令缓冲区及其用过的全部显存永远不会释放（每张约 300 MB）；批处理中，一个阶段用过的私有临时显存在它返回后就交给后面的阶段复用（同一队列上按顺序执行，Metal 的依赖追踪保证后写在前读之后），而 CPU 会写入的共享缓冲区和辅助队列上的 DRO 网格不参与复用；最终图像直接写进 GeoCorr+SSCS 的输出数组（只有 front 读它），省掉一张全尺寸图。作为对照，Apple Core Image 解码同一张到 16 位 RGBA 约 1.48 GB，rawpy/LibRaw 约 0.61 GB。
 
 `SONYLOOK_GPU_PROFILE=1` 让每个 encoder 在开始和结束时记录 GPU 时间戳；`sonylook_metal_profile_collect()` 在 GPU 工作完成后累计，`sonylook_metal_profile_report(runs)` 按 kernel 打印每次运行的 GPU 毫秒数（不设置时不采样）。
 
@@ -97,10 +97,10 @@ DSC05740 的分阶段耗时（`--metal`，`SONYLOOK_METAL_BATCH=0 SONYLOOK_RAW_S
 | 阶段 | 耗时 |
 | --- | ---: |
 | 读取 RAW | 21 ms |
-| RawNR + ITP | 30 ms |
+| RawNR + ITP | 26 ms |
 | DRO | 6 ms |
 | GeoCorr + SSCS | 5 ms |
-| 外观链 + 空间阶段 | 20 ms |
+| 外观链 + 空间阶段 | 18 ms |
 | Marble + Effect / ToneCurve / ShadeCorrection | 17 ms |
 
 - 同一进程中首次解码某个文件时，需要读取文件并解析元数据，每张另需约 0.1–0.3 s。
@@ -141,7 +141,7 @@ python3 tests/verify_raw_decode.py photo.ARW [folder ...]
 | `metal/shaders/dro.metal` | DRO，以及正确舍入的除法和定点 `exp2` |
 | `metal/shaders/geo.metal` | GeoCorr |
 | `metal/shaders/sscs.metal` | SSCS，以及 GeoCorr+SSCS 融合 kernel |
-| `metal/shaders/look.metal` | LinearMatrix16 至 ChromaSuppress |
+| `metal/shaders/look.metal` | LinearMatrix16 至 ChromaSuppress，以及 GeoCorr+SSCS+front 融合 kernel |
 | `metal/shaders/spatial.metal` | Sharpness、YGamma、Spica、YCC2RGB |
 | `metal/shaders/marble.metal` | Marble 亮度路径和色度路径 |
 | `metal/shaders/post.metal` | Marble+Post 融合、Effect、ToneCurve、ShadeCorrection，以及带可选移位的 RGB 交错 |

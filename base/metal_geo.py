@@ -45,15 +45,62 @@ def apply(planes, origin, region, lens):
     return tuple(out)
 
 
-def apply_sscs(planes, origin, region, lens, params):
-    """Fused GeoCorr and SSCS, returning interleaved RGB in one GPU pass."""
+def _prepare_sscs(planes, origin, region, lens, params):
     planes, lens_params, tables, n, region = _prepare(planes, origin, region, lens)
     x0, y0, x1, y1 = region
     sscs = np.asarray([params['T'], params['tR'], params['tG'], params['tB'],
                        *params['w']], dtype=np.int32)
     if sscs.shape != (7,):
         raise ValueError("SSCS parameters must include three channel weights")
-    out = metal_itp.empty((y1-y0, x1-x0, 3))
+    return dict(planes=planes, origin=(int(origin[0]), int(origin[1])), region=region,
+                lens_params=lens_params, tables=tables, n=n, sscs=sscs,
+                out=metal_itp.empty((y1-y0, x1-x0, 3)))
+
+
+def apply_sscs(planes, origin, region, lens, params):
+    """Fused GeoCorr and SSCS, returning interleaved RGB in one GPU pass."""
+    return _run_sscs(_prepare_sscs(planes, origin, region, lens, params))
+
+
+# GeoCorr + SSCS left for the look front to run (metal_look.front_spatial with
+# geo=): the front then computes them per threadgroup and the interleaved image
+# between the two stages is never written.  One record at most; it keeps the
+# input planes alive until it is taken or resolved.
+_pending = None
+
+
+def defer_sscs(planes, origin, region, lens, params):
+    """apply_sscs, deferred: returns the output array, not yet written.  Whoever uses it next
+    either take()s the record and runs the fused front, or resolve()s it (the plain kernel)."""
+    global _pending
+    _pending = _prepare_sscs(planes, origin, region, lens, params)
+    return _pending["out"]
+
+
+def pending(out):
+    return _pending is not None and _pending["out"] is out
+
+
+def take(out):
+    """The deferred record for `out` (now the caller's to run), or None."""
+    global _pending
+    rec = _pending if pending(out) else None
+    if rec is not None:
+        _pending = None
+    return rec
+
+
+def resolve(out):
+    """Run a deferred GeoCorr + SSCS into `out` now; no effect when none is pending for it."""
+    rec = take(out)
+    if rec is not None:
+        _run_sscs(rec)
+    return out
+
+
+def _run_sscs(rec):
+    planes, origin, (x0, y0, x1, y1) = rec["planes"], rec["origin"], rec["region"]
+    lens_params, tables, n, sscs, out = rec["lens_params"], rec["tables"], rec["n"], rec["sscs"], rec["out"]
     lib = metal_itp._load()
     lib.sonylook_metal_geo_sscs.argtypes = [
         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,

@@ -3,6 +3,7 @@
 
 Run after building both native libraries: python tests/verify_metal_itp.py [sample.ARW]
 """
+import os
 import sys
 import time
 from pathlib import Path
@@ -59,6 +60,28 @@ def main():
         if not np.array_equal(expected, actual):
             raise AssertionError("batched and original Metal tile outputs differ")
     print('batched and original Metal tile outputs identical')
+    # The default three-pass tiles (interior-only final pass, half-width edge planes) against the
+    # separate kernels with every tile-edge rule (SONYLOOK_ITP_FUSED=0): odd sizes, a last tile
+    # one pixel wide or high, several tile sizes, full-range and flat input.
+    def both(raw, tile):
+        out = []
+        for mode in ('2', '0'):
+            os.environ['SONYLOOK_ITP_FUSED'] = mode
+            out.append([p.copy() for p in metal.full_image(raw, black, gains, scale, cfg.params, tile=tile)])
+        del os.environ['SONYLOOK_ITP_FUSED']
+        return out
+    saved = os.environ.pop('SONYLOOK_ITP_FUSED', None)
+    cases = ((1027, 1051, 384), (1027, 1051, 64), (401, 397, 64), (385, 769, 384), (769, 385, 384),
+             (13, 12, 384), (12, 13, 384), (130, 131, 32), (97, 1025, 96))
+    for h, w, tile in cases:
+        for raw in (rng.integers(0, 65536, (h, w), dtype=np.uint16), rng.integers(0, 16384, (h, w), dtype=np.uint16),
+                    np.full((h, w), 9000, np.uint16)):
+            three, separate = both(raw, tile)
+            if not all(np.array_equal(a, b) for a, b in zip(three, separate)):
+                raise AssertionError(f'{(h, w)} tile {tile}: three-pass and separate-kernel ITP differ')
+    if saved is not None:
+        os.environ['SONYLOOK_ITP_FUSED'] = saved
+    print(f'three-pass and separate-kernel ITP identical on {len(cases)} sizes x 3 inputs')
     if len(sys.argv) > 1:
         import rawpy
         import arw_looks

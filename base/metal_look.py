@@ -168,8 +168,11 @@ def spatial(y, cr, cb, sp: Spatial):
     return out
 
 
-def front_spatial(rgb, look, atan, sp: Spatial, args=None):
-    """LinearMatrix16 through YCC2RGB on uint16 RGB in one GPU pass; returns (R, G, B)."""
+def front_spatial(rgb, look, atan, sp: Spatial, args=None, geo=None):
+    """LinearMatrix16 through YCC2RGB on uint16 RGB in one GPU pass; returns (R, G, B).
+
+    geo: a record from metal_geo.take(rgb).  `rgb` is then the not-yet-written output of a
+    deferred GeoCorr + SSCS, and both run inside the front (geo_front) without writing it."""
     rgb = np.ascontiguousarray(rgb, dtype=np.uint16)
     table = np.ascontiguousarray(look.table, dtype=np.float32)
     gamma = np.ascontiguousarray(look.gamma, dtype=np.int16)
@@ -179,6 +182,24 @@ def front_spatial(rgb, look, atan, sp: Spatial, args=None):
     args = front_args(look) if args is None else args
     out = _planes(*rgb.shape[:2])
     lib = metal_itp._load()
+    if geo is not None:
+        planes, (x0, y0, x1, y1) = geo["planes"], geo["region"]
+        if (y1 - y0, x1 - x0) != rgb.shape[:2]:
+            raise ValueError("deferred GeoCorr region does not match the image")
+        lib.sonylook_metal_geo_front_spatial.argtypes = (
+            [ctypes.c_void_p] * 3 + [ctypes.c_uint32] * 2 + [ctypes.c_int32] * 4 + [ctypes.c_uint32] * 2
+            + [ctypes.c_void_p] * 4 + [ctypes.c_uint32] + [ctypes.c_void_p] * 4
+            + [ctypes.POINTER(FrontArgs), ctypes.POINTER(SpatialArgs)] + [ctypes.c_void_p] * 6)
+        rc = lib.sonylook_metal_geo_front_spatial(
+            *(p.ctypes.data for p in planes), planes[0].shape[1], planes[0].shape[0],
+            *geo["origin"], x0, y0, x1 - x0, y1 - y0,
+            geo["lens_params"].ctypes.data, *(t.ctypes.data for t in geo["tables"]), geo["n"],
+            geo["sscs"].ctypes.data, table.ctypes.data, gamma.ctypes.data, atan.ctypes.data,
+            ctypes.byref(args), ctypes.byref(sp.args), sp.ylut.ctypes.data, sp.patterns.ctypes.data,
+            sp.coefs.ctypes.data, *(v.ctypes.data for v in out))
+        if rc:
+            raise RuntimeError(lib.sonylook_metal_error().decode())
+        return out
     lib.sonylook_metal_front_spatial.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32] + \
         [ctypes.c_void_p] * 3 + [ctypes.POINTER(FrontArgs), ctypes.POINTER(SpatialArgs)] + [ctypes.c_void_p] * 6
     rc = lib.sonylook_metal_front_spatial(rgb.ctypes.data, rgb.shape[1], rgb.shape[0], table.ctypes.data,

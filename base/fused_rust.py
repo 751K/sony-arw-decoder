@@ -744,7 +744,8 @@ def rawnr(raw, look, iso=100, settings=(0, 0, 0), strength_override=None, thread
 class DroParams(ctypes.Structure):
     _fields_ = [(k, ctypes.c_int64) for k in ("org_x", "org_y", "cw", "ch", "nx", "ny")] + [
         (k, ctypes.c_float) for k in ("log2_max", "strength", "k_up", "k_down", "scale")] + [
-        (k, ctypes.c_void_p) for k in ("w_grid", "s_grid", "curve", "log_t")]
+        (k, ctypes.c_void_p) for k in ("w_grid", "s_grid", "curve", "log_t")] + [
+        ("nb", ctypes.c_int64), ("kbin", ctypes.c_float)]
 
 
 def dro_vatr(planes, origin, G, strength=1.0, k_up=1.0, k_down=1.0, scale=1.0, threads=0):
@@ -756,19 +757,21 @@ def dro_vatr(planes, origin, G, strength=1.0, k_up=1.0, k_down=1.0, scale=1.0, t
     if g.shape != (h, w) or b.shape != (h, w):
         raise ValueError("planes must have the same shape")
     geo = G["geo"]
-    if G["nb"] != 14:
-        raise ValueError("the Rust DRO expects 14 histogram bins")
+    nb, kbin = int(G["nb"]), int(G.get("k", 1))
+    if (nb, kbin) not in ((14, 1), (28, 2)):
+        raise ValueError("the Rust DRO expects 14 bins (Edit) or 28 half-unit bins (camera)")
     W = np.ascontiguousarray(G["W"], np.float32)
     S = np.ascontiguousarray(G["S"], np.float32)
     curve = np.ascontiguousarray(G["curve"], np.float32)
     log_t = np.ascontiguousarray(DRO.LOG_T, np.float32)
-    if W.shape != (geo["ny"], geo["nx"], 14) or S.shape != W.shape or curve.shape != (104,) or log_t.shape != (2049,):
+    if W.shape != (geo["ny"], geo["nx"], nb) or S.shape != W.shape or curve.shape != (104,) or log_t.shape != (2049,):
         raise ValueError("unexpected DRO grid shapes")
     p = DroParams(org_x=geo["org_x"], org_y=geo["org_y"], cw=geo["subpx_x"] * geo["nsub"],
                   ch=geo["subpx_y"] * geo["nsub"], nx=geo["nx"], ny=geo["ny"],
                   log2_max=float(DRO.LOG2_MAX), strength=float(strength), k_up=float(k_up),
                   k_down=float(k_down), scale=float(scale),
-                  w_grid=W.ctypes.data, s_grid=S.ctypes.data, curve=curve.ctypes.data, log_t=log_t.ctypes.data)
+                  w_grid=W.ctypes.data, s_grid=S.ctypes.data, curve=curve.ctypes.data, log_t=log_t.ctypes.data,
+                  nb=nb, kbin=float(kbin))
     outs = [np.empty((h, w), np.uint16) for _ in range(3)]
     fn = _load_symbol("dro_vatr_u16")
     fn.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_size_t, ctypes.c_size_t, ctypes.c_int64, ctypes.c_int64,

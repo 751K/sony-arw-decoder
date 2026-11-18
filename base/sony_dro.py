@@ -33,15 +33,23 @@ BIN_W = np.array([0.8828129768371582, 0.6054689884185791, 0.3242189884185791, 0.
 BLEND = np.array([1, .75, .5, .25, 0, 0, 0, 0, 0, .25, .5, .75, 1, 1], f32)   # 0x1002ed088 -> dro+0x104
 
 # The camera's grid (model="camera"), fitted to the local brightness the camera's own HEIFs imply
-# (2026-11-16: a colour chart and three room scenes, Lv1-Lv5 inverted jointly; not Edit).  Same cells,
-# smoothing, end-bin blend and per-pixel operator as Edit; three differences in the analysis:
-#   samples   log2(0.1495 R + 0.32 G + 0.057 B)   (Edit: 0.1495 R + 0.057 (G + B))
-#   bins      one log2 unit wide, matching Vatr's lookup of L   (Edit: 14 / log2(8191) per unit)
-#   kernel    Gaussian, sigma 2.4 bins   (Edit: BIN_W, about 1.4)
+# (2026-11-16/18: a colour chart, five room scenes and display test patterns, Lv1-Lv5 inverted jointly;
+# not Edit).  Same cells, cross smoothing and per-pixel operator as Edit; differences in the analysis:
+#   samples   log2(s (0.1495 R + 0.32 G + 0.057 B)), s = 0.665   (Edit: 0.1495 R + 0.057 (G + B))
+#   bins      28, half a log2 unit wide; Vatr looks them up at 2 L   (Edit: 14 / log2(8191) per unit)
+#   sums      each bin also sums its samples' log2 values, so S / W is a weighted mean of sample values
+#             rather than of bin indices and follows L continuously on smooth areas   (Edit: bin index)
+#   kernel    Gaussian, sigma 2.3 log2 units   (Edit: BIN_W, about 1.4 bins)
+#   blend     Edit's end-bin blend per log2 unit, linear in between, towards the bin's value j / 2
 MODELS = ("camera", "edit")
-CAMERA_G = f32(0.32)
-CAMERA_SIGMA = 2.4
-CAMERA_W = np.exp(-np.arange(9, dtype=np.float64) ** 2 / (2 * CAMERA_SIGMA ** 2)).astype(f32)
+CAMERA_K = 2                                             # bins per log2 unit
+CAMERA_NB = 14 * CAMERA_K
+CAMERA_SCALE = 0.665
+CAMERA_COEF = tuple(f32(c * CAMERA_SCALE) for c in (0.1495, 0.32, 0.057))
+CAMERA_SIGMA = 2.3
+CAMERA_W = np.exp(-(np.arange(CAMERA_NB, dtype=np.float64) / CAMERA_K) ** 2
+                  / (2 * CAMERA_SIGMA ** 2)).astype(f32)           # by bin distance
+CAMERA_BLEND = np.interp(np.arange(CAMERA_NB) / CAMERA_K, np.arange(14), BLEND.astype(np.float64)).astype(f32)
 
 
 
@@ -90,7 +98,7 @@ def grid_geometry(w, h, nx=8, ny=6, nsub=14, step=4):
 
 def raw_samples(raw, geo, black=(512, 512, 512), model="edit"):
     """FUN_1000fc734 (u16 raw, dro+0x46 = 1): log-luminance of every step-th RGGB quad.
-    model="camera" weights G with CAMERA_G instead (see MODELS)."""
+    model="camera" uses CAMERA_COEF instead (see MODELS)."""
     p = raw.astype(np.int64)
     ys = geo["org_y"] + geo["step"] * np.arange(geo["ns_y"])
     xs = geo["org_x"] + geo["step"] * np.arange(geo["ns_x"])
@@ -99,7 +107,7 @@ def raw_samples(raw, geo, black=(512, 512, 512), model="edit"):
     g = np.maximum((((p[Y + 1, X] + p[Y, X + 1]) >> 1) - black[1]).astype(f32), f32(0))
     b = np.maximum((p[Y + 1, X + 1] - black[2]).astype(f32), f32(0))
     if model == "camera":
-        v = (fma32(COEF[2], b, fma32(CAMERA_G, g, (r * COEF[0]).astype(f32))) * K54).astype(f32)
+        v = (fma32(CAMERA_COEF[2], b, fma32(CAMERA_COEF[1], g, (r * CAMERA_COEF[0]).astype(f32))) * K54).astype(f32)
     else:
         v = (fma32((b + g).astype(f32), COEF[2], (r * COEF[0]).astype(f32)) * K54).astype(f32)
     return log_lookup(v)
@@ -185,35 +193,49 @@ def build_grid(raw, knots, ctrl, black=(512, 512, 512), model="edit"):
     samples = raw_samples(raw, geo, black, model)
     sub = subcell_means(samples, geo)
     ny, nx, n = geo["ny"], geo["nx"], geo["nsub"]
-    nb = 14
+    nb = CAMERA_NB if cam else 14
     cells = sub.reshape(ny, n, nx, n).transpose(0, 2, 1, 3).reshape(ny, nx, n * n)
     hist = np.zeros((ny, nx, nb), f32)
+    val = np.zeros((ny, nx, nb), f32)                    # camera: sum of the samples' log2 values per bin
     inc = f32(f32(1.0) / f32(n * n))
     inv70 = f32(f32(1.0) / LOG2_MAX)
     for i in range(n * n):
         v = cells[..., i]
         if cam:
-            b = np.minimum(np.maximum(v, f32(0)).astype(np.int64), nb - 1)
+            b = np.minimum(np.maximum((v * f32(CAMERA_K)).astype(f32), f32(0)).astype(np.int64), nb - 1)
         else:
             b = np.maximum(((v * f32(nb)).astype(f32) * inv70).astype(f32), f32(0)).astype(np.int64)
             b = b - (b == nb)
         for yy in range(ny):
             for xx in range(nx):
                 hist[yy, xx, b[yy, xx]] = f32(hist[yy, xx, b[yy, xx]] + inc)
+                if cam:
+                    val[yy, xx, b[yy, xx]] = fma32(v[yy, xx], inc, val[yy, xx, b[yy, xx]])
     sm = smooth_cells(hist)
+    smv = smooth_cells(val) if cam else None
     W = np.zeros_like(sm); S = np.zeros_like(sm)
     for j in range(nb):
         w_ = np.zeros((ny, nx), f32); s_ = np.zeros((ny, nx), f32)
         for k in range(nb):
-            wt = (CAMERA_W if cam else BIN_W)[min(abs(j - k), 8)]
             hk = sm[..., k]
-            w_ = fma32(hk, wt, w_)
-            s_ = fma32((hk * wt).astype(f32), f32(k), s_)
-        diff = fma32(w_, f32(j), -s_)                                   # fnmsub: W*j - S, one rounding
-        S[..., j] = fma32(BLEND[j], diff, s_)
+            if cam:
+                wt = CAMERA_W[abs(j - k)]
+                w_ = fma32(hk, wt, w_)
+                s_ = fma32(smv[..., k], wt, s_)
+            else:
+                wt = BIN_W[min(abs(j - k), 8)]
+                w_ = fma32(hk, wt, w_)
+                s_ = fma32((hk * wt).astype(f32), f32(k), s_)
+        if cam:
+            diff = fma32(w_, f32(j / CAMERA_K), -s_)                    # towards the bin's value j / 2
+            S[..., j] = fma32(CAMERA_BLEND[j], diff, s_)
+        else:
+            diff = fma32(w_, f32(j), -s_)                               # fnmsub: W*j - S, one rounding
+            S[..., j] = fma32(BLEND[j], diff, s_)
         W[..., j] = w_
     return dict(geo=geo, samples=samples, sub=sub, cells=cells, hist=hist, smooth=sm, S=S, W=W,
-                curve=curve_table(knots, ctrl), nb=nb)
+                curve=curve_table(knots, ctrl), nb=nb, k=CAMERA_K if cam else 1,
+                **(dict(val=val, smooth_val=smv) if cam else {}))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -236,6 +258,8 @@ def grid_lookup(G, x, y, L):
     j0, j1, dy0, dy1 = _axis(y, g["org_y"] + (ch >> 1), ch, g["ny"])
     nb = G["nb"]
     L = np.asarray(L, f32)
+    if G.get("k", 1) != 1:                       # camera grid: bins of 1 / k log2 unit (exact scaling)
+        L = (L * f32(G["k"])).astype(f32)
     b = np.floor(np.maximum(L, 0)).astype(np.int64)
     f = (L - np.floor(L)).astype(f32)
     b1 = np.where(b < nb - 2, b + 1, nb - 1)

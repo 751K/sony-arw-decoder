@@ -13,10 +13,17 @@ def set_model(model):
     if model not in sony_dro.MODELS:
         raise ValueError(f"unknown DRO model {model!r}")
     lib = metal_itp._load()
-    lib.sonylook_metal_dro_model.argtypes = [ctypes.c_uint32, ctypes.c_float, ctypes.c_void_p]
+    lib.sonylook_metal_dro_model.argtypes = [ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+    coef = np.ascontiguousarray(sony_dro.CAMERA_COEF, np.float32)
     kw = np.ascontiguousarray(sony_dro.CAMERA_W, np.float32)
-    if lib.sonylook_metal_dro_model(int(model == "camera"), float(sony_dro.CAMERA_G), kw.ctypes.data):
+    blend = np.ascontiguousarray(sony_dro.CAMERA_BLEND, np.float32)
+    assert kw.shape == blend.shape == (28,)
+    if lib.sonylook_metal_dro_model(int(model == "camera"), coef.ctypes.data, kw.ctypes.data, blend.ctypes.data):
         raise RuntimeError(lib.sonylook_metal_error().decode())
+
+
+def _bins(model):
+    return sony_dro.CAMERA_NB if model == "camera" else 14
 
 
 def _common(raw, black, curve, origin):
@@ -37,8 +44,8 @@ def prepare(raw, black, curve, *, origin=(0, 0), strength=1.0,
     """Start DRO grid analysis on the auxiliary Metal queue and return W/S arrays."""
     raw, black, curve = _common(raw, black, curve, origin)
     set_model(model)
-    weights = metal_itp.empty((6, 8, 14), np.float32)
-    sums = metal_itp.empty((6, 8, 14), np.float32)
+    weights = metal_itp.empty((6, 8, _bins(model)), np.float32)
+    sums = metal_itp.empty((6, 8, _bins(model)), np.float32)
     lib = metal_itp._load()
     lib.sonylook_metal_dro_grid.argtypes = [
         ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
@@ -69,8 +76,8 @@ def prepare_view(source, offset, size, black, curve, *, origin=(0, 0), strength=
     if w < 448 or h < 336:
         raise ValueError("DRO raw grid requires at least 448 x 336 pixels")
     set_model(model)
-    weights = metal_itp.empty((6, 8, 14), np.float32)
-    sums = metal_itp.empty((6, 8, 14), np.float32)
+    weights = metal_itp.empty((6, 8, _bins(model)), np.float32)
+    sums = metal_itp.empty((6, 8, _bins(model)), np.float32)
     lib = metal_itp._load()
     lib.sonylook_metal_dro_grid_view.argtypes = [
         ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
@@ -96,8 +103,9 @@ def apply_prepared(planes, grid, black, curve, *, origin=(0, 0), strength=1.0,
     black = np.ascontiguousarray(black, dtype=np.int32)
     if len(planes) != 3 or any(p.shape != planes[0].shape for p in planes):
         raise ValueError("expected three identically shaped 2D planes")
-    if weights.shape != (6, 8, 14) or sums.shape != (6, 8, 14):
+    if weights.shape not in ((6, 8, 14), (6, 8, sony_dro.CAMERA_NB)) or sums.shape != weights.shape:
         raise ValueError("invalid DRO grid")
+    set_model("camera" if weights.shape[2] == sony_dro.CAMERA_NB else "edit")   # bins tell the model
     if raw_size is None:
         raw_size = (planes[0].shape[1] + 2 * max(origin[0], 0),
                     planes[0].shape[0] + 2 * max(origin[1], 0))
@@ -129,8 +137,8 @@ def apply(raw, planes, black, curve, *, origin=(0, 0), strength=1.0,
         raise ValueError("expected three identically shaped 2D planes")
     out = [metal_itp.empty(p.shape) for p in planes]
     sub = np.empty((84, 112), np.float32) if debug else None
-    W = np.empty((6, 8, 14), np.float32) if debug else None
-    S = np.empty((6, 8, 14), np.float32) if debug else None
+    W = np.empty((6, 8, _bins(model)), np.float32) if debug else None
+    S = np.empty((6, 8, _bins(model)), np.float32) if debug else None
     lib = metal_itp._load()
     lib.sonylook_metal_dro.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,

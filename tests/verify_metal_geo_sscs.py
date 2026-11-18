@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Compare fused Metal GeoCorr+SSCS with the separate Metal and NumPy paths."""
+"""Compare fused Metal GeoCorr+SSCS with the separate Metal and NumPy paths.
+
+With an ARW (for its looks) it also compares GeoCorr+SSCS run inside the look front
+(geo_front: metal_geo.defer_sscs + metal_look.front_spatial(geo=)) with the two stages
+run one after the other."""
 import sys
 from pathlib import Path
 
@@ -9,7 +13,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "base"))
 import fused_rust
 import metal_geo
 import metal_itp
+import metal_look
 import metal_sscs
+import sony_detail
+import sony_look
+import sony_render
 import sony_lens
 import sony_sscs
 
@@ -77,6 +85,35 @@ def main():
     print("synthetic GeoCorr+SSCS: fused, separate Metal, Rust and NumPy identical")
 
     if len(sys.argv) > 1:
+        # geo_front works on 64 x 4 threadgroups with two extra columns per side: sizes around
+        # those multiples, odd sizes, the 7 x 7 minimum, full-range input, SSCS on and off.
+        looks = sony_render.load_looks(sys.argv[1])
+        atan, _ = sony_look.load_static_tables()
+        detail = dict(sharp=sony_detail.sharpness_params(),
+                      spica=(sony_detail.load_srsettings(), sony_detail.spica_params(100)), dev208=0, dev2c4=50)
+        cases = 0
+        for name, mode in (("Standard", 0), ("Vivid", 1)):
+            look = sony_render.Look(name, looks, output_mode=mode, use_rust=True)
+            sp = metal_look.Spatial(look, detail)
+            for (h, w), prm in zip(((7, 7), (9, 63), (8, 64), (7, 65), (12, 66), (13, 127), (131, 233), (64, 128), (67, 193)),
+                                   params * 3):
+                for prm in (prm, sony_sscs.PASSTHROUGH):
+                    region = (-32, -20, -32 + w, -20 + h)
+                    for top in (65536, 16384):
+                        planes = [rng.integers(0, top, (171, 233), dtype=np.uint16) for _ in range(3)]
+                        lin = metal_geo.apply_sscs(planes, origin, region, lens, prm)
+                        separate = [p.copy() for p in metal_look.front_spatial(lin, look, atan, sp)]
+                        out = metal_geo.defer_sscs(planes, origin, region, lens, prm)
+                        fused = metal_look.front_spatial(out, look, atan, sp, geo=metal_geo.take(out))
+                        if not all(np.array_equal(a, b) for a, b in zip(separate, fused)):
+                            raise AssertionError(f"{name} {(h, w)}: GeoCorr+SSCS inside the front differs")
+                        # resolve() must give the plain kernel's image
+                        out = metal_geo.defer_sscs(planes, origin, region, lens, prm)
+                        if not np.array_equal(metal_geo.resolve(out), lin) or metal_geo.pending(out):
+                            raise AssertionError("a resolved deferred GeoCorr+SSCS differs")
+                        cases += 1
+        print(f"GeoCorr+SSCS inside the look front: identical to the separate stages ({cases} cases)")
+
         lens = sony_lens.lens_from_arw(sys.argv[1])
         params = sony_sscs.params_from_arw(sys.argv[1])
         shape = (512, 700)

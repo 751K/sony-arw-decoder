@@ -8,17 +8,38 @@ struct FrontArgs {
     int c0,c1,c2; float k8,k9,k10,k11,gcr_pos,gcr_neg,gcb_pos,gcb_neg;
     float area[16]; int area_flag; int w9,w12,w8,w11;
 };
-inline float look_blur(device const ushort *rgb,uint x,uint y,uint w,uint channel) {
-    uint i=(y*w+x)*3+channel;float a,b;
+// The five-tap row blur of one channel: i is that channel's element of pixel
+// x in an interleaved row (device memory, or geo_front's threadgroup tile).
+template<typename P>
+inline float look_blur(P rgb,uint i,uint x,uint w) {
+    float a,b;
     if(x==0)return fma(float(rgb[i+3]),8.0f,fma(float(rgb[i]),23.0f,float(rgb[i+6])))*0.03125f;
     if(x==1)return fma(float(rgb[i+3]),8.0f,fma(float(rgb[i]),14.0f,fma(float(rgb[i-3]),9.0f,float(rgb[i+6]))))*0.03125f;
     if(x==w-2){a=float(rgb[i+3])+float(rgb[i-3]);b=fma(float(rgb[i]),14.0f,float(rgb[i-6]))+float(rgb[i+3]);return fma(a,8.0f,b)*0.03125f;}
     if(x==w-1)return fma(float(rgb[i]),23.0f,fma(float(rgb[i-3]),8.0f,float(rgb[i-6])))*0.03125f;
     a=float(rgb[i+3])+float(rgb[i-3]);b=fma(float(rgb[i]),14.0f,float(rgb[i-6]))+float(rgb[i+6]);return fma(a,8.0f,b)*0.03125f;
 }
-inline int3 look_encode(device const ushort *rgb,device const float *table,device const short *gamma,device const float *atan_tab,uint2 p,uint width,constant float *thresholds) {
-    uint i=(p.y*width+p.x)*3;float r=rgb[i],g=rgb[i+1],b=rgb[i+2];
-    float br=look_blur(rgb,p.x,p.y,width,0),bg=look_blur(rgb,p.x,p.y,width,1),bb=look_blur(rgb,p.x,p.y,width,2);
+// (ni*1024 + di) / (2*di) for 0 <= ni <= di (num is the smaller of the two
+// differences, or 0), clamped to [0, 511], without 64-bit division: a float
+// estimate (off by at most 1), then the exact remainder ni*1024 + di - 2*q*di.
+// For di < 2^29 its true value stays within +-2^31, so 32-bit wrapping
+// arithmetic gives it exactly; the loops move q onto 0 <= remainder < 2*di.
+// Larger di (differences of 32768 or more) keep the 64-bit division.
+inline int hue_index(int ni,int di) {
+    if(di>=(1<<29))return clamp(int((long(ni)*1024L+di)/(long(di)*2L)),0,511);
+    int q=int(fma(float(ni)/float(di),512.0f,0.5f));
+    uint n1024=uint(ni)*1024u,d=uint(di);
+    int r=int(n1024+d-uint(2*q)*d);
+    while(r<0){q--;r+=2*di;}
+    while(r>=2*di){q++;r-=2*di;}
+    return clamp(q,0,511);
+}
+// LinearMatrix16 + MainGamma for the pixel whose R element is rgb[i]; x and
+// width are its column and the image width (the blur's edge rules).
+template<typename P>
+inline int3 look_encode_at(P rgb,uint i,uint x,uint width,device const float *table,device const short *gamma,device const float *atan_tab,constant float *thresholds) {
+    float r=rgb[i],g=rgb[i+1],b=rgb[i+2];
+    float br=look_blur(rgb,i,x,width),bg=look_blur(rgb,i+1,x,width),bb=look_blur(rgb,i+2,x,width);
     // The blur is an exact multiple of 1/32 for uint16 input. Summing its
     // integer numerator preserves the reference's double-precision luma.
     int luma_num=int(br*32.0f)*109+int(bg*32.0f)*366+int(bb*32.0f)*37;
@@ -28,8 +49,7 @@ inline int3 look_encode(device const ushort *rgb,device const float *table,devic
     float num=big?fb:fa,den=big?(aa==0?1.0f:fa):(bc==0?1.0f:fb);
     // Differences are multiples of 1/16384. Integer division reproduces the
     // reference's float64 ratio and round-to-nearest at hue-bin boundaries.
-    long ni=long(num*16384.0f),di=long(den*16384.0f);
-    int index=clamp(int((ni*1024L+di)/(di*2L)),0,511);
+    int index=hue_index(int(num*16384.0f),int(den*16384.0f));
     float hue=abs(atan_tab[index]+offh);int hi=int(hue);if(hi<0||hi>1022)hi=1023;
     device const float *t=table+hi*18;float sq0=r*r,sq1=g*g,sq2=b*b;int enc[3];
     for(int row=0;row<3;row++) {
@@ -41,6 +61,9 @@ inline int3 look_encode(device const ushort *rgb,device const float *table,devic
         enc[row]=int(short(int(trunc(fma(t1-t0,frac,t0)))));
     }
     return int3(enc[0],enc[1],enc[2]);
+}
+inline int3 look_encode(device const ushort *rgb,device const float *table,device const short *gamma,device const float *atan_tab,uint2 p,uint width,constant float *thresholds) {
+    return look_encode_at(rgb,(p.y*width+p.x)*3,p.x,width,table,gamma,atan_tab,thresholds);
 }
 kernel void look_lm_gamma(device const ushort *rgb [[buffer(0)]],device const float *table [[buffer(1)]],device const short *gamma [[buffer(2)]],device const float *atan_tab [[buffer(3)]],device short *out [[buffer(4)]],constant LookArgs &a [[buffer(5)]],uint2 p [[thread_position_in_grid]]) {
     if(p.x>=a.width||p.y>=a.height)return;
@@ -69,8 +92,9 @@ inline ushort scale_chroma(ushort v,int f) {
 }
 inline ushort pack_chroma(float v) { return ushort(clamp(int(trunc(v+32768.0f)),0,0xffff)); }
 inline void ycc_front(int3 enc,constant FrontArgs &a,device ushort *yo,device ushort *cro,device ushort *cbo,uint o) {
-    long sum=long(enc.x)*long(a.c0)+long(enc.y)*long(a.c1)+long(enc.z)*long(a.c2);
-    ushort yv=ushort((uint(sum)>>13)&0xffffu);
+    // Only the low 32 bits of the 64-bit sum are used: wrapping 32-bit products give them.
+    uint sum=uint(enc.x)*uint(a.c0)+uint(enc.y)*uint(a.c1)+uint(enc.z)*uint(a.c2);
+    ushort yv=ushort((sum>>13)&0xffffu);
     int rg=enc.x-enc.y,bgc=enc.z-enc.y;float s3=float(rg),s4=float(bgc);
     float cb0=fma(rg<0?a.k9:a.k8,s3,s4),cr0=fma(bgc<0?a.k11:a.k10,s4,s3);
     float cr=(cr0*0.5f)*(cr0<0?a.gcr_neg:a.gcr_pos),cb=(cb0*0.5f)*(cb0<0?a.gcb_neg:a.gcb_pos);
@@ -96,4 +120,48 @@ kernel void look_front(device const ushort *rgb [[buffer(0)]],device const float
 kernel void encoded_front(device const short *enc [[buffer(0)]],device ushort *yo [[buffer(1)]],device ushort *cro [[buffer(2)]],device ushort *cbo [[buffer(3)]],constant FrontArgs &a [[buffer(4)]],uint2 p [[thread_position_in_grid]]) {
     if(p.x>=a.width||p.y>=a.height)return;
     uint o=p.y*a.width+p.x,i=o*3;ycc_front(int3(enc[i],enc[i+1],enc[i+2]),a,yo,cro,cbo,o);
+}
+
+// GeoCorr + SSCS + the look front in one pass, without the interleaved RGB
+// image between them. The front's hue blur reads its row at x +- 2, so a
+// threadgroup computes GeoCorr/SSCS for its 64 x 4 pixels plus two columns on
+// each side (68 x 4, 6% more than once per pixel) into threadgroup memory
+// and runs the front from there. Each value is computed exactly as by
+// geo_sscs_apply and look_front.
+#define GF_W 64
+#define GF_H 4
+#define GF_TW (GF_W+4)
+struct GeoFrontArgs { GeoSscsArgs gs; FrontArgs f; };
+kernel void geo_front(device const ushort *r [[buffer(0)]],device const ushort *g [[buffer(1)]],device const ushort *b [[buffer(2)]],
+                      device const float *tr [[buffer(3)]],device const float *tg [[buffer(4)]],device const float *tb [[buffer(5)]],
+                      device const float *table [[buffer(6)]],device const short *gamma [[buffer(7)]],device const float *atan_tab [[buffer(8)]],
+                      device ushort *yo [[buffer(9)]],device ushort *cro [[buffer(10)]],device ushort *cbo [[buffer(11)]],
+                      constant GeoFrontArgs &a [[buffer(12)]],uint2 grp [[threadgroup_position_in_grid]],
+                      uint2 lt [[thread_position_in_threadgroup]],uint2 tsz [[threads_per_threadgroup]]) {
+    threadgroup ushort T[GF_TW*GF_H*3];
+    int w=int(a.f.width),h=int(a.f.height),X0=int(grp.x)*GF_W,Y0=int(grp.y)*GF_H;
+    uint tid=lt.y*tsz.x+lt.x,nt=tsz.x*tsz.y;
+    for(uint k=tid;k<GF_TW*GF_H;k+=nt) {
+        int gx=X0-2+int(k%GF_TW),gy=Y0+int(k/GF_TW);
+        ushort r0=0,g0=0,b0=0;
+        if(gx>=0&&gx<w&&gy<h) {
+            float px=float(a.gs.geo.region_x)+float(gx),py=float(a.gs.geo.region_y)+float(gy);
+            float dx=px-a.gs.geo.cx,dy=py-a.gs.geo.cy;
+            float radius=sqrt(fma(dy,dy,dx*dx)),t=(a.gs.geo.s2*radius)/a.gs.geo.step;
+            int i0=int(floor(max(t,0.0f)));bool inside=i0<int(a.gs.geo.n)-1;
+            int i=clamp(i0,0,int(a.gs.geo.n)-2);float frac=t-float(i);
+            r0=geo_channel(r,tr,a.gs.geo,px,py,i,frac,inside,0);
+            g0=geo_channel(g,tg,a.gs.geo,px,py,i,frac,inside,1);
+            b0=geo_channel(b,tb,a.gs.geo,px,py,i,frac,inside,2);
+            sscs_pixel(r0,g0,b0,a.gs.sscs);
+        }
+        T[3*k]=r0;T[3*k+1]=g0;T[3*k+2]=b0;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for(uint k=tid;k<GF_W*GF_H;k+=nt) {
+        int lx=int(k%GF_W),ly=int(k/GF_W),px=X0+lx,py=Y0+ly;
+        if(px>=w||py>=h)continue;
+        int3 e=look_encode_at((threadgroup const ushort *)T,uint(ly*GF_TW+lx+2)*3u,uint(px),uint(w),table,gamma,atan_tab,a.f.thresholds);
+        ycc_front(e,a.f,yo,cro,cbo,uint(py)*uint(w)+uint(px));
+    }
 }

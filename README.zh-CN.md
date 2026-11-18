@@ -89,7 +89,7 @@ export_image = decode("photo.ARW", metal=True, output_bits=16)
 
 `--highlights`（Python 中为 `highlights=`）可选 `camera`（默认）或 `edit`。相机直出的 JPEG 和 HEIF 不做 Edit 的近饱和色彩抑制（SSCS）和 ChromaSuppress。若做这两步，G 通道已饱和的亮色会偏白：色卡曝光包围中，+2 EV 与相机 HEIF 的 ΔE2000 为 1.93，不做时为 0.43。`edit` 保留这两步，与 Edit 导出逐位一致。细节见 docs/pipeline.md §10.3。
 
-`--dro-model`（Python 中为 `dro_model=`）可选 `camera`（默认）或 `edit`，只在 DRO 开启时起作用。两者使用同一条 ARW 曲线和同一个逐像素算子，区别在于局部亮度的估计：`camera` 采用按相机 HEIF 拟合的网格（按亮度加权的样本、1 档宽的 bin、更宽的亮度维核），色卡 Lv1–Lv5 与相机 HEIF 的 ΔE2000 由 0.55–1.86 降至 0.31–0.79；`edit` 与 Edit 的网格逐位一致。两者都读取整个传感器缓冲区，与 Edit 相同。细节见 docs/pipeline.md §3.3。
+`--dro-model`（Python 中为 `dro_model=`）可选 `camera`（默认）或 `edit`，只在 DRO 开启时起作用。两者使用同一条 ARW 曲线和同一个逐像素算子，区别在于局部亮度的估计：`camera` 采用按相机 HEIF 拟合的网格（按亮度加权的样本、半档宽且同时累加样本值的 bin、更宽的亮度维核），色卡 Lv1–Lv5 与相机 HEIF 的 ΔE2000 由 0.55–1.86 降至 0.27–0.72，平滑区域与相机的一致性也明显提高；`edit` 与 Edit 的网格逐位一致。两者都读取整个传感器缓冲区，与 Edit 相同。细节见 docs/pipeline.md §3.3。
 
 ### 批量处理
 
@@ -100,7 +100,7 @@ python3 base/sony_batch.py ~/Pictures/2025 --out-dir out-p3 --metal --color-spac
 python3 base/sony_batch.py ~/Pictures/2025 --out-dir out-hif --format hif --metal
 ```
 
-`--format hif`（或 `--out photo.hif`）通过 Core Image 写出 10 位 HEIF，由 Apple 的硬件编码器做 HEVC 编码（仅限 macOS；`--bits 8` 输出 8 位）。A7M5 图像在默认质量 95 下约 6–9 MB，与解码结果相比 PSNR 51 dB（同质量的 8 位 JPEG 为 4 MB、46 dB）。写一张约 150 ms，所以批量输出 HEIF 时默认用两个写出线程；文件已在系统缓存中时每张约 79 ms。ICC 配置文件和其他格式一样嵌入。
+`--format hif`（或 `--out photo.hif`）通过 Core Image 写出 10 位 HEIF，由 Apple 的硬件编码器做 HEVC 编码（仅限 macOS；`--bits 8` 输出 8 位）。A7M5 图像在默认质量 95 下约 6–9 MB，与解码结果相比 PSNR 51 dB（同质量的 8 位 JPEG 为 4 MB、46 dB）。写一张约 150 ms（JPEG 约 100 ms，都比解码一张慢），所以批量处理默认用两个写出线程；输出 HEIF、文件已在系统缓存中时每张约 79 ms。ICC 配置文件和其他格式一样嵌入。
 
 文件夹会递归查找，输出保留原来的子目录结构；默认输出 8 位 JPEG（`--format tif` 输出 16 位 TIFF，每张约 200 MB）。解码选项与 `sony_decode.py` 相同。读取后面的文件、解码、编码写出前面的图片三者同时进行，输出与逐张单独解码逐字节相同。出错的文件（例如损坏的文件）会报告并跳过。在上面的 Mac mini 上，输出 JPEG 并使用 `--metal` 时：文件已在系统缓存中，每张约 87 ms（逐张串行为 151 ms）；从外接 USB 固态硬盘读取，每张 126–162 ms（串行为 267–354 ms），此时瓶颈是硬盘约 300 MB/s 的读取速度。结束时的汇总行会把时间拆分为解码、等待读取和等待写出。
 

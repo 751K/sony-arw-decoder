@@ -60,7 +60,7 @@ def collect(inputs, out_dir, ext):
     return jobs
 
 
-def run(jobs, decode_kw, write_kw, *, read_ahead=2, writers=1, skip_existing=False, log=print):
+def run(jobs, decode_kw, write_kw, *, read_ahead=2, writers=2, skip_existing=False, log=print):
     """Decode and write every (arw, out) job; returns the list of (arw, error) failures."""
     look = decode_kw.get("look")
     decode_kw = {k: v for k, v in decode_kw.items() if k != "look"}
@@ -142,8 +142,8 @@ def main():
     ap.add_argument("--skip-existing", action="store_true", help="leave files whose output exists")
     ap.add_argument("--read-ahead", type=int, default=2, help="files read ahead of the decoder")
     ap.add_argument("--writers", type=int, default=None,
-                    help="image encoding/writing threads (default 2 for HEIF, whose encode is slower "
-                         "than a decode, else 1); each holds one more image in memory")
+                    help="image encoding/writing threads (default 2: one JPEG or HEIF encode takes "
+                         "longer than a decode); each holds one more image in memory")
     SD.add_decode_arguments(ap)
     a = ap.parse_args()
     ext = FORMATS[a.format]
@@ -151,7 +151,7 @@ def main():
     jobs = collect(a.inputs, a.out_dir, ext)
     failures = run(jobs, SD.decode_kwargs(a, output_bits), SD.write_kwargs(a, output_bits),
                    read_ahead=max(0, a.read_ahead),
-                   writers=a.writers if a.writers else (2 if ext in EXP.HEIF_EXTS else 1),
+                   writers=a.writers or 2,
                    skip_existing=a.skip_existing)
     for arw, exc in failures:
         print(f"failed: {arw}: {type(exc).__name__}: {exc}", file=sys.stderr)

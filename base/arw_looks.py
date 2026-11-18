@@ -28,7 +28,12 @@ def _fmt(typ, val):
 
 def main_tags(path):
     """SR2SubIFD tags as {'0x7310': '512 512 512 512', ...} (strings / ints, like the look IFDs)."""
-    _, _, sub = sr2_block(str(path))
+    return dict(_main_tags(sr2.file_key(str(path))))
+
+
+@lru_cache(maxsize=4)
+def _main_tags(key):
+    _, _, sub = sr2._sr2_block(key)
     return {f"0x{k:04x}": _fmt(*sub[k][:2]) for k in sorted(sub)}
 
 
@@ -69,7 +74,12 @@ def look_settings(path):
 
 def look_ifds(path):
     """{ColorMode name: {'0x7842': ..., ..., 'ColorMode': name}} for every look stored in the file."""
-    blk, off, sub = sr2_block(str(path))
+    return {k: dict(v) for k, v in _look_ifds(sr2.file_key(str(path))).items()}
+
+
+@lru_cache(maxsize=4)
+def _look_ifds(key):
+    blk, off, sub = sr2._sr2_block(key)
     out = {}
     for o in sub[0x74c0][1]:
         t = sr2.ifd(blk, o, base=off)

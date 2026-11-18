@@ -20,13 +20,13 @@ pub struct DroParams {
     pub k_up: f32,
     pub k_down: f32,
     pub scale: f32,
-    pub w_grid: *const f32, // ny x nx x 14
-    pub s_grid: *const f32, // ny x nx x 14
+    pub w_grid: *const f32, // ny x nx x nb
+    pub s_grid: *const f32, // ny x nx x nb
     pub curve: *const f32,  // 104
     pub log_t: *const f32,  // 2049
+    pub nb: i64,            // histogram bins: 14 (Edit) or 28 (camera, half a log2 unit)
+    pub kbin: f32,          // bins per log2 unit at the lookup: 1 or 2
 }
-
-const NB: i64 = 14;
 const COEF: [f32; 3] = [0.1495, 0.2935, 0.057];
 
 #[inline(always)]
@@ -71,12 +71,12 @@ unsafe impl Sync for Grid<'_> {}
 
 impl Grid<'_> {
     #[inline(always)]
-    fn get(a: &[f32], nx: i64, j: i64, i: i64, b: i64) -> f32 {
-        let b = b.min(NB + 1);
-        if b >= NB {
+    fn get(a: &[f32], nx: i64, nb: i64, j: i64, i: i64, b: i64) -> f32 {
+        let b = b.min(nb + 1);
+        if b >= nb {
             0.0 // bins past the end read 0
         } else {
-            a[((j * nx + i) * NB + b) as usize]
+            a[((j * nx + i) * nb + b) as usize]
         }
     }
 
@@ -91,19 +91,21 @@ impl Grid<'_> {
         let py = (p.scale * y as f32) as i64;
         let (i0, i1, dx0, dx1) = axis(px, p.org_x + (p.cw >> 1), p.cw, p.nx);
         let (j0, j1, dy0, dy1) = axis(py, p.org_y + (p.ch >> 1), p.ch, p.ny);
-        let b = l.max(0.0).floor() as i64;
-        let f = l - l.floor();
-        let b1 = if b < NB - 2 { b + 1 } else { NB - 1 };
+        let nb = p.nb;
+        let lb = l * p.kbin; // exact (1 or 2)
+        let b = lb.max(0.0).floor() as i64;
+        let f = lb - lb.floor();
+        let b1 = if b < nb - 2 { b + 1 } else { nb - 1 };
         let (sx, sy) = (dx0 + dx1, dy0 + dy1);
         let (fdx0, fdx1, fdy0, fdy1) = (dx0 as f32, dx1 as f32, dy0 as f32, dy1 as f32);
         let inv = if sx != 0 { 1.0f32 / sx as f32 } else { 0.0 };
         let sy_f = sy.max(1) as f32;
         let interp = |a: &[f32], bb: i64| -> f32 {
             let nx = p.nx;
-            let a0 = Self::get(a, nx, j0, i0, bb);
-            let a1 = Self::get(a, nx, j0, i1, bb);
-            let a2 = Self::get(a, nx, j1, i0, bb);
-            let a3 = Self::get(a, nx, j1, i1, bb);
+            let a0 = Self::get(a, nx, nb, j0, i0, bb);
+            let a1 = Self::get(a, nx, nb, j0, i1, bb);
+            let a2 = Self::get(a, nx, nb, j1, i0, bb);
+            let a3 = Self::get(a, nx, nb, j1, i1, bb);
             let (top, bot) = if sx != 0 {
                 (a1.mul_add(fdx0, a0 * fdx1) * inv, a3.mul_add(fdx0, a2 * fdx1) * inv)
             } else {
@@ -163,10 +165,10 @@ pub unsafe extern "C" fn dro_vatr_u16(
         return -1;
     }
     let p = &*params;
-    if p.nx < 1 || p.ny < 1 || p.w_grid.is_null() || p.s_grid.is_null() || p.curve.is_null() || p.log_t.is_null() {
+    if p.nx < 1 || p.ny < 1 || !(p.nb == 14 || p.nb == 28) || !(p.kbin == 1.0 || p.kbin == 2.0) || p.w_grid.is_null() || p.s_grid.is_null() || p.curve.is_null() || p.log_t.is_null() {
         return -1;
     }
-    let ncell = (p.nx * p.ny * NB) as usize;
+    let ncell = (p.nx * p.ny * p.nb) as usize;
     let grid = Grid {
         p,
         w: slice::from_raw_parts(p.w_grid, ncell),

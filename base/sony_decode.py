@@ -361,6 +361,8 @@ def decode(arw, look=None, *, output="srgb", raw=None, nr=None, dro=None, marble
     if highlights == "camera":
         sscs = False
     sscs_params = SC.params_from_tags(tags) if sscs else None
+    if sscs_params is None and metal_sscs:
+        sscs_params = SC.PASSTHROUGH    # interleave on the GPU; no CPU sync or copy
     fused_geo_sscs = False
     L = None
     if lens:
@@ -373,7 +375,10 @@ def decode(arw, look=None, *, output="srgb", raw=None, nr=None, dro=None, marble
             import metal_geo as MG
             region = (ox, oy, ox + W, oy + H)
             if metal_sscs and sscs_params is not None:
-                lin = MG.apply_sscs(planes, (ox, oy), region, L, sscs_params)
+                # With the Metal look the front runs GeoCorr + SSCS itself (render takes the
+                # deferred record), so the interleaved image between them is never written.
+                defer = metal_look and os.environ.get("SONYLOOK_GEO_FRONT", "1") != "0"
+                lin = (MG.defer_sscs if defer else MG.apply_sscs)(planes, (ox, oy), region, L, sscs_params)
                 fused_geo_sscs = True
             else:
                 planes = list(MG.apply(planes, (ox, oy), region, L))

@@ -57,6 +57,12 @@ def check_ycc(rng, looks, atan):
             same(f'{name} NumPy', numpy_ycc(encoded, look, None if area is None else (area, 1)), actual)
             rgb = rng.integers(0, 16384, (97, 133, 3), dtype=np.uint16)
             same(f'{name} fused', fused_rust.front_u16(rgb, cfg), metal_look.front(rgb, look, atan, args))
+            # Full 16-bit input: hue differences of 32768 and more take the GPU's 64-bit division
+            # (look.metal hue_index); the rest its 32-bit remainder path.
+            wide = rng.integers(0, 65536, (97, 133, 3), dtype=np.uint16)
+            wide[:8, :, 0], wide[:8, :, 1:] = 65535, 0
+            wide[8:16, :, :2], wide[8:16, :, 2] = 0, 65535
+            same(f'{name} fused 16-bit', fused_rust.front_u16(wide, cfg), metal_look.front(wide, look, atan, args))
         print(f'{name}, output mode {mode}: YCC, AreaComp and ChromaSuppress identical (Rust and NumPy)')
 
 

@@ -466,6 +466,16 @@ class Look:
                 metal_itp.end()
                 metal_batch = False
 
+        # A GeoCorr + SSCS that sony_decode deferred (metal_geo.defer_sscs): the
+        # whole-image Metal front runs it itself; any other path needs lin written.
+        geo = None
+        MG = sys.modules.get("metal_geo")
+        if MG is not None and MG.pending(lin):
+            if metal_spatial and metal_look and sscs is None:
+                geo = MG.take(lin)
+            else:
+                MG.resolve(lin)
+
         # Only the front/spatial -> Marble/Post chain stays in the batch. Every
         # other path reads lin (or GPU front planes) on the CPU, or submits
         # its own command buffer, so the RAW chain must complete first.
@@ -716,7 +726,7 @@ class Look:
                 MI.begin()
                 metal_batch = True
             t = time.perf_counter()
-            pre = ML.front_spatial(lin, self, atan, ML.Spatial(self, detail))
+            pre = ML.front_spatial(lin, self, atan, ML.Spatial(self, detail), geo=geo)
             # Only the front reads lin, so with reuse_input the final image can be
             # written over it (encoded after the front on the same queue).
             if reuse_input and lin.shape == (H, W, 3) and lin.dtype == np.uint16 and MI.resident(lin):

@@ -16,7 +16,7 @@ static id<MTLSharedEvent> raw_event;
 static uint64_t raw_stream_base;
 static uint64_t grid_event_value;
 static uint64_t pending_grid_value;
-#define NPIPE 58
+#define NPIPE 59
 static id<MTLComputePipelineState> pipelines[NPIPE];
 static char error_text[2048];
 const char *sonylook_metal_error(void) { return error_text; }
@@ -311,7 +311,7 @@ int sonylook_metal_init(const char *path) { @autoreleasepool {
         }
         library=[d newLibraryWithSource:source options:opts error:&err]; if(!library) return fail(err.description);
     }
-    NSArray *names=@[@"scale_raw",@"differences",@"candidates",@"weights",@"green_inputs",@"green_five",@"average_pairs",@"direction_errors",@"direction",@"green_finish",@"chroma_inputs",@"chroma_finish",@"load_tile",@"store_tile",@"dro_subcells",@"dro_histogram",@"dro_smooth",@"dro_weights",@"dro_apply",@"geo_apply",@"sscs_apply",@"look_lm_gamma",@"look_front",@"encoded_front",@"sharp_hblur",@"sharp_apply",@"spica_ycc",@"marble_in",@"marble_blocks",@"marble_sigma",@"marble_binom",@"marble_out",@"post_apply",@"nr_split",@"nr_filter",@"marble_halfc",@"marble_cblocks",@"marble_csigma",@"marble_cup",@"dro_math_test",@"interleave3",@"geo_sscs_apply",@"candidates_both",@"green_inputs_five",@"green_finish_fused",@"dro_smooth_weights",@"marble_out_post",@"load_scale_tile",@"weights_candidates",@"marble_out_packed",@"dro_fix_args",@"dro_apply_fix",@"dro_apply_exact",@"itp_edges",@"itp_final",@"marble_in_half",@"spatial_fused",@"lut_u16"];
+    NSArray *names=@[@"scale_raw",@"differences",@"candidates",@"weights",@"green_inputs",@"green_five",@"average_pairs",@"direction_errors",@"direction",@"green_finish",@"chroma_inputs",@"chroma_finish",@"load_tile",@"store_tile",@"dro_subcells",@"dro_histogram",@"dro_smooth",@"dro_weights",@"dro_apply",@"geo_apply",@"sscs_apply",@"look_lm_gamma",@"look_front",@"encoded_front",@"sharp_hblur",@"sharp_apply",@"spica_ycc",@"marble_in",@"marble_blocks",@"marble_sigma",@"marble_binom",@"marble_out",@"post_apply",@"nr_split",@"nr_filter",@"marble_halfc",@"marble_cblocks",@"marble_csigma",@"marble_cup",@"dro_math_test",@"interleave3",@"geo_sscs_apply",@"candidates_both",@"green_inputs_five",@"green_finish_fused",@"dro_smooth_weights",@"marble_out_post",@"load_scale_tile",@"weights_candidates",@"marble_out_packed",@"dro_fix_args",@"dro_apply_fix",@"dro_apply_exact",@"itp_edges",@"itp_final",@"marble_in_half",@"spatial_fused",@"lut_u16",@"geo_front"];
     if(names.count!=NPIPE) return fail(@"Metal kernel table size mismatch");
     pipeline_names=names;
     id<MTLComputePipelineState> ps[NPIPE];
@@ -387,7 +387,13 @@ static void encode_tile_scaled(id<MTLCommandBuffer> cmd, id source, NSArray *v, 
 static void encode_tile_three(id<MTLCommandBuffer> cmd,id source,NSArray *v,Args *a,id R,id G,id B) {
     id<MTLComputeCommandEncoder> e=new_encoder(cmd,101);
     itp_dispatch_encoder(e,47,@[source,v[0]],a);[e memoryBarrierWithScope:MTLBarrierScopeBuffers];
-    itp_dispatch_encoder(e,53,@[v[0],v[1],v[2],v[13],v[14],v[3],v[4]],a);[e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    // itp_edges: one thread per odd-parity pixel, into half-width planes.
+    NSArray *edges=@[v[0],v[1],v[2],v[13],v[14],v[3],v[4]];
+    [e setComputePipelineState:pipelines[53]];
+    for(NSUInteger i=0;i<edges.count;i++)bind(e,edges[i],i);
+    [e setBytes:a length:sizeof(*a) atIndex:edges.count];
+    [e dispatchThreads:MTLSizeMake((a->width+1)/2,a->height,1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];
+    [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
     NSArray *fin=@[v[0],v[1],v[2],v[13],v[14],v[3],v[4],R,G,B];
     [e setComputePipelineState:pipelines[54]];
     for(NSUInteger i=0;i<fin.count;i++)bind(e,fin[i],i);
@@ -500,17 +506,23 @@ typedef struct {
     uint32_t fix_capacity;
     uint32_t src_stride,src_x,src_y;
     uint32_t model;
-    float coef_g;
-    float kw[9];
+    uint32_t nb;
+    float coef_r,coef_g,coef_b;
+    float kw[28];
+    float cblend[28];
 } DroArgs;
-// DRO grid model for the following grid calls: 0 Edit, 1 camera (sony_dro.MODELS).
-static uint32_t dro_model=0;static float dro_coef_g=0.0f,dro_kw[9];
-int sonylook_metal_dro_model(uint32_t model,float coef_g,const float *kw) {
-    if(model>1||(model&&!kw))return fail(@"Invalid DRO model");
-    dro_model=model;dro_coef_g=coef_g;
-    for(int i=0;i<9;i++)dro_kw[i]=model?kw[i]:0.0f;
+// DRO grid model for the following grid calls: 0 Edit (14 bins), 1 camera (28 bins; sony_dro.MODELS).
+// coef: the camera's 3 sample weights, kw / blend: its 28-entry range kernel and end-bin blend.
+static uint32_t dro_model=0;static float dro_coef[3],dro_kw[28],dro_blend[28];
+int sonylook_metal_dro_model(uint32_t model,const float *coef,const float *kw,const float *blend) {
+    if(model>1||(model&&(!coef||!kw||!blend)))return fail(@"Invalid DRO model");
+    dro_model=model;
+    for(int i=0;i<3;i++)dro_coef[i]=model?coef[i]:0.0f;
+    for(int i=0;i<28;i++){dro_kw[i]=model?kw[i]:0.0f;dro_blend[i]=model?blend[i]:0.0f;}
     return 0;
 }
+static size_t dro_grid_bytes(void){return (size_t)8*6*(dro_model?28:14)*4;}   // one W or S grid
+#define DRO_HIST_BYTES ((size_t)2*8*6*28*4)                                       // counts + value sums
 static void dispatch_dro(id<MTLCommandBuffer> cmd,int kernel,NSArray *buffers,DroArgs *args, uint32_t w,uint32_t h) {
     id<MTLComputeCommandEncoder> e=new_encoder(cmd,kernel);[e setComputePipelineState:pipelines[kernel]];
     for(NSUInteger i=0;i<buffers.count;i++)bind(e,buffers[i],i);
@@ -550,7 +562,8 @@ static DroArgs make_dro_args(uint32_t raww,uint32_t rawh,uint32_t w,uint32_t h,c
     a.subpx_x=((raww>>2)/112)*4;a.subpx_y=((rawh>>2)/84)*4;a.per_x=a.subpx_x/4;a.per_y=a.subpx_y/4;
     a.org_x=((raww-a.subpx_x*112)>>1)&~1u;a.org_y=((rawh-a.subpx_y*84)>>1)&~1u;
     a.src_stride=raww;a.src_x=0;a.src_y=0;
-    a.model=dro_model;a.coef_g=dro_coef_g;memcpy(a.kw,dro_kw,sizeof(a.kw));
+    a.model=dro_model;a.nb=dro_model?28:14;a.coef_r=dro_coef[0];a.coef_g=dro_coef[1];a.coef_b=dro_coef[2];
+    memcpy(a.kw,dro_kw,sizeof(a.kw));memcpy(a.cblend,dro_blend,sizeof(a.cblend));
     return a;
 }
 // The grid from a raww x rawh crop at (src_x, src_y) of a GPU-resident
@@ -577,7 +590,7 @@ int sonylook_metal_dro_grid_view(const uint16_t *src,uint32_t src_stride,uint32_
     // The grid finishes asynchronously on aux_queue. W/S are read by a later
     // call, so they must be resident arrays (metal_itp.empty), never pooled
     // copies that would need a copy-back.
-    id Wb=find_resident(weights,8*6*14*4),Sb=find_resident(sums,8*6*14*4);
+    id Wb=find_resident(weights,dro_grid_bytes()),Sb=find_resident(sums,dro_grid_bytes());
     if(!Wb||!Sb)return fail(@"Metal DRO grid outputs must be GPU-resident arrays");
     NSUInteger mark;@synchronized(buf_lock){mark=call_bufs.count;}
     size_t srclen=(size_t)src_stride*src_rows*2;
@@ -586,7 +599,7 @@ int sonylook_metal_dro_grid_view(const uint16_t *src,uint32_t src_stride,uint32_
     id rawbuf=wait?find_resident(src,srclen):in_buf(src,srclen),tab=in_buf(logtab,2049*4);
     if(wait&&!rawbuf)return fail(@"Streamed DRO grid needs a GPU-resident source");
     no_batch_free=1;            // these run on the auxiliary queue
-    id sub=acquire(112*84*4,MTLResourceStorageModeShared),hist=acquire(8*6*14*4,MTLResourceStorageModePrivate);
+    id sub=acquire(112*84*4,MTLResourceStorageModeShared),hist=acquire(DRO_HIST_BYTES,MTLResourceStorageModePrivate);
     no_batch_free=0;
     if(!rawbuf||!tab||!sub||!hist)return fail(@"Metal DRO grid allocation failed");
     // Temporaries live until the aux command buffer completes, not until the
@@ -616,7 +629,7 @@ int sonylook_metal_dro_grid_apply(const uint16_t *r,const uint16_t *g,const uint
     DroArgs a=make_dro_args(raww,rawh,w,h,black,ox,oy,log2_max,strength,k_up,k_down,scale);
     size_t n=(size_t)w*h;
     id rb=in_buf(r,n*2),gb=in_buf(g,n*2),bb=in_buf(b,n*2),tab=in_buf(logtab,2049*4),cv=in_buf(curve,104*4);
-    id Wb=in_buf(weights,8*6*14*4),Sb=in_buf(sums,8*6*14*4);
+    id Wb=in_buf(weights,dro_grid_bytes()),Sb=in_buf(sums,dro_grid_bytes());
     id R=out_buf(ro,n*2),G=out_buf(go,n*2),B=out_buf(bo,n*2);
     if(!rb||!gb||!bb||!tab||!cv||!Wb||!Sb||!R||!G||!B)return fail(@"Prepared Metal DRO allocation failed");
     id<MTLCommandBuffer> cmd=command_buffer();
@@ -633,8 +646,8 @@ int sonylook_metal_dro(const uint16_t *raw,uint32_t raww,uint32_t rawh,const uin
     id<MTLBuffer> rawbuf=in_buf(raw,(size_t)raww*rawh*2);
     id<MTLBuffer> rb=in_buf(r,n*2);id<MTLBuffer> gb=in_buf(g,n*2);id<MTLBuffer> bb=in_buf(b,n*2);
     id<MTLBuffer> tab=in_buf(logtab,2049*4);id<MTLBuffer> cv=in_buf(curve,104*4);
-    id<MTLBuffer> sub=acquire(112*84*4,MTLResourceStorageModeShared);id<MTLBuffer> hist=acquire(8*6*14*4,MTLResourceStorageModePrivate);
-    id<MTLBuffer> W=acquire(8*6*14*4,MTLResourceStorageModeShared);id<MTLBuffer> S=acquire(8*6*14*4,MTLResourceStorageModeShared);
+    id<MTLBuffer> sub=acquire(112*84*4,MTLResourceStorageModeShared);id<MTLBuffer> hist=acquire(DRO_HIST_BYTES,MTLResourceStorageModePrivate);
+    id<MTLBuffer> W=acquire(dro_grid_bytes(),MTLResourceStorageModeShared);id<MTLBuffer> S=acquire(dro_grid_bytes(),MTLResourceStorageModeShared);
     id R=out_buf(ro,n*2),G=out_buf(go,n*2),B=out_buf(bo,n*2);
     if(!rawbuf||!rb||!gb||!bb||!tab||!cv||!sub||!hist||!W||!S||!R||!G||!B)return fail(@"Metal DRO buffer allocation failed");
     id<MTLCommandBuffer> cmd=command_buffer();
@@ -643,7 +656,7 @@ int sonylook_metal_dro(const uint16_t *raw,uint32_t raww,uint32_t rawh,const uin
     int rc=submit_command(cmd);if(rc)return rc;
     copy_back(R,ro,n*2);copy_back(G,go,n*2);copy_back(B,bo,n*2);
     if(!batch_cmd) {
-        if(debug_sub)memcpy(debug_sub,sub.contents,112*84*4);if(debug_w)memcpy(debug_w,W.contents,8*6*14*4);if(debug_s)memcpy(debug_s,S.contents,8*6*14*4);
+        if(debug_sub)memcpy(debug_sub,sub.contents,112*84*4);if(debug_w)memcpy(debug_w,W.contents,dro_grid_bytes());if(debug_s)memcpy(debug_s,S.contents,dro_grid_bytes());
     }
     return done(0);
 }}
@@ -859,6 +872,40 @@ int sonylook_metal_front_spatial(const uint16_t *rgbin,uint32_t w,uint32_t h,con
     encode_grid(cmd,22,[@[rgbb,tab,gb,ab] arrayByAddingObjectsFromArray:ycc],&fa,sizeof(fa),w,h);
     if(encode_spatial(cmd,ycc[0],ycc[1],ycc[2],w,h,args,ylut,patterns,coefs,rgb))return -1;
     return finish_rgb(cmd,rgb,n,r,g,b);
+}}
+
+// GeoCorr + SSCS + the look front + the spatial stages: front_spatial with
+// the interleaved RGB between GeoCorr/SSCS and the front left out (geo_front
+// computes it per threadgroup). r/g/b are the w x h planes GeoCorr reads; the
+// image is ow x oh.
+typedef struct { GeoSscsArgs gs; FrontArgs f; } GeoFrontArgs;
+int sonylook_metal_geo_front_spatial(const uint16_t *r,const uint16_t *g,const uint16_t *b,uint32_t w,uint32_t h,
+                                     int32_t ox,int32_t oy,int32_t rx,int32_t ry,uint32_t ow,uint32_t oh,
+                                     const float *lens,const float *tr,const float *tg,const float *tb,uint32_t n,
+                                     const int32_t *params,const float *table,const int16_t *gamma,const float *atan,
+                                     const FrontArgs *front,const SpatialArgs *args,const int16_t *ylut,const int32_t *patterns,
+                                     const float *coefs,uint16_t *R,uint16_t *G,uint16_t *B) { @autoreleasepool {
+    if(!device||!r||!g||!b||!w||!h||ow<7||oh<7||n<2||!lens||!tr||!tg||!tb||!params||!table||!gamma||!atan||!front||!args||!ylut||!patterns||!coefs||!R||!G||!B)
+        return fail(@"Invalid Metal GeoCorr/front/spatial arguments");
+    GeoFrontArgs a={.gs={.geo={.width=w,.height=h,.output_width=ow,.output_height=oh,.origin_x=ox,.origin_y=oy,
+                               .region_x=rx,.region_y=ry,.cx=lens[0],.cy=lens[1],.s=lens[2],.s2=lens[3],.step=lens[4],.n=n},
+                         .sscs={.width=ow,.height=oh,.t=params[0],.tr=params[1],.tg=params[2],.tb=params[3],
+                                .wr=params[4],.wg=params[5],.wb=params[6]}},.f=*front};
+    memcpy(a.gs.geo.off,lens+5,sizeof(a.gs.geo.off));a.f.width=ow;a.f.height=oh;
+    size_t count=(size_t)w*h,n_out=(size_t)ow*oh;
+    id rb=in_buf(r,count*2),gb=in_buf(g,count*2),bb=in_buf(b,count*2);
+    id rt=in_buf(tr,n*4),gt=in_buf(tg,n*4),bt=in_buf(tb,n*4);
+    id tab=in_buf(table,1024*18*4),gmb=in_buf(gamma,65536*2),ab=in_buf(atan,512*4);
+    NSArray *ycc=new_buffers(3,n_out*2,MTLResourceStorageModePrivate),*rgb=out3(R,G,B,n_out*2);
+    if(!rb||!gb||!bb||!rt||!gt||!bt||!tab||!gmb||!ab||!ycc||!rgb)return fail(@"Metal GeoCorr/front/spatial buffer allocation failed");
+    id<MTLCommandBuffer> cmd=command_buffer();
+    id<MTLComputeCommandEncoder> e=new_encoder(cmd,58);[e setComputePipelineState:pipelines[58]];
+    NSArray *bufs=[@[rb,gb,bb,rt,gt,bt,tab,gmb,ab] arrayByAddingObjectsFromArray:ycc];
+    for(NSUInteger i=0;i<bufs.count;i++)bind(e,bufs[i],i);
+    [e setBytes:&a length:sizeof(a) atIndex:bufs.count];
+    [e dispatchThreadgroups:MTLSizeMake((ow+63)/64,(oh+3)/4,1) threadsPerThreadgroup:MTLSizeMake(64,4,1)];[e endEncoding];
+    if(encode_spatial(cmd,ycc[0],ycc[1],ycc[2],ow,oh,args,ylut,patterns,coefs,rgb))return -1;
+    return finish_rgb(cmd,rgb,n_out,R,G,B);
 }}
 
 typedef struct { uint32_t width,height,capacity; int32_t effect,conv,m_fwd[9],m_inv[9]; float t_r,t_b,c_hi[3],c_lo[3]; int32_t tone,shade,cw,ch; float g_hi[11],g_lo[11],d_hi[10],d_lo[10]; uint32_t diff_zero,lo_one; int32_t c10_one; } PostArgs;

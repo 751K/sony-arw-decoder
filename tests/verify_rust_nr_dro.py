@@ -54,8 +54,13 @@ def check_rawnr(path, raw):
 
 
 def check_dro(path, raw):
+    for model in sony_dro.MODELS:
+        check_dro_model(path, raw, model)
+
+
+def check_dro_model(path, raw, model):
     x0, y0, x1, y1 = decoder_params.crop_rect(path)
-    G = sony_dro.build_grid(raw[y0:y1, x0:x1], *sony_dro.curve_points_from_arw(path))
+    G = sony_dro.build_grid(raw, *sony_dro.curve_points_from_arw(path), model=model)
     rng = np.random.default_rng(5)
     n = 0
     for strength, k_up, k_down in ((1.0, 1.0, 1.0), (0.6, 1.3, 0.7), (1.4, 0.5, 1.0)):
@@ -80,7 +85,7 @@ def check_dro(path, raw):
             e[ya:yb] = c
     tn = time.perf_counter() - t
     same('DRO full image', expected, actual)
-    print(f'DRO: {n} crops and a {W} x {H} image identical; NumPy {tn:.2f} s, Rust {tr:.3f} s')
+    print(f'DRO ({model}): {n} crops and a {W} x {H} image identical; NumPy {tn:.2f} s, Rust {tr:.3f} s')
 
 
 def image(h, w, seed):
