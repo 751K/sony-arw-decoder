@@ -132,16 +132,10 @@ kernel void spica_ycc(device const ushort *yg [[buffer(0)]],device const ushort 
 #define SP_T 32
 #define SP_YW (SP_T+12)              // Y tile: image (X0-6.., Y0-6..)
 #define SP_HW (SP_T+6)               // hb tile: rows Y0-6.., columns X0-3..; yg tile: (X0-3.., Y0-3..)
-kernel void spatial_fused(device const ushort *y [[buffer(0)]],device const ushort *cr [[buffer(1)]],device const ushort *cb [[buffer(2)]],
-                          device const short *lut [[buffer(3)]],device const int *patterns [[buffer(4)]],device const float *coefs [[buffer(5)]],
-                          device ushort *ro [[buffer(6)]],device ushort *go [[buffer(7)]],device ushort *bo [[buffer(8)]],
-                          constant SpatialArgs &a [[buffer(9)]],uint2 tg [[threadgroup_position_in_grid]],
-                          uint2 lt [[thread_position_in_threadgroup]],uint2 tsz [[threads_per_threadgroup]]) {
-    threadgroup ushort Y[SP_YW*SP_YW];
-    threadgroup float HB[SP_YW*SP_HW];
-    threadgroup ushort YG[SP_HW*SP_HW];
-    int w=int(a.width),h=int(a.height),X0=int(tg.x)*SP_T,Y0=int(tg.y)*SP_T;
-    uint tid=lt.y*tsz.x+lt.x,nt=tsz.x*tsz.y;
+// Fills YG (the yg tile) for the output tile at (X0, Y0).
+inline void spatial_tile(device const ushort *y,device const short *lut,constant SpatialArgs &a,int X0,int Y0,uint tid,uint nt,
+                         threadgroup ushort *Y,threadgroup float *HB,threadgroup ushort *YG) {
+    int w=int(a.width),h=int(a.height);
     for(uint k=tid;k<SP_YW*SP_YW;k+=nt){
         int gx=X0-6+int(k%SP_YW),gy=Y0-6+int(k/SP_YW);
         Y[k]=(gx>=0&&gx<w&&gy>=0&&gy<h)?y[uint(gy)*uint(w)+uint(gx)]:ushort(0);
@@ -168,16 +162,34 @@ kernel void spatial_fused(device const ushort *y [[buffer(0)]],device const usho
         YG[k]=ygamma(v,lut,a);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    // Spica and YCC2RGB: spica_ycc on the yg tile.
+}
+// Spica and YCC2RGB for image pixel (px, py) of the tile: spica_ycc on the yg tile.
+inline void spatial_pixel(threadgroup const ushort *YG,device const ushort *cr,device const ushort *cb,device const int *patterns,
+                          device const float *coefs,constant SpatialArgs &a,int X0,int Y0,int px,int py,thread ushort *rgb) {
+    int w=int(a.width),h=int(a.height);
+    int li=(py-Y0+3)*SP_HW+(px-X0+3);
+    uint i=uint(py)*uint(w)+uint(px);int yc=int(YG[li]),yv=yc;
+    if(px>=3&&px<w-3&&py>=3&&py<h-3) {
+        yv=spica_value(YG,li,SP_HW,yc,patterns,coefs,a);
+    }
+    int crv=int(cr[i])-0x8000,cbv=int(cb[i])-0x8000,yy=yv*10000;
+    rgb[0]=div_clip(crv*0x36c4+yy);rgb[1]=div_clip(crv*-0x1be5+yy+cbv*-0xd71);rgb[2]=div_clip(cbv*0x4538+yy);
+}
+kernel void spatial_fused(device const ushort *y [[buffer(0)]],device const ushort *cr [[buffer(1)]],device const ushort *cb [[buffer(2)]],
+                          device const short *lut [[buffer(3)]],device const int *patterns [[buffer(4)]],device const float *coefs [[buffer(5)]],
+                          device ushort *ro [[buffer(6)]],device ushort *go [[buffer(7)]],device ushort *bo [[buffer(8)]],
+                          constant SpatialArgs &a [[buffer(9)]],uint2 tg [[threadgroup_position_in_grid]],
+                          uint2 lt [[thread_position_in_threadgroup]],uint2 tsz [[threads_per_threadgroup]]) {
+    threadgroup ushort Y[SP_YW*SP_YW];
+    threadgroup float HB[SP_YW*SP_HW];
+    threadgroup ushort YG[SP_HW*SP_HW];
+    int w=int(a.width),h=int(a.height),X0=int(tg.x)*SP_T,Y0=int(tg.y)*SP_T;
+    uint tid=lt.y*tsz.x+lt.x,nt=tsz.x*tsz.y;
+    spatial_tile(y,lut,a,X0,Y0,tid,nt,Y,HB,YG);
     for(uint k=tid;k<SP_T*SP_T;k+=nt){
         int px=X0+int(k%SP_T),py=Y0+int(k/SP_T);
         if(px>=w||py>=h)continue;
-        int li=(py-Y0+3)*SP_HW+(px-X0+3);
-        uint i=uint(py)*uint(w)+uint(px);int yc=int(YG[li]),yv=yc;
-        if(px>=3&&px<w-3&&py>=3&&py<h-3) {
-            yv=spica_value((threadgroup const ushort *)YG,li,SP_HW,yc,patterns,coefs,a);
-        }
-        int crv=int(cr[i])-0x8000,cbv=int(cb[i])-0x8000,yy=yv*10000;
-        ro[i]=div_clip(crv*0x36c4+yy);go[i]=div_clip(crv*-0x1be5+yy+cbv*-0xd71);bo[i]=div_clip(cbv*0x4538+yy);
+        ushort rgb[3];spatial_pixel(YG,cr,cb,patterns,coefs,a,X0,Y0,px,py,rgb);
+        uint i=uint(py)*uint(w)+uint(px);ro[i]=rgb[0];go[i]=rgb[1];bo[i]=rgb[2];
     }
 }

@@ -27,6 +27,75 @@ inline void marble_ycc(device const ushort *r,device const ushort *g,device cons
     cbv=ushort(clamp(wrap32(rr*-0x6ab+gg*-0x964+bb*0x1011)>>11,-0x8000,0x7fff)+0x8000);
     crv=ushort(clamp(wrap32(rr*0x1acc+gg*-0x1ac0+bb*-9)>>11,-0x8000,0x7fff)+0x8000);
 }
+// The 16-px border Marble leaves unwritten, packed: the top and bottom 16 rows
+// whole, then 32 pixels (16 left, 16 right) per row between them. Used when the
+// final image is written over the planes Marble reads (see marble_border_copy).
+inline uint marble_border_index(int x,int y,int w,int h) {
+    if(y<16)return uint(y*w+x);
+    if(y>=h-16)return uint((y-(h-32))*w+x);
+    return uint(32*w+(y-16)*32+(x<16?x:x-(w-32)));
+}
+// marble_ycc on a pixel value instead of a plane read.
+inline ushort marble_conv_v(long s0,long s1,long s2,constant int *m,device const short *enc,int row) {
+    long o=(long(m[3*row])*s0+long(m[3*row+1])*s1+long(m[3*row+2])*s2)>>13;
+    return ushort(enc[clamp(o,0L,0x3fffL)]);
+}
+inline void marble_ycc_v(thread const ushort *rgb,device const short *dec,device const short *enc,constant MarbleArgs &a,thread ushort &yv,thread ushort &cbv,thread ushort &crv) {
+    long s0=dec[rgb[0]],s1=dec[rgb[1]],s2=dec[rgb[2]];
+    long rr=marble_conv_v(s0,s1,s2,a.m_fwd,enc,0),gg=marble_conv_v(s0,s1,s2,a.m_fwd,enc,1),bb=marble_conv_v(s0,s1,s2,a.m_fwd,enc,2);
+    yv=ushort(min((rr*0xb44+gg*0xdc3+bb*0x271)>>11,0xefffL)+0x1000);
+    cbv=ushort(clamp(wrap32(rr*-0x6ab+gg*-0x964+bb*0x1011)>>11,-0x8000,0x7fff)+0x8000);
+    crv=ushort(clamp(wrap32(rr*0x1acc+gg*-0x1ac0+bb*-9)>>11,-0x8000,0x7fff)+0x8000);
+}
+// spatial_fused followed by marble_in_half on its output: each thread takes a
+// pixel pair of the 32 x 32 tile (tiles start on even columns), writes the
+// spatial RGB, Marble's Y/Cb/Cr and the pair's half-width chroma. The pair
+// that holds the last column also writes the padding column past it, and the
+// last image row also writes the padding rows below it (marble_halfc's edge rules).
+kernel void spatial_marble(device const ushort *y [[buffer(0)]],device const ushort *cr [[buffer(1)]],device const ushort *cb [[buffer(2)]],
+                           device const short *lut [[buffer(3)]],device const int *patterns [[buffer(4)]],device const float *coefs [[buffer(5)]],
+                           device ushort *ro [[buffer(6)]],device ushort *go [[buffer(7)]],device ushort *bo [[buffer(8)]],
+                           constant SpatialArgs &a [[buffer(9)]],device const short *dec [[buffer(10)]],device const short *enc [[buffer(11)]],
+                           device ushort *yo [[buffer(12)]],device ushort *cbo [[buffer(13)]],device ushort *cro [[buffer(14)]],
+                           device ushort *hcb [[buffer(15)]],device ushort *hcr [[buffer(16)]],constant MarbleArgs &ma [[buffer(17)]],
+                           device ushort *bord [[buffer(18)]],
+                           uint2 tg [[threadgroup_position_in_grid]],uint2 lt [[thread_position_in_threadgroup]],uint2 tsz [[threads_per_threadgroup]]) {
+    threadgroup ushort Y[SP_YW*SP_YW];
+    threadgroup float HB[SP_YW*SP_HW];
+    threadgroup ushort YG[SP_HW*SP_HW];
+    int w=int(a.width),h=int(a.height),X0=int(tg.x)*SP_T,Y0=int(tg.y)*SP_T;
+    uint tid=lt.y*tsz.x+lt.x,nt=tsz.x*tsz.y,half4=ma.w4/2;
+    spatial_tile(y,lut,a,X0,Y0,tid,nt,Y,HB,YG);
+    for(uint k=tid;k<SP_T*SP_T/2;k+=nt){
+        int px=X0+2*int(k%(SP_T/2)),py=Y0+int(k/(SP_T/2));
+        if(px>=w||py>=h)continue;
+        uint i=uint(py)*uint(w)+uint(px);
+        ushort rgb[3],y0,cb0,cr0,y1=0,cb1=0,cr1=0;
+        spatial_pixel(YG,cr,cb,patterns,coefs,a,X0,Y0,px,py,rgb);
+        ro[i]=rgb[0];go[i]=rgb[1];bo[i]=rgb[2];
+        // Marble's inset border, packed (marble_border_index), for a final image
+        // written over these planes (as marble_border_copy would).
+        bool bw=w>=32&&h>=32,brow=py<16||py>=h-16;uint nb=uint(32*w+(h-32)*32);
+        if(bw&&(brow||px<16||px>=w-16)){uint j=marble_border_index(px,py,w,h);bord[j]=rgb[0];bord[nb+j]=rgb[1];bord[2*nb+j]=rgb[2];}
+        marble_ycc_v(rgb,dec,enc,ma,y0,cb0,cr0);yo[i]=y0;cbo[i]=cb0;cro[i]=cr0;
+        bool has1=px+1<w;
+        if(has1){
+            spatial_pixel(YG,cr,cb,patterns,coefs,a,X0,Y0,px+1,py,rgb);
+            ro[i+1]=rgb[0];go[i+1]=rgb[1];bo[i+1]=rgb[2];
+            if(bw&&(brow||px+1<16||px+1>=w-16)){uint j=marble_border_index(px+1,py,w,h);bord[j]=rgb[0];bord[nb+j]=rgb[1];bord[2*nb+j]=rgb[2];}
+            marble_ycc_v(rgb,dec,enc,ma,y1,cb1,cr1);yo[i+1]=y1;cbo[i+1]=cb1;cro[i+1]=cr1;
+        }
+        uint x=uint(px/2);
+        ushort vb=has1?ushort((int(cb0)+int(cb1))>>1):cb0,vr=has1?ushort((int(cr0)+int(cr1))>>1):cr0;
+        bool pad=px+2>=w&&x+1<half4;                     // padding column: the last column's chroma
+        ushort pb=has1?cb1:cb0,pr=has1?cr1:cr0;
+        uint last=py==h-1?ma.h4:uint(py)+1;
+        for(uint r=uint(py);r<last;r++){
+            uint o=r*half4+x;hcb[o]=vb;hcr[o]=vr;
+            if(pad){hcb[o+1]=pb;hcr[o+1]=pr;}
+        }
+    }
+}
 // marble_in and marble_halfc in one pass: one thread per half-width column
 // (w4/2 x h4) converts its pixel pair, stores Y/Cb/Cr for real pixels and the
 // pair's half-width chroma. halfc's edge rules (last column past the pairs,
@@ -100,6 +169,18 @@ inline uint marble_blend(int nv,int ov,float f) {
 // x8 bilinear upsample, detail gain, chroma blend, YCbCr -> RGB and the final
 // colour conversion inside the 16-px valid region. post.metal also calls this
 // helper from the fused Marble + Post kernel.
+kernel void marble_border_copy(device const ushort *r [[buffer(0)]],device const ushort *g [[buffer(1)]],device const ushort *b [[buffer(2)]],
+                               device ushort *br [[buffer(3)]],device ushort *bg [[buffer(4)]],device ushort *bb [[buffer(5)]],
+                               constant MarbleArgs &a [[buffer(6)]],uint2 p [[thread_position_in_grid]]) {
+    // One thread per border pixel, j in marble_border_index order.
+    int w=int(a.width),h=int(a.height),j=int(p.x),x,y;
+    if(j>=32*w+(h-32)*32)return;
+    if(j<16*w){y=j/w;x=j%w;}
+    else if(j<32*w){int k=j-16*w;y=h-16+k/w;x=k%w;}
+    else {int k=j-32*w,c=k%32;y=16+k/32;x=c<16?c:w-32+c;}
+    uint i=uint(y*w+x);
+    br[j]=r[i];bg[j]=g[i];bb[j]=b[i];
+}
 inline void marble_pixel(device const ushort *y,device const ushort *cb,device const ushort *cr,device const int *q,device const ushort *r0,device const ushort *g0,device const ushort *b0,device const short *dec,device const short *enc,device const ushort *hcb,device const ushort *hcr,constant MarbleArgs &a,uint2 p,thread ushort *rgb) {
     int w=int(a.width),h=int(a.height);if(int(p.x)>=w||int(p.y)>=h)return;
     int x=int(p.x),yy=int(p.y);uint row=uint(yy*w),i=row+uint(x);
@@ -134,7 +215,10 @@ inline void marble_pixel(device const ushort *y,device const ushort *cb,device c
     if(x>=16&&x<w-16&&yy>=16&&yy<h-16) {
         long s0=dec[rgb[0]],s1=dec[rgb[1]],s2=dec[rgb[2]];
         for(int c=0;c<3;c++){long o=(long(a.m_inv[3*c])*s0+long(a.m_inv[3*c+1])*s1+long(a.m_inv[3*c+2])*s2)>>13;rgb[c]=ushort(enc[clamp(o,0L,0x3fffL)]);}
-    } else if(a.inset) { rgb[0]=r0[i];rgb[1]=g0[i];rgb[2]=b0[i]; }
+    } else if(a.inset) {
+        uint j=a.inset==2?marble_border_index(x,yy,w,h):i;     // 2: r0/g0/b0 hold only the border
+        rgb[0]=r0[j];rgb[1]=g0[j];rgb[2]=b0[j];
+    }
 }
 kernel void marble_out(device const ushort *y [[buffer(0)]],device const ushort *cb [[buffer(1)]],device const ushort *cr [[buffer(2)]],device const int *q [[buffer(3)]],device const ushort *r0 [[buffer(4)]],device const ushort *g0 [[buffer(5)]],device const ushort *b0 [[buffer(6)]],device const short *dec [[buffer(7)]],device const short *enc [[buffer(8)]],device ushort *ro [[buffer(9)]],device ushort *go [[buffer(10)]],device ushort *bo [[buffer(11)]],device const ushort *hcb [[buffer(12)]],device const ushort *hcr [[buffer(13)]],constant MarbleArgs &a [[buffer(14)]],uint2 p [[thread_position_in_grid]]) {
     ushort rgb[3];

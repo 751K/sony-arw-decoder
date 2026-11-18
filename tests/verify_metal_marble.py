@@ -110,6 +110,7 @@ def main(path):
 
     check_fused_post(with_tab, path)
     check_chroma(with_tab, blk8, path)
+    check_over_input(with_tab, blk8, path)
 
     # Full-resolution timing: Rust as one slab vs Metal.
     r, g, b = image(4672, 7008, 9)
@@ -238,6 +239,46 @@ def full_chroma(path):
     same('chroma 7008 x 4672', expected, actual)
     print(f'chroma + Clarity 7008 x 4672: identical; NumPy {tn:.2f} s, Metal {tm:.2f} s')
 
+
+
+def check_over_input(blk4, blk8, path):
+    """The packed result written over its own input planes (one planes_block), with
+    the inset border read from a copy: identical to a separate output array."""
+    import metal_itp
+    curves = [((0, 128, 384, 511), (0, 170, 350, 511))] * 4
+    shade = dict(amount=60, radius=70, strength=30, flag=1, angle=45000)
+    looks_by_name = sony_render.load_looks(path)
+    dec = dict(iso=400, f0=1, d14c=0, f22780=1.0, f22784=1.0, d1b0=0)
+    n = 0
+    for h, w in ((32, 32), (40, 64), (33, 48), (97, 136), (200, 160)):
+        if (h * w * 2) % 16:
+            continue
+        for mlook, dev in ((blk4, dict(d218=0, d224=20, d2c0=40)), (blk8, dict(d218=1, d224=40, d2c0=10))):
+            for inset in (True, False):
+                for post_name in (None, 'Sepia'):
+                    pp = None
+                    if post_name:
+                        rl = sony_render.Look(post_name, looks_by_name, tone_curves=curves, shade=shade)
+                        pp = metal_look.Post(rl, w, h)
+                    for bits in (14, 16):
+                        src = image(h, w, 5000 + n)
+                        expected = metal_look.marble(*src, mlook, dev, dec, inset=inset, post=pp,
+                                                     packed=True, output_bits=bits)
+                        planes = metal_itp.planes_block((h, w))
+                        for d, v in zip(planes, src):
+                            d[...] = v
+                        block = metal_itp.block_view(planes)
+                        assert block is not None, 'planes_block did not give one block'
+                        got = metal_look.marble(*planes, mlook, dev, dec, inset=inset, post=pp,
+                                                packed=True, output_bits=bits, out=block)
+                        if not np.shares_memory(got, planes[0]):
+                            raise AssertionError('the packed output was not written over the planes')
+                        if not np.array_equal(expected, got):
+                            d = np.argwhere(expected != got)
+                            raise AssertionError(f'over-input {h}x{w} inset={inset} post={post_name} bits={bits}: '
+                                                 f'{len(d)} differ, first {tuple(d[0])}')
+                        n += 1
+    print(f'packed Marble written over its input planes: {n} cases identical')
 
 if __name__ == '__main__':
     if len(sys.argv) not in (2, 3):

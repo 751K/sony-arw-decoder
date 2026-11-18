@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import numpy as np
 
 import metal_itp
@@ -45,16 +46,21 @@ def apply(planes, origin, region, lens):
     return tuple(out)
 
 
-def _prepare_sscs(planes, origin, region, lens, params):
+def _prepare_sscs(planes, origin, region, lens, params, over_input=False):
     planes, lens_params, tables, n, region = _prepare(planes, origin, region, lens)
     x0, y0, x1, y1 = region
     sscs = np.asarray([params['T'], params['tR'], params['tG'], params['tB'],
                        *params['w']], dtype=np.int32)
     if sscs.shape != (7,):
         raise ValueError("SSCS parameters must include three channel weights")
+    # over_input: the output array is the input planes' own block (planes_block),
+    # for the final image to be written there later. GeoCorr itself never writes
+    # it: it runs inside the look front (take), or into a new array (resolve).
+    out = metal_itp.block_view(planes) if over_input else None
+    if out is None or out.shape != (y1 - y0, x1 - x0, 3):
+        out, over_input = metal_itp.empty((y1-y0, x1-x0, 3)), False
     return dict(planes=planes, origin=(int(origin[0]), int(origin[1])), region=region,
-                lens_params=lens_params, tables=tables, n=n, sscs=sscs,
-                out=metal_itp.empty((y1-y0, x1-x0, 3)))
+                lens_params=lens_params, tables=tables, n=n, sscs=sscs, out=out, over_input=over_input)
 
 
 def apply_sscs(planes, origin, region, lens, params):
@@ -71,9 +77,12 @@ _pending = None
 
 def defer_sscs(planes, origin, region, lens, params):
     """apply_sscs, deferred: returns the output array, not yet written.  Whoever uses it next
-    either take()s the record and runs the fused front, or resolve()s it (the plain kernel)."""
+    either take()s the record and runs the fused front, or resolve()s it (the plain kernel)
+    and uses the array resolve() returns.  The input planes must not be used otherwise:
+    the returned array may share their memory."""
     global _pending
-    _pending = _prepare_sscs(planes, origin, region, lens, params)
+    _pending = _prepare_sscs(planes, origin, region, lens, params,
+                             over_input=os.environ.get("SONYLOOK_PLANE_REUSE", "1") != "0")
     return _pending["out"]
 
 
@@ -91,10 +100,13 @@ def take(out):
 
 
 def resolve(out):
-    """Run a deferred GeoCorr + SSCS into `out` now; no effect when none is pending for it."""
+    """Run a deferred GeoCorr + SSCS now and return its result: `out`, or a new array when
+    `out` shares the input planes' memory.  Returns `out` when none is pending for it."""
     rec = take(out)
     if rec is not None:
-        _run_sscs(rec)
+        if rec["over_input"]:
+            rec["out"] = metal_itp.empty(out.shape)
+        return _run_sscs(rec)
     return out
 
 

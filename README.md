@@ -2,7 +2,7 @@
 
 English | [中文](README.zh-CN.md)
 
-A standalone complete Sony RAW decoder that reproduces the Imaging Edge Edit development pipeline stage by stage and takes the camera's own output as the reference, with Rust and Metal acceleration backends for the CPU and the GPU. It decodes a 33-megapixel RAW in 88 ms, 3–4× faster than macOS's own RAW decoder (Core Image); peak memory for one image is about 1.05 GB, below Core Image's 1.48 GB; and it writes sRGB, Adobe RGB, Display P3 and ProPhoto RGB as TIFF, JPEG, PNG or HEIF.
+A standalone complete Sony RAW decoder that reproduces the Imaging Edge Edit development pipeline stage by stage and takes the camera's own output as the reference, with Rust and Metal acceleration backends for the CPU and the GPU. It decodes a 33-megapixel RAW in 75 ms, 11–22× faster than macOS's own RAW decoder (Core Image) and 40–80× faster than LibRaw; peak memory for one image is about 0.83 GB, below Core Image's 1.58 GB for the same 16-bit output (LibRaw: 0.61 GB); and it writes sRGB, Adobe RGB, Display P3 and ProPhoto RGB as TIFF, JPEG, PNG or HEIF.
 
 ## Pipeline
 
@@ -31,15 +31,36 @@ Rust and Metal are optional and may be combined. NumPy always serves as the refe
 
 Benchmark environment: Mac mini with Apple M6, 16 GB memory, macOS 27.2, arm64. Input: `chart/SonyChart.ARW`; output: a full-resolution 7008 × 4672 image.
 
-Each backend was run once to initialise caches and Metal shaders, then the second full-image decode was timed in the same process.
+Each backend was run once to initialise caches and Metal shaders, then the second full-image decode was timed in the same process (Metal: the median of 9 decodes after 3 warm-up runs).
 
 | Backend | Time | Speed-up vs NumPy |
 | --- | ---: | ---: |
 | NumPy | 24.92 s | 1.0× |
 | Rust | 1.79 s | 13.9× |
-| Metal (`--metal`) | 0.088 s | 283.2× |
+| Metal (`--metal`) | 0.075 s | 332× |
 
 `--metal` automatically uses the Rust RAW reader and table builders when the Rust library is available, so `--rust --metal` is the same path. GPU stages are submitted in two command buffers: the RAW chain and the render chain. GeoCorr with SSCS, and Marble with Effect/ToneCurve/ShadeCorrection, run in fused kernels. The compressed RAW is decoded on a background thread while the GPU already processes the rows that are ready (`SONYLOOK_RAW_STREAM=0` decodes it first). Set `SONYLOOK_METAL_BATCH=0` to restore independent stage submission. All three backends produced identical full-image hashes. The first decode in a new process is slower because it includes initialisation, table construction and Metal shader compilation. These figures describe one synthetic ARW and should not be treated as a general benchmark across all camera models or development settings.
+
+Compared on the same machine with macOS's own RAW decoder (Core Image's `CIRAWFilter`, used by Photos and Preview) and with LibRaw 0.22.2 (through rawpy 0.28, whose build is single-threaded), from file to a full-resolution 16-bit bitmap in memory, median of the warm runs. Core Image gets a new `CIRAWFilter` for each decode (reusing one filter on the same file re-renders a cached decode and is not a decode); LibRaw runs `imread` + `postprocess(output_bps=16)` with its default AHD demosaic, and with its fastest (linear):
+
+| File | Core Image, defaults | Core Image, noise reduction / sharpening / local tone mapping off | LibRaw, AHD | LibRaw, linear | This decoder (`--metal`) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| SonyChart (A7M5) | 857 ms | 1184 ms | 4995 ms | 3047 ms | 74 ms |
+| DSC02741 (A7M5) | 1522 ms | 1370 ms | 5988 ms | 3680 ms | 76 ms |
+| DSC06657 (A7M5) | 1469 ms | 1376 ms | 6034 ms | 3667 ms | 75 ms |
+| DSC05212 (A7M4) | 1546 ms | 1410 ms | 5426 ms | 3482 ms | 69 ms |
+
+Peak memory for one decode of DSC02741 in its own process (`/usr/bin/time -l`, peak memory footprint, GPU memory included):
+
+| Decoder and output | Peak memory |
+| --- | ---: |
+| This decoder, `--metal`, 16-bit TIFF or JPEG | 0.83 GB |
+| Core Image, 16-bit RGBA | 1.58 GB |
+| Core Image, 8-bit RGBA | 1.06 GB |
+| LibRaw, 16-bit RGB | 0.61 GB |
+| LibRaw, 8-bit RGB | 0.50 GB |
+
+Core Image and LibRaw apply their own demosaic and tone (Core Image also its own noise reduction), and LibRaw keeps the whole sensor area (7168 × 5120 rather than the 7008 × 4672 crop); this decoder reproduces Sony's pipeline, so only times and memory are comparable, not the images.
 
 ## Install
 

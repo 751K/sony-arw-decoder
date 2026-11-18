@@ -12,18 +12,18 @@ const char *sonylook_heif_error(void) { return heif_error; }
 static int heif_fail(NSString *s) { snprintf(heif_error,sizeof(heif_error),"%s",s.UTF8String); return -1; }
 
 // rgb: interleaved uint16 RGB on the 16-bit scale (the 16-bit TIFF values,
-// 14-bit << 2); icc: the output profile, embedded in the file. depth 10
+// 14-bit << 2), rows `stride` bytes apart (>= w*6); icc: the output profile, embedded in the file. depth 10
 // writes a 10-bit HEIF, 8 an 8-bit one; quality is 0..1. Thread-safe.
-int sonylook_heif_write(const uint16_t *rgb,uint32_t w,uint32_t h,const void *icc,size_t icc_len,
+int sonylook_heif_write(const uint16_t *rgb,uint32_t w,uint32_t h,size_t stride,const void *icc,size_t icc_len,
                         float quality,int depth,const char *path) { @autoreleasepool {
-    if(!rgb||!w||!h||!icc||!icc_len||!path||(depth!=8&&depth!=10))return heif_fail(@"Invalid HEIF arguments");
+    if(!rgb||!w||!h||stride<(size_t)w*6||!icc||!icc_len||!path||(depth!=8&&depth!=10))return heif_fail(@"Invalid HEIF arguments");
     static CIContext *ctx;static dispatch_once_t once;
     dispatch_once(&once,^{ctx=[CIContext contextWithOptions:@{kCIContextCacheIntermediates:@NO}];});
     CGColorSpaceRef cs=CGColorSpaceCreateWithICCData((__bridge CFDataRef)[NSData dataWithBytes:icc length:icc_len]);
     if(!cs)return heif_fail(@"HEIF: the ICC profile is not usable");
-    NSData *data=[NSData dataWithBytesNoCopy:(void *)rgb length:(size_t)w*h*6 freeWhenDone:NO];
+    NSData *data=[NSData dataWithBytesNoCopy:(void *)rgb length:stride*(h-1)+(size_t)w*6 freeWhenDone:NO];
     CGDataProviderRef dp=CGDataProviderCreateWithCFData((__bridge CFDataRef)data);
-    CGImageRef cg=CGImageCreate(w,h,16,48,(size_t)w*6,cs,kCGBitmapByteOrder16Little|(CGBitmapInfo)kCGImageAlphaNone,
+    CGImageRef cg=CGImageCreate(w,h,16,48,stride,cs,kCGBitmapByteOrder16Little|(CGBitmapInfo)kCGImageAlphaNone,
                                 dp,NULL,false,kCGRenderingIntentDefault);
     CGDataProviderRelease(dp);
     if(!cg){CGColorSpaceRelease(cs);return heif_fail(@"HEIF: cannot wrap the image");}

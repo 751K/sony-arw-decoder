@@ -95,9 +95,14 @@ def prepare_view(source, offset, size, black, curve, *, origin=(0, 0), strength=
 
 
 def apply_prepared(planes, grid, black, curve, *, origin=(0, 0), strength=1.0,
-                   k_up=1.0, k_down=1.0, scale=1.0, raw_size=None):
-    """Apply a DRO grid started by prepare(), waiting on the shared event."""
+                   k_up=1.0, k_down=1.0, scale=1.0, raw_size=None, inplace=False):
+    """Apply a DRO grid started by prepare(), waiting on the shared event.
+
+    inplace: write the result over `planes` when they are GPU-resident uint16
+    arrays (each pixel reads only itself; see dro_apply in dro.metal)."""
+    src = planes
     planes = tuple(np.ascontiguousarray(p, dtype=np.uint16) for p in planes)
+    inplace = inplace and all(p is q and metal_itp.resident(p) for p, q in zip(planes, src))
     weights, sums = (np.ascontiguousarray(v, dtype=np.float32) for v in grid)
     curve = np.ascontiguousarray(curve, dtype=np.float32)
     black = np.ascontiguousarray(black, dtype=np.int32)
@@ -110,7 +115,7 @@ def apply_prepared(planes, grid, black, curve, *, origin=(0, 0), strength=1.0,
         raw_size = (planes[0].shape[1] + 2 * max(origin[0], 0),
                     planes[0].shape[0] + 2 * max(origin[1], 0))
     h, w = planes[0].shape
-    out = [metal_itp.empty(p.shape) for p in planes]
+    out = list(planes) if inplace else [metal_itp.empty(p.shape) for p in planes]
     lib = metal_itp._load()
     lib.sonylook_metal_dro_grid_apply.argtypes = [
         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,

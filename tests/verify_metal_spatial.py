@@ -68,6 +68,61 @@ def same(name, expected, actual):
             raise AssertionError(f'{name} {label}: {np.count_nonzero(d)} differences, max {d.max()}, first at {tuple(yx)}')
 
 
+def check_marble_input(path, looks, sets, rng):
+    """Marble's input conversion written by the spatial pass (spatial_marble) against
+    Marble converting the spatial output itself: luma and chroma paths, every
+    width and height mod 4, sizes crossing the 32 x 32 tiles, all output modes."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from verify_metal_marble import looks as marble_looks
+    blk4, _, blk8 = marble_looks(path)
+    look = sony_render.Look('Standard', looks, use_rust=True)
+    dec = dict(iso=800, f0=1, d14c=0, f22780=1.0, f22784=1.0, d1b0=0)
+    y0, cr0, cb0 = test_planes(rng, 131, 197)
+    n = 0
+    for h, w in ((10, 10), (11, 13), (32, 64), (33, 62), (63, 97), (64, 95), (131, 197), (130, 196)):
+        y, cr, cb = (np.ascontiguousarray(v[:h, :w]) for v in (y0, cr0, cb0))
+        for mlook, d218, lum, mode in ((blk4, 1, 0, 0), (blk8, 1, 30, 1), (blk4, 0, 40, 3), (blk8, 1, 60, 4)):
+            dev = dict(d218=d218, d224=20, d2c0=lum)
+            sp = metal_look.Spatial(look, sets[n % len(sets)][1])
+            mcfg = dict(look=mlook, dev=dev, dec=dec, mode=mode)
+            for inset in (False, True):
+                plain = metal_look.spatial(y, cr, cb, sp)
+                expected = metal_look.marble(*plain, mlook, dev, dec, mode=mode, inset=inset)
+                pre = metal_look.spatial(y, cr, cb, sp, marble=mcfg)
+                same(f'spatial+marble {h} x {w} pre', plain, pre)
+                same(f'spatial+marble {h} x {w} d218={d218} lum={lum} mode={mode} inset={inset}',
+                     expected, metal_look.marble(*pre, mlook, dev, dec, mode=mode, inset=inset))
+                n += 1
+    # A staged conversion that does not match the Marble call is not used.
+    y, cr, cb = (np.ascontiguousarray(v[:64, :95]) for v in (y0, cr0, cb0))
+    dev = dict(d218=1, d224=20, d2c0=30)
+    sp = metal_look.Spatial(look, sets[0][1])
+    plain = metal_look.spatial(y, cr, cb, sp)
+    pre = metal_look.spatial(y, cr, cb, sp, marble=dict(look=blk4, dev=dev, dec=dec, mode=0))
+    same('mismatched mode', metal_look.marble(*plain, blk4, dev, dec, mode=1),
+         metal_look.marble(*pre, blk4, dev, dec, mode=1))
+    print(f'Marble input from the spatial pass: {n} cases identical to separate conversion')
+    # Through render(): front_spatial, where Marble's Cb/Cr overwrite the front's
+    # Cr/Cb temporaries in place, with and without the command batch.
+    m = 0
+    for batch in ('1', '0'):
+        os.environ['SONYLOOK_METAL_BATCH'] = batch
+        for h, w in ((10, 10), (33, 62), (64, 95), (97, 131)):
+            rgb = rng.integers(0, 16384, (h, w, 3), dtype=np.uint16)
+            for mlook, d218, lum in ((blk4, 1, 0), (blk8, 1, 30), (blk4, 0, 40)):
+                mcfg = dict(look=mlook, dev=dict(d218=d218, d224=20, d2c0=lum), dec=dec)
+                kw = dict(detail=sets[m % len(sets)][1], marble=mcfg, marble_inset=16, strip=32,
+                          metal_look=True, metal_spatial=True, metal_marble=True)
+                os.environ['SONYLOOK_SPATIAL_MARBLE'] = '0'
+                expected = look.render(rgb, **kw)
+                os.environ.pop('SONYLOOK_SPATIAL_MARBLE')
+                same(f'render {h} x {w} batch={batch} d218={d218} lum={lum}',
+                     np.moveaxis(expected, -1, 0), np.moveaxis(look.render(rgb, **kw), -1, 0))
+                m += 1
+    os.environ.pop('SONYLOOK_METAL_BATCH')
+    print(f'render with Marble input from front_spatial: {m} cases identical')
+
+
 def main(path):
     rng = np.random.default_rng(1729)
     looks = sony_render.load_looks(path)
@@ -100,6 +155,8 @@ def main(path):
             os.environ.pop('SONYLOOK_SPATIAL_FUSED')
             same(f'fused {h} x {w} {name}', separate, metal_look.spatial(y, cr, cb, sp))
     print(f'fused kernel: {len(sizes)} image sizes from 7 x 7, identical to the separate kernels')
+
+    check_marble_input(path, looks, sets, rng)
 
     # Full render path: band overlap, SSCS, and both CPU backends.
     params = sony_sscs.params_from_arw(path)

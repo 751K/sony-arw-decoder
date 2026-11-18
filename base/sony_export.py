@@ -65,7 +65,11 @@ def to_8bit(img, input_bits=14):
     """Encoded 14/16-bit image -> uint8 (Edit's 16-bit value >> 8)."""
     if input_bits not in (14, 16):
         raise ValueError("input_bits must be 14 or 16")
-    return (np.asarray(img, np.uint16) >> (6 if input_bits == 14 else 8)).astype(np.uint8)
+    img = np.asarray(img, np.uint16)
+    # Shifted straight into the uint8 result: no full-size uint16 temporary.
+    out = np.empty(img.shape, np.uint8)
+    np.right_shift(img, 6 if input_bits == 14 else 8, out=out, casting="unsafe")
+    return out
 
 
 HEIF_EXTS = (".hif", ".heif", ".heic")
@@ -81,7 +85,7 @@ def _heif_lib():
         fn = lib.sonylook_heif_write
     except (OSError, AttributeError) as exc:
         raise RuntimeError("HEIF output needs the macOS bridge: run ./metal/build.sh") from exc
-    fn.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_char_p, ctypes.c_size_t,
+    fn.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_size_t,
                    ctypes.c_float, ctypes.c_int, ctypes.c_char_p]
     lib.sonylook_heif_error.restype = ctypes.c_char_p
     lib.sonylook_heif_info.argtypes = [ctypes.c_char_p] + [ctypes.c_void_p] * 3 + [ctypes.c_char_p, ctypes.c_size_t]
@@ -92,10 +96,14 @@ def _heif_lib():
 def write_heif(arr16, path, icc, bits=10, quality=95):
     """HEIF through Core Image (hardware HEVC): arr16 is (H, W, 3) uint16 on the
     16-bit scale; bits 10 or 8; the profile is embedded."""
-    arr16 = np.ascontiguousarray(arr16, np.uint16)
+    arr16 = np.asarray(arr16)
+    # Rows may be strided (decode() returns a crop of a padded image): passed
+    # as they are, without a contiguous copy, when each row's pixels are packed.
+    if arr16.dtype != np.uint16 or arr16.ndim != 3 or arr16.strides[1:] != (6, 2) or arr16.strides[0] < 6 * arr16.shape[1]:
+        arr16 = np.ascontiguousarray(arr16, np.uint16)
     h, w = arr16.shape[:2]
     lib = _heif_lib()
-    if lib.sonylook_heif_write(arr16.ctypes.data, w, h, icc, len(icc), float(quality) / 100.0,
+    if lib.sonylook_heif_write(arr16.ctypes.data, w, h, arr16.strides[0], icc, len(icc), float(quality) / 100.0,
                                int(bits), str(path).encode()):
         raise RuntimeError(lib.sonylook_heif_error().decode())
 
@@ -146,9 +154,13 @@ def write_image(img, path, *, color_space="srgb", bits=None, quality=95, input_b
         if bits == 16 else to_8bit(img, input_bits=input_bits)
     if is_tiff:
         import tifffile
+        # One strip, fed in row bands: tifffile would otherwise copy a strided
+        # array (decode() returns a crop of a padded image) to a contiguous one.
+        h = arr.shape[0]
+        bands = (np.ascontiguousarray(arr[y:y + 64]) for y in range(0, h, 64))
         # TIFF type 7 (UNDEFINED), as Capture One and the TIFF ICC convention use
-        tifffile.imwrite(path, arr, photometric="rgb",
-                         extratags=[(34675, 7, len(icc), icc, False)])
+        tifffile.imwrite(path, data=bands, shape=arr.shape, dtype=arr.dtype, photometric="rgb",
+                         rowsperstrip=h, extratags=[(34675, 7, len(icc), icc, False)])
     else:
         from PIL import Image
         im = Image.fromarray(arr, "RGB")

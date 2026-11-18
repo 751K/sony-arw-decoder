@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import numpy as np
 
 import metal_itp
@@ -150,14 +151,16 @@ class Spatial:
         self.args = a
 
 
-def spatial(y, cr, cb, sp: Spatial):
-    """Sharpness -> YGamma -> Spica -> YCC2RGB on whole Y/Cr/Cb planes; returns (R, G, B)."""
+def spatial(y, cr, cb, sp: Spatial, marble=None):
+    """Sharpness -> YGamma -> Spica -> YCC2RGB on whole Y/Cr/Cb planes; returns (R, G, B).
+    marble: as in front_spatial."""
     planes = [np.ascontiguousarray(v, dtype=np.uint16) for v in (y, cr, cb)]
     h, w = planes[0].shape
     if any(v.shape != (h, w) for v in planes) or h < 7 or w < 7:
         raise ValueError("expected three identically shaped planes of at least 7 x 7")
     out = _planes(h, w)
     lib = metal_itp._load()
+    _stage_marble(lib, marble)
     lib.sonylook_metal_spatial.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_uint32, ctypes.c_uint32,
                                           ctypes.POINTER(SpatialArgs)] + [ctypes.c_void_p] * 6
     rc = lib.sonylook_metal_spatial(*(v.ctypes.data for v in planes), w, h, ctypes.byref(sp.args),
@@ -168,8 +171,12 @@ def spatial(y, cr, cb, sp: Spatial):
     return out
 
 
-def front_spatial(rgb, look, atan, sp: Spatial, args=None, geo=None):
+def front_spatial(rgb, look, atan, sp: Spatial, args=None, geo=None, marble=None):
     """LinearMatrix16 through YCC2RGB on uint16 RGB in one GPU pass; returns (R, G, B).
+
+    marble: None, or dict(look, dev, dec, mode) of a Metal Marble that will run on the
+    result.  The spatial pass then also writes Marble's converted input, which marble()
+    on these planes picks up instead of converting them again.
 
     geo: a record from metal_geo.take(rgb).  `rgb` is then the not-yet-written output of a
     deferred GeoCorr + SSCS, and both run inside the front (geo_front) without writing it."""
@@ -180,12 +187,22 @@ def front_spatial(rgb, look, atan, sp: Spatial, args=None, geo=None):
     if rgb.ndim != 3 or rgb.shape[2] != 3 or rgb.shape[0] < 7 or rgb.shape[1] < 7:
         raise ValueError("expected H x W x 3 RGB of at least 7 x 7")
     args = front_args(look) if args is None else args
-    out = _planes(*rgb.shape[:2])
+    out = None
     lib = metal_itp._load()
+    _stage_marble(lib, marble)
     if geo is not None:
         planes, (x0, y0, x1, y1) = geo["planes"], geo["region"]
         if (y1 - y0, x1 - x0) != rgb.shape[:2]:
             raise ValueError("deferred GeoCorr region does not match the image")
+        # The result may go over the GeoCorr input planes: geo_front reads them
+        # in its own pass, before the spatial pass writes (Metal orders the two).
+        if (os.environ.get("SONYLOOK_PLANE_REUSE", "1") != "0" and
+                all(p.shape == rgb.shape[:2] and p.dtype == np.uint16 and metal_itp.resident(p) for p in planes) and
+                len({p.ctypes.data for p in planes}) == 3):
+            out = tuple(planes)
+    if out is None:
+        out = _planes(*rgb.shape[:2])
+    if geo is not None:
         lib.sonylook_metal_geo_front_spatial.argtypes = (
             [ctypes.c_void_p] * 3 + [ctypes.c_uint32] * 2 + [ctypes.c_int32] * 4 + [ctypes.c_uint32] * 2
             + [ctypes.c_void_p] * 4 + [ctypes.c_uint32] + [ctypes.c_void_p] * 4
@@ -232,14 +249,19 @@ def marble_supported(look, dev):
 
 
 def _marble_setup(r, g, b, look, dev, dec, mode, inset):
-    import sony_effect as E
-    import sony_marble as MB
     if not marble_supported(look, dev):
         return None
     planes = [np.ascontiguousarray(v, dtype=np.uint16) for v in (r, g, b)]
     h, w = planes[0].shape
     if any(v.shape != (h, w) for v in planes) or h < 10 or w < 10:
         raise ValueError("expected three identically shaped planes of at least 10 x 10")
+    return (planes, h, w) + _marble_params(look, dev, dec, mode, inset)
+
+
+def _marble_params(look, dev, dec, mode, inset):
+    """(MarbleArgs without the size fields, [dec_in, enc_in, dec_out, enc_out], upw)."""
+    import sony_effect as E
+    import sony_marble as MB
     lum = int(dev["d2c0"])
     P, thr_y, a_y, G = MB.luma_params(look, dev, dec, lum)
     a = MarbleArgs()
@@ -271,7 +293,40 @@ def _marble_setup(r, g, b, look, dev, dec, mode, inset):
     if any(t.shape != (0x4000,) for t in tabs):
         raise ValueError("Marble conversion tables must have 0x4000 entries")
     upw = np.ascontiguousarray(MB.UPW, dtype=np.int32)
-    return planes, h, w, a, tabs, upw
+    return a, tabs, upw
+
+
+def _stage_marble(lib, marble):
+    """Ask the next spatial pass to also write Marble's converted input (see bridge.m, mb_req).
+    marble: None, or dict(look, dev, dec, mode) of the Marble that will run on its output."""
+    lib.sonylook_metal_marble_stage.argtypes = [ctypes.c_void_p] * 3
+    if marble is None or os.environ.get("SONYLOOK_SPATIAL_MARBLE", "1") == "0" or \
+            not marble_supported(marble["look"], marble["dev"]):
+        lib.sonylook_metal_marble_stage(None, None, None)
+        return
+    a, tabs, _ = _marble_params(marble["look"], marble["dev"], marble["dec"], marble["mode"], False)
+    lib.sonylook_metal_marble_stage(ctypes.addressof(a.m_fwd), tabs[0].ctypes.data, tabs[1].ctypes.data)
+
+
+class PlaneReuseOverflow(RuntimeError):
+    """Marble + Post wrote the final image over its input planes and then found more
+    uncertain Post pixels than it could record, so it cannot rerun from those planes.
+    sony_decode.decode() catches this and decodes again without reusing them."""
+
+
+def _over_input(out, planes):
+    """True when the packed output `out` is the block of `planes` (metal_itp.planes_block):
+    Marble then writes over them (see sonylook_metal_marble). False when they do not
+    share memory; None when they overlap in any other way (out cannot be used)."""
+    if not any(np.shares_memory(out, v) for v in planes):
+        return False
+    h, w = planes[0].shape
+    n = planes[0].nbytes
+    p0 = out.ctypes.data
+    if (h >= 32 and w >= 32 and [v.ctypes.data for v in planes] == [p0, p0 + n, p0 + 2 * n]
+            and out.shape == (h, w, 3)):
+        return True
+    return None
 
 
 def _packed_out(h, w, out):
@@ -298,7 +353,13 @@ def marble(r, g, b, look, dev, dec, mode=0, inset=True, post=None, capacity=None
     planes, h, w, a, tabs, upw = setup
     if output_bits not in (14, 16):
         raise ValueError("output_bits must be 14 or 16")
+    over = False
+    if packed and out is not None:
+        over = _over_input(out, planes)
+        if over is None:
+            out, over = None, False
     out = _packed_out(h, w, out) if packed else _planes(h, w)
+    over = over and np.shares_memory(out, planes[0])
     active_post = post is not None and post.active
     fix = fixin = nfix = None
     cap = 0
@@ -307,6 +368,8 @@ def marble(r, g, b, look, dev, dec, mode=0, inset=True, post=None, capacity=None
             raise ValueError("planes must match the Post image size")
         n = w * h
         cap = max(1, n // 64) if capacity is None else int(capacity)
+        if capacity is None and os.environ.get("SONYLOOK_POST_FIX_CAP"):   # tests: force the rerun
+            cap = int(os.environ["SONYLOOK_POST_FIX_CAP"])
         post.args.capacity = cap
         fix = np.empty(cap, np.uint32)
         fixin = np.empty((cap, 3), np.uint16)
@@ -335,6 +398,8 @@ def marble(r, g, b, look, dev, dec, mode=0, inset=True, post=None, capacity=None
     if active_post:
         count = int(nfix.value)
         if count > cap:                          # rare: rerun with a list large enough
+            if over:                             # ... but the planes are overwritten
+                raise PlaneReuseOverflow(f"{count} uncertain Post pixels, room for {cap}")
             return marble(planes[0], planes[1], planes[2], look, dev, dec, mode=mode,
                           inset=inset, post=post, capacity=count, stats=stats,
                           packed=packed, output_bits=output_bits, out=out if packed else None)
@@ -507,6 +572,8 @@ def interleave(r, g, b, output_bits=14, out=None):
     h, w = planes[0].shape
     if any(v.shape != (h, w) for v in planes) or not h or not w:
         raise ValueError("planes must be nonempty and the same size")
+    if out is not None and any(np.shares_memory(out, v) for v in planes):
+        out = None                       # an in-place interleave would race
     out = _packed_out(h, w, out)
     lib = metal_itp._load()
     lib.sonylook_metal_interleave.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_uint32] * 3 + [ctypes.c_void_p]

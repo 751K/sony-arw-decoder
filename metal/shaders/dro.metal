@@ -223,28 +223,38 @@ static inline ushort3 dro_pixel(ushort r16,ushort g16,ushort b16,int x,int y,dev
 // DRO tone mapping in three steps: dro_apply runs the fast exp2 and appends
 // the (rare) undecided pixels to `list`; dro_fix_args turns the count into
 // indirect dispatch sizes; dro_apply_fix recomputes the listed pixels exactly.
-// If the list overflowed, dro_apply_exact redoes the whole image instead.
-kernel void dro_apply(device const ushort *r [[buffer(0)]],device const ushort *g [[buffer(1)]],device const ushort *b [[buffer(2)]],device const float *weights [[buffer(3)]],device const float *sums [[buffer(4)]],device const float *curve [[buffer(5)]],device const float *logtab [[buffer(6)]],device ushort *ro [[buffer(7)]],device ushort *go [[buffer(8)]],device ushort *bo [[buffer(9)]],device uint *list [[buffer(10)]],device atomic_uint *count [[buffer(11)]],constant DroArgs &a [[buffer(12)]],uint2 p [[thread_position_in_grid]]) {
+// If the list overflowed, dro_apply_exact recomputes every undecided pixel
+// instead, found through the bit mask `undecided`.
+// The output may be the input planes themselves: dro_apply writes only the
+// decided pixels, so the later passes still read the undecided ones unchanged.
+kernel void dro_apply(device const ushort *r [[buffer(0)]],device const ushort *g [[buffer(1)]],device const ushort *b [[buffer(2)]],device const float *weights [[buffer(3)]],device const float *sums [[buffer(4)]],device const float *curve [[buffer(5)]],device const float *logtab [[buffer(6)]],device ushort *ro [[buffer(7)]],device ushort *go [[buffer(8)]],device ushort *bo [[buffer(9)]],device uint *list [[buffer(10)]],device atomic_uint *count [[buffer(11)]],device atomic_uint *undecided [[buffer(12)]],constant DroArgs &a [[buffer(13)]],uint2 p [[thread_position_in_grid]]) {
     if(p.x>=a.width||p.y>=a.height)return;uint i=p.y*a.width+p.x;
     bool ok;ushort3 o=dro_pixel<false>(r[i],g[i],b[i],int(p.x),int(p.y),weights,sums,curve,logtab,a,ok);
-    if(!ok){uint k=atomic_fetch_add_explicit(count,1u,memory_order_relaxed);if(k<a.fix_capacity)list[k]=i;}
+    if(!ok){
+        uint k=atomic_fetch_add_explicit(count,1u,memory_order_relaxed);if(k<a.fix_capacity)list[k]=i;
+        atomic_fetch_or_explicit(&undecided[i>>5],1u<<(i&31),memory_order_relaxed);
+        return;
+    }
     ro[i]=o.x;go[i]=o.y;bo[i]=o.z;
 }
 kernel void dro_fix_args(device const uint *count [[buffer(0)]],device uint *ind [[buffer(1)]],constant DroArgs &a [[buffer(2)]],uint2 p [[thread_position_in_grid]]) {
     if(p.x||p.y)return;
     uint c=count[0],m=min(c,a.fix_capacity);
-    ind[0]=(m+63)/64;ind[1]=1;ind[2]=1;
     bool over=c>a.fix_capacity;
+    // On overflow the exact pass takes every undecided pixel and dro_apply_fix
+    // none: it would overwrite listed pixels the exact pass still reads in place.
+    ind[0]=over?0:(m+63)/64;ind[1]=1;ind[2]=1;
     ind[3]=over?(a.width+15)/16:0;ind[4]=over?(a.height+15)/16:1;ind[5]=1;
 }
-kernel void dro_apply_fix(device const ushort *r [[buffer(0)]],device const ushort *g [[buffer(1)]],device const ushort *b [[buffer(2)]],device const float *weights [[buffer(3)]],device const float *sums [[buffer(4)]],device const float *curve [[buffer(5)]],device const float *logtab [[buffer(6)]],device ushort *ro [[buffer(7)]],device ushort *go [[buffer(8)]],device ushort *bo [[buffer(9)]],device const uint *list [[buffer(10)]],device const uint *count [[buffer(11)]],constant DroArgs &a [[buffer(12)]],uint t [[thread_position_in_grid]]) {
+kernel void dro_apply_fix(device const ushort *r [[buffer(0)]],device const ushort *g [[buffer(1)]],device const ushort *b [[buffer(2)]],device const float *weights [[buffer(3)]],device const float *sums [[buffer(4)]],device const float *curve [[buffer(5)]],device const float *logtab [[buffer(6)]],device ushort *ro [[buffer(7)]],device ushort *go [[buffer(8)]],device ushort *bo [[buffer(9)]],device const uint *list [[buffer(10)]],device const uint *count [[buffer(11)]],device const uint *undecided [[buffer(12)]],constant DroArgs &a [[buffer(13)]],uint t [[thread_position_in_grid]]) {
     if(t>=min(count[0],a.fix_capacity))return;
     uint i=list[t],x=i%a.width,y=i/a.width;bool ok;
     ushort3 o=dro_pixel<true>(r[i],g[i],b[i],int(x),int(y),weights,sums,curve,logtab,a,ok);
     ro[i]=o.x;go[i]=o.y;bo[i]=o.z;
 }
-kernel void dro_apply_exact(device const ushort *r [[buffer(0)]],device const ushort *g [[buffer(1)]],device const ushort *b [[buffer(2)]],device const float *weights [[buffer(3)]],device const float *sums [[buffer(4)]],device const float *curve [[buffer(5)]],device const float *logtab [[buffer(6)]],device ushort *ro [[buffer(7)]],device ushort *go [[buffer(8)]],device ushort *bo [[buffer(9)]],device const uint *list [[buffer(10)]],device const uint *count [[buffer(11)]],constant DroArgs &a [[buffer(12)]],uint2 p [[thread_position_in_grid]]) {
+kernel void dro_apply_exact(device const ushort *r [[buffer(0)]],device const ushort *g [[buffer(1)]],device const ushort *b [[buffer(2)]],device const float *weights [[buffer(3)]],device const float *sums [[buffer(4)]],device const float *curve [[buffer(5)]],device const float *logtab [[buffer(6)]],device ushort *ro [[buffer(7)]],device ushort *go [[buffer(8)]],device ushort *bo [[buffer(9)]],device const uint *list [[buffer(10)]],device const uint *count [[buffer(11)]],device const uint *undecided [[buffer(12)]],constant DroArgs &a [[buffer(13)]],uint2 p [[thread_position_in_grid]]) {
     if(p.x>=a.width||p.y>=a.height)return;uint i=p.y*a.width+p.x;bool ok;
+    if(!((undecided[i>>5]>>(i&31))&1u))return;
     ushort3 o=dro_pixel<true>(r[i],g[i],b[i],int(p.x),int(p.y),weights,sums,curve,logtab,a,ok);
     ro[i]=o.x;go[i]=o.y;bo[i]=o.z;
 }

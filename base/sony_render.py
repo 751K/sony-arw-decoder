@@ -474,7 +474,7 @@ class Look:
             if metal_spatial and metal_look and sscs is None:
                 geo = MG.take(lin)
             else:
-                MG.resolve(lin)
+                lin = MG.resolve(lin)      # may be a new array (see metal_geo.defer_sscs)
 
         # Only the front/spatial -> Marble/Post chain stays in the batch. Every
         # other path reads lin (or GPU front planes) on the CPU, or submits
@@ -726,7 +726,10 @@ class Look:
                 MI.begin()
                 metal_batch = True
             t = time.perf_counter()
-            pre = ML.front_spatial(lin, self, atan, ML.Spatial(self, detail), geo=geo)
+            # A Metal Marble on the result takes its converted input from the spatial pass.
+            mb_in = (dict(look=marble["look"], dev=marble["dev"], dec=marble["dec"], mode=self.output_mode)
+                     if metal_marble and marble is not None and H >= 10 and W >= 10 else None)
+            pre = ML.front_spatial(lin, self, atan, ML.Spatial(self, detail), geo=geo, marble=mb_in)
             # Only the front reads lin, so with reuse_input the final image can be
             # written over it (encoded after the front on the same queue).
             if reuse_input and lin.shape == (H, W, 3) and lin.dtype == np.uint16 and MI.resident(lin):

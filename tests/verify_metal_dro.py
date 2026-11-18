@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Compare Metal DRO's analysis grid and tone mapping with NumPy (bit-exact), for both grid models."""
 import ctypes
+import os
 import sys
 from pathlib import Path
 
@@ -80,11 +81,33 @@ def main():
             for name, cpu, gpu in zip(('subcells', 'W', 'S'), (grid['sub'], grid['W'], grid['S']), debug):
                 if not np.array_equal(cpu, gpu):
                     raise AssertionError(f'{model} {origin} {name}: max difference {np.max(np.abs(cpu-gpu))}')
-            for name, cpu, gpu in zip('RGB', expected, actual):
-                difference = np.abs(cpu.astype(np.int32) - gpu.astype(np.int32))
-                if difference.any():
-                    raise AssertionError(f'{origin} {st} {ku} {kd} {name}: {np.count_nonzero(difference)} differ, max {difference.max()}')
-        print(f'{model} {origin} strength/k variants: grid and RGB identical')
+            check_rgb(f'{origin} {st} {ku} {kd}', expected, actual)
+            # The prepared path: written over the input planes, and with a
+            # one-entry fix list so the undecided pixels take the overflow pass.
+            for cap in (None, '1'):
+                for inplace in (False, True):
+                    if cap:
+                        os.environ['SONYLOOK_DRO_FIX_CAP'] = cap
+                    src = [metal_itp.empty(p.shape) for p in planes]
+                    for d, p in zip(src, planes):
+                        d[...] = p
+                    w_s = metal_dro.prepare(raw, black, grid['curve'], origin=origin, strength=st,
+                                            k_up=ku, k_down=kd, model=model)
+                    got = metal_dro.apply_prepared(src, w_s, black, grid['curve'], origin=origin,
+                                                   strength=st, k_up=ku, k_down=kd, inplace=inplace,
+                                                   raw_size=raw.shape[::-1])
+                    os.environ.pop('SONYLOOK_DRO_FIX_CAP', None)
+                    if inplace and any(g is not d for g, d in zip(got, src)):
+                        raise AssertionError('inplace DRO did not write over its input')
+                    check_rgb(f'prepared {origin} {st} cap={cap} inplace={inplace}', expected, got)
+        print(f'{model} {origin} strength/k variants: grid and RGB identical (also in place, and the overflow pass)')
+
+
+def check_rgb(label, expected, actual):
+    for name, cpu, gpu in zip('RGB', expected, actual):
+        difference = np.abs(cpu.astype(np.int32) - gpu.astype(np.int32))
+        if difference.any():
+            raise AssertionError(f'{label} {name}: {np.count_nonzero(difference)} differ, max {difference.max()}')
 
 
 if __name__ == '__main__':

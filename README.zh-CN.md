@@ -2,7 +2,7 @@
 
 [English](README.md) | 中文
 
-本仓库为 Sony RAW 完整解码器：以 Imaging Edge Edit 的显影管线为蓝本逐阶段复现，输出以相机直出为参照，针对 CPU 与 GPU 分别提供基于 Rust 和 Metal 的加速后端。在速度上，解码一张 3300 万像素的 RAW 仅需 88 ms，比 macOS 自带的 RAW 解码（Core Image）快 3–4 倍；在内存占用上，单张峰值约 1.05 GB，低于 Core Image 的 1.48 GB；并支持 sRGB、Adobe RGB、Display P3、ProPhoto RGB 多种色彩空间，以及 TIFF、JPEG、PNG、HEIF 多种格式输出。
+本仓库为 Sony RAW 完整解码器：以 Imaging Edge Edit 的显影管线为蓝本逐阶段复现，输出以相机直出为参照，针对 CPU 与 GPU 分别提供基于 Rust 和 Metal 的加速后端。在速度上，解码一张 3300 万像素的 RAW 仅需 75 ms，比 macOS 自带的 RAW 解码（Core Image）快 11–22 倍，比 LibRaw 快 40–80 倍；在内存占用上，单张峰值约 0.83 GB，低于 Core Image 同样输出 16 位时的 1.58 GB（LibRaw 为 0.61 GB）；并支持 sRGB、Adobe RGB、Display P3、ProPhoto RGB 多种色彩空间，以及 TIFF、JPEG、PNG、HEIF 多种格式输出。
 
 ## 处理管线
 
@@ -32,15 +32,36 @@ Rust 与 Metal 可选，也可以组合使用。NumPy 始终作为逐阶段和�
 
 测试环境：Mac mini，Apple M6，16 GB 内存，macOS 27.2，arm64。输入为 `chart/SonyChart.ARW`，输出为完整的 7008 × 4672 图像。
 
-每个后端先运行一次以初始化缓存和 Metal 着色器，再在同一进程中测量第二次完整解码。
+每个后端先运行一次以初始化缓存和 Metal 着色器，再在同一进程中测量第二次完整解码（Metal 取预热 3 次后 9 次解码的中位数）。
 
 | 后端 | 耗时 | 相对 NumPy 加速 |
 | --- | ---: | ---: |
 | NumPy | 24.92 秒 | 1.0× |
 | Rust | 1.79 秒 | 13.9× |
-| Metal（`--metal`） | 0.088 秒 | 283.2× |
+| Metal（`--metal`） | 0.075 秒 | 332× |
 
 使用 `--metal` 时，如果 Rust 库可用，会自动使用 Rust 读取 RAW 并构建外观表，所以 `--rust --metal` 与它是同一条路径。GPU 阶段分为 RAW 链和渲染链两条 command buffer 提交；GeoCorr 与 SSCS、Marble 与 Effect/ToneCurve/ShadeCorrection 分别在同一个 kernel 内完成。压缩 RAW 在后台线程解码，GPU 同时处理已经解出的行（`SONYLOOK_RAW_STREAM=0` 改为先解码完再开始）。设置 `SONYLOOK_METAL_BATCH=0` 可恢复逐阶段提交。三种后端的整图输出哈希完全一致。新进程中的首次解码还会包含初始化、表构建和 Metal 着色器编译，因此耗时更高。以上数据基于一张合成 ARW，不代表所有相机型号或显影设置下的通用性能。
+
+在同一台机器上，与 macOS 自带的 RAW 解码（Core Image 的 `CIRAWFilter`，照片和预览都用它）以及 LibRaw 0.22.2（通过 rawpy 0.28，该版本为单线程）对比：从文件到内存中的全分辨率 16 位位图，取热运行中位数。Core Image 每次解码都新建 `CIRAWFilter`（同一个 filter 反复渲染同一个文件时，用的是缓存的解码结果，不算真正解码）；LibRaw 执行 `imread` + `postprocess(output_bps=16)`，分别用默认的 AHD 去马赛克和最快的线性插值：
+
+| 文件 | Core Image 默认 | Core Image 关闭降噪、锐化、局部色调 | LibRaw AHD | LibRaw 线性插值 | 本解码器（`--metal`） |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| SonyChart（A7M5） | 857 ms | 1184 ms | 4995 ms | 3047 ms | 74 ms |
+| DSC02741（A7M5） | 1522 ms | 1370 ms | 5988 ms | 3680 ms | 76 ms |
+| DSC06657（A7M5） | 1469 ms | 1376 ms | 6034 ms | 3667 ms | 75 ms |
+| DSC05212（A7M4） | 1546 ms | 1410 ms | 5426 ms | 3482 ms | 69 ms |
+
+DSC02741 单张解码的峰值内存（每项单独一个进程，`/usr/bin/time -l` 的 peak memory footprint，含 GPU 内存）：
+
+| 解码器与输出 | 峰值内存 |
+| --- | ---: |
+| 本解码器，`--metal`，16 位 TIFF 或 JPEG | 0.83 GB |
+| Core Image，16 位 RGBA | 1.58 GB |
+| Core Image，8 位 RGBA | 1.06 GB |
+| LibRaw，16 位 RGB | 0.61 GB |
+| LibRaw，8 位 RGB | 0.50 GB |
+
+Core Image 和 LibRaw 用的是各自的去马赛克和色调（Core Image 还有自己的降噪），LibRaw 还保留整个传感器区域（7168 × 5120，而不是 7008 × 4672 的裁切）；本解码器复现的是 Sony 的流程，所以这里只比较耗时和内存，画面不能直接比较。
 
 ## 安装
 

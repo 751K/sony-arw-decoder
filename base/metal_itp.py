@@ -186,6 +186,37 @@ def process_tile(raw, black, gains, scale, params):
     return tuple(out)
 
 
+def planes_block(shape):
+    """Three (h, w) uint16 planes, laid out one after another in one GPU-resident
+    block when each plane's size keeps the next 16-byte aligned (as Metal binds
+    them); else three separate arrays.  block_view() gives the block as one
+    (h, w, 3) image, so a later stage can write its result over the planes."""
+    h, w = (int(v) for v in shape)
+    if (h * w * 2) % 16 == 0 and os.environ.get("SONYLOOK_PLANE_REUSE", "1") != "0":
+        block = empty((3, h, w))
+        if resident(block):
+            return [block[0], block[1], block[2]]
+    return [empty((h, w)) for _ in range(3)]
+
+
+def block_view(planes):
+    """The (h, w, 3) uint16 array over the memory of three planes from planes_block()
+    (None when they are not one block)."""
+    if len(planes) != 3 or any(p.dtype != np.uint16 or p.ndim != 2 or p.shape != planes[0].shape
+                               or not p.flags.c_contiguous for p in planes):
+        return None
+    h, w = planes[0].shape
+    n = planes[0].nbytes
+    p0 = planes[0].ctypes.data
+    if planes[1].ctypes.data != p0 + n or planes[2].ctypes.data != p0 + 2 * n:
+        return None
+    lib = _load()
+    lib.sonylook_metal_resident.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    if not lib.sonylook_metal_resident(p0, 3 * n):
+        return None
+    return np.lib.stride_tricks.as_strided(planes[0], shape=(h, w, 3), strides=(w * 6, 6, 2))
+
+
 def full_image(raw, black, gains, scale, params, tile=384, halo=12,
                nr_args=None, nr_thresholds=None, stream=None):
     """Run experimental Metal ITP over an RGGB image with Sony's tile edges.
@@ -213,7 +244,7 @@ def full_image(raw, black, gains, scale, params, tile=384, halo=12,
         nr_thresholds = np.ascontiguousarray(nr_thresholds, dtype=np.int32)
         if nr_thresholds.shape != (3, 0x8000):
             raise ValueError("nr_thresholds must have shape (3, 0x8000)")
-    out = [empty(raw.shape) for _ in range(3)]
+    out = planes_block(raw.shape)
     lib = _load()
     rc = lib.sonylook_metal_itp_image(stream.src if stream is not None else raw.ctypes.data, raw.shape[1], raw.shape[0], black.ctypes.data,
                                      gains.ctypes.data, int(scale), p.ctypes.data, tile, halo,

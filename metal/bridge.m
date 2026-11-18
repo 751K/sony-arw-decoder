@@ -16,7 +16,7 @@ static id<MTLSharedEvent> raw_event;
 static uint64_t raw_stream_base;
 static uint64_t grid_event_value;
 static uint64_t pending_grid_value;
-#define NPIPE 59
+#define NPIPE 61
 static id<MTLComputePipelineState> pipelines[NPIPE];
 static char error_text[2048];
 const char *sonylook_metal_error(void) { return error_text; }
@@ -131,8 +131,8 @@ static void pool_put(id<MTLBuffer> b) {
 static NSMutableArray *batch_free;
 static NSUInteger call_mark;            // call_bufs[call_mark..] belong to the current call
 static int no_batch_free;
-// A temporary for this call.
-static id<MTLBuffer> acquire(size_t len,MTLResourceOptions mode) {
+// A temporary not tied to the current call (the caller hands it on or drops it).
+static id<MTLBuffer> take_temp(size_t len,MTLResourceOptions mode) {
     id<MTLBuffer> b=nil;
     if(batch_cmd&&!no_batch_free&&(mode&MTLResourceStorageModeMask)==MTLResourceStorageModePrivate) {
         size_t want=round_len(len);
@@ -143,7 +143,11 @@ static id<MTLBuffer> acquire(size_t len,MTLResourceOptions mode) {
             if(best!=NSNotFound){b=batch_free[best];[batch_free removeObjectAtIndex:best];}
         }
     }
-    if(!b)b=pool_take(len,mode);
+    return b?b:pool_take(len,mode);
+}
+// A temporary for this call.
+static id<MTLBuffer> acquire(size_t len,MTLResourceOptions mode) {
+    id<MTLBuffer> b=take_temp(len,mode);
     if(b){@synchronized(buf_lock){[call_bufs addObject:b];}}
     return b;
 }
@@ -311,7 +315,7 @@ int sonylook_metal_init(const char *path) { @autoreleasepool {
         }
         library=[d newLibraryWithSource:source options:opts error:&err]; if(!library) return fail(err.description);
     }
-    NSArray *names=@[@"scale_raw",@"differences",@"candidates",@"weights",@"green_inputs",@"green_five",@"average_pairs",@"direction_errors",@"direction",@"green_finish",@"chroma_inputs",@"chroma_finish",@"load_tile",@"store_tile",@"dro_subcells",@"dro_histogram",@"dro_smooth",@"dro_weights",@"dro_apply",@"geo_apply",@"sscs_apply",@"look_lm_gamma",@"look_front",@"encoded_front",@"sharp_hblur",@"sharp_apply",@"spica_ycc",@"marble_in",@"marble_blocks",@"marble_sigma",@"marble_binom",@"marble_out",@"post_apply",@"nr_split",@"nr_filter",@"marble_halfc",@"marble_cblocks",@"marble_csigma",@"marble_cup",@"dro_math_test",@"interleave3",@"geo_sscs_apply",@"candidates_both",@"green_inputs_five",@"green_finish_fused",@"dro_smooth_weights",@"marble_out_post",@"load_scale_tile",@"weights_candidates",@"marble_out_packed",@"dro_fix_args",@"dro_apply_fix",@"dro_apply_exact",@"itp_edges",@"itp_final",@"marble_in_half",@"spatial_fused",@"lut_u16",@"geo_front"];
+    NSArray *names=@[@"scale_raw",@"differences",@"candidates",@"weights",@"green_inputs",@"green_five",@"average_pairs",@"direction_errors",@"direction",@"green_finish",@"chroma_inputs",@"chroma_finish",@"load_tile",@"store_tile",@"dro_subcells",@"dro_histogram",@"dro_smooth",@"dro_weights",@"dro_apply",@"geo_apply",@"sscs_apply",@"look_lm_gamma",@"look_front",@"encoded_front",@"sharp_hblur",@"sharp_apply",@"spica_ycc",@"marble_in",@"marble_blocks",@"marble_sigma",@"marble_binom",@"marble_out",@"post_apply",@"nr_split",@"nr_filter",@"marble_halfc",@"marble_cblocks",@"marble_csigma",@"marble_cup",@"dro_math_test",@"interleave3",@"geo_sscs_apply",@"candidates_both",@"green_inputs_five",@"green_finish_fused",@"dro_smooth_weights",@"marble_out_post",@"load_scale_tile",@"weights_candidates",@"marble_out_packed",@"dro_fix_args",@"dro_apply_fix",@"dro_apply_exact",@"itp_edges",@"itp_final",@"marble_in_half",@"spatial_fused",@"lut_u16",@"geo_front",@"spatial_marble",@"marble_border_copy"];
     if(names.count!=NPIPE) return fail(@"Metal kernel table size mismatch");
     pipeline_names=names;
     id<MTLComputePipelineState> ps[NPIPE];
@@ -534,13 +538,19 @@ static void dispatch_dro(id<MTLCommandBuffer> cmd,int kernel,NSArray *buffers,Dr
 // exact recompute of the listed pixels, and an exact full pass that only gets
 // threadgroups when the list overflowed. No CPU round trip, so it batches.
 static int encode_dro_apply(id<MTLCommandBuffer> cmd,NSArray *io,DroArgs *a,uint32_t w,uint32_t h) {
-    size_t n=(size_t)w*h;uint32_t cap=(uint32_t)MAX((size_t)4096,n/64);a->fix_capacity=cap;
+    size_t n=(size_t)w*h;uint32_t cap=(uint32_t)MAX((size_t)4096,n/64);
+    const char *capenv=getenv("SONYLOOK_DRO_FIX_CAP");    // tests: force the overflow path
+    if(capenv)cap=(uint32_t)MAX(1,atoi(capenv));
+    a->fix_capacity=cap;
     id<MTLBuffer> list=acquire((size_t)cap*4,MTLResourceStorageModePrivate);
     id<MTLBuffer> count=acquire(4,MTLResourceStorageModeShared);
     id<MTLBuffer> ind=acquire(6*4,MTLResourceStorageModePrivate);
-    if(!list||!count||!ind)return fail(@"Metal DRO list allocation failed");
+    size_t mbytes=((n+31)/32)*4;
+    id<MTLBuffer> mask=acquire(mbytes,MTLResourceStorageModePrivate);
+    if(!list||!count||!ind||!mask)return fail(@"Metal DRO list allocation failed");
     memset(count.contents,0,4);
-    NSArray *all=[io arrayByAddingObjectsFromArray:@[list,count]];
+    id<MTLBlitCommandEncoder> bl=[cmd blitCommandEncoder];[bl fillBuffer:mask range:NSMakeRange(0,mbytes) value:0];[bl endEncoding];
+    NSArray *all=[io arrayByAddingObjectsFromArray:@[list,count,mask]];
     dispatch_dro(cmd,18,all,a,w,h);
     dispatch_dro(cmd,50,@[count,ind],a,1,1);
     for(int pass=0;pass<2;pass++){
@@ -815,7 +825,30 @@ static NSArray *new_buffers(size_t count,size_t length,MTLResourceOptions option
     return v;
 }
 // Sharpness, YGamma, Spica and YCC2RGB from Y/Cr/Cb buffers into rgb[0..2].
-static int encode_spatial(id<MTLCommandBuffer> cmd,id<MTLBuffer> y,id<MTLBuffer> cr,id<MTLBuffer> cb,uint32_t w,uint32_t h,const SpatialArgs *args,const int16_t *ylut,const int32_t *patterns,const float *coefs,NSArray *rgb) {
+typedef struct { uint32_t width,height,w4,h4,n8w,n8h; int32_t m_fwd[9],m_inv[9]; int32_t thr_y,a_y,g20,g24,lo_l,hi_l,gate,g34,g38,g3c,g40; float f; int32_t inset;
+    int32_t lum_on,bnr,blk,nbw,nbh; uint32_t d0; int32_t cc,c8,c4,c0,bc,b8,b4,b0,ac,a8,l98,l90,l88,t7c,t80; int32_t up_t[4]; } MarbleArgs;
+// Marble's input conversion folded into the spatial pass. Python stages the
+// conversion (sonylook_metal_marble_stage) before a front/spatial call; that
+// call's fused spatial kernel then also writes Marble's Y/Cb/Cr and half-width
+// chroma, kept here under the host address of its R output. A later
+// sonylook_metal_marble on the same planes with the same conversion uses them
+// instead of running marble_in_half; any other call drops them.
+static int mb_req;
+static int32_t mb_req_fwd[9];
+static int16_t mb_req_dec[0x4000],mb_req_enc[0x4000];
+static NSArray *mb_stash_ycc,*mb_stash_half;
+static id<MTLBuffer> mb_stash_bord;      // the inset border, packed (marble_border_index)
+static const void *mb_stash_key;
+static uint32_t mb_stash_w,mb_stash_h;
+static int32_t mb_stash_fwd[9];
+static int16_t mb_stash_dec[0x4000],mb_stash_enc[0x4000];
+int sonylook_metal_marble_stage(const int32_t *m_fwd,const int16_t *dec,const int16_t *enc) {
+    if(!m_fwd||!dec||!enc){mb_req=0;return 0;}
+    memcpy(mb_req_fwd,m_fwd,sizeof(mb_req_fwd));memcpy(mb_req_dec,dec,sizeof(mb_req_dec));memcpy(mb_req_enc,enc,sizeof(mb_req_enc));
+    mb_req=1;return 0;
+}
+static void mb_drop(void){mb_stash_ycc=nil;mb_stash_half=nil;mb_stash_bord=nil;mb_stash_key=NULL;}
+static int encode_spatial(id<MTLCommandBuffer> cmd,id<MTLBuffer> y,id<MTLBuffer> cr,id<MTLBuffer> cb,uint32_t w,uint32_t h,const SpatialArgs *args,const int16_t *ylut,const int32_t *patterns,const float *coefs,NSArray *rgb,const void *key) {
     SpatialArgs a=*args;a.width=w;a.height=h;size_t n=(size_t)w*h;
     id<MTLBuffer> lut=in_buf(ylut,65536*2);
     id<MTLBuffer> pat=in_buf(patterns,256*3*4);
@@ -823,7 +856,43 @@ static int encode_spatial(id<MTLCommandBuffer> cmd,id<MTLBuffer> y,id<MTLBuffer>
     if(!lut||!pat||!cof)return fail(@"Metal spatial buffer allocation failed");
     // SONYLOOK_SPATIAL_FUSED=0: the three separate kernels with hb/yg planes.
     const char *fused=getenv("SONYLOOK_SPATIAL_FUSED");
+    int staged=mb_req&&key&&w>=10&&h>=10;mb_req=0;
+    if(key)mb_drop();                  // a new image at possibly the same address
     if(!fused||atoi(fused)) {
+        if(staged) {
+            MarbleArgs ma;memset(&ma,0,sizeof(ma));ma.width=w;ma.height=h;ma.w4=(w+3)&~3u;ma.h4=(h+3)&~3u;
+            memcpy(ma.m_fwd,mb_req_fwd,sizeof(ma.m_fwd));
+            size_t hn=(size_t)(ma.w4/2)*ma.h4;
+            id db=in_buf(mb_req_dec,0x4000*2),eb=in_buf(mb_req_enc,0x4000*2);
+            NSMutableArray *ycc=[NSMutableArray array],*half=[NSMutableArray array];
+            // Each pixel's Cr/Cb is read only by the thread that writes Marble's
+            // Cb/Cr for it, so a private Cr/Cb temporary of this call is
+            // overwritten in place and taken out of the call's temporaries.
+            // Shared ones are the caller's arrays (or copies of them): not written.
+            int inplace=cr.storageMode==MTLStorageModePrivate&&cb.storageMode==MTLStorageModePrivate;
+            int nnew=inplace?1:3;
+            for(int i=0;i<nnew;i++){id<MTLBuffer> b=take_temp(n*2,MTLResourceStorageModePrivate);if(!b)return fail(@"Metal spatial buffer allocation failed");[ycc addObject:b];}
+            if(inplace){
+                @synchronized(buf_lock){[call_bufs removeObjectIdenticalTo:cr];[call_bufs removeObjectIdenticalTo:cb];}
+                [ycc addObject:cb];[ycc addObject:cr];       // Marble's order: Y, Cb, Cr
+            }
+            for(int i=0;i<2;i++){id<MTLBuffer> b=take_temp(hn*2,MTLResourceStorageModePrivate);if(!b)return fail(@"Metal spatial buffer allocation failed");[half addObject:b];}
+            size_t nbord=(w>=32&&h>=32)?(size_t)32*w+(size_t)(h-32)*32:1;
+            id<MTLBuffer> bord=take_temp(nbord*6,MTLResourceStorageModePrivate);
+            if(!db||!eb||!bord)return fail(@"Metal spatial buffer allocation failed");
+            id<MTLComputeCommandEncoder> e=new_encoder(cmd,59);[e setComputePipelineState:pipelines[59]];
+            NSArray *bufs=[@[y,cr,cb,lut,pat,cof] arrayByAddingObjectsFromArray:rgb];
+            for(NSUInteger i=0;i<bufs.count;i++)bind(e,bufs[i],i);
+            [e setBytes:&a length:sizeof(a) atIndex:9];
+            NSArray *more=[[@[db,eb] arrayByAddingObjectsFromArray:ycc] arrayByAddingObjectsFromArray:half];
+            for(NSUInteger i=0;i<more.count;i++)bind(e,more[i],10+i);
+            [e setBytes:&ma length:sizeof(ma) atIndex:17];
+            [e setBuffer:bord offset:0 atIndex:18];
+            [e dispatchThreadgroups:MTLSizeMake((w+31)/32,(h+31)/32,1) threadsPerThreadgroup:MTLSizeMake(32,8,1)];[e endEncoding];
+            mb_stash_ycc=ycc;mb_stash_half=half;mb_stash_bord=bord;mb_stash_key=key;mb_stash_w=w;mb_stash_h=h;
+            memcpy(mb_stash_fwd,mb_req_fwd,sizeof(mb_stash_fwd));memcpy(mb_stash_dec,mb_req_dec,sizeof(mb_stash_dec));memcpy(mb_stash_enc,mb_req_enc,sizeof(mb_stash_enc));
+            return 0;
+        }
         id<MTLComputeCommandEncoder> e=new_encoder(cmd,56);[e setComputePipelineState:pipelines[56]];
         NSArray *bufs=[@[y,cr,cb,lut,pat,cof] arrayByAddingObjectsFromArray:rgb];
         for(NSUInteger i=0;i<bufs.count;i++)bind(e,bufs[i],i);
@@ -855,7 +924,7 @@ int sonylook_metal_spatial(const uint16_t *y,const uint16_t *cr,const uint16_t *
     NSArray *rgb=out3(r,g,b,n*2);
     if(!yb||!crb||!cbb||!rgb)return fail(@"Metal spatial buffer allocation failed");
     id<MTLCommandBuffer> cmd=command_buffer();
-    if(encode_spatial(cmd,yb,crb,cbb,w,h,args,ylut,patterns,coefs,rgb))return -1;
+    if(encode_spatial(cmd,yb,crb,cbb,w,h,args,ylut,patterns,coefs,rgb,r))return -1;
     return finish_rgb(cmd,rgb,n,r,g,b);
 }}
 // LinearMatrix16 through YCC2RGB in one command buffer; Y/Cr/Cb stay on the GPU.
@@ -870,7 +939,7 @@ int sonylook_metal_front_spatial(const uint16_t *rgbin,uint32_t w,uint32_t h,con
     if(!rgbb||!tab||!gb||!ab||!ycc||!rgb)return fail(@"Metal front/spatial buffer allocation failed");
     id<MTLCommandBuffer> cmd=command_buffer();
     encode_grid(cmd,22,[@[rgbb,tab,gb,ab] arrayByAddingObjectsFromArray:ycc],&fa,sizeof(fa),w,h);
-    if(encode_spatial(cmd,ycc[0],ycc[1],ycc[2],w,h,args,ylut,patterns,coefs,rgb))return -1;
+    if(encode_spatial(cmd,ycc[0],ycc[1],ycc[2],w,h,args,ylut,patterns,coefs,rgb,r))return -1;
     return finish_rgb(cmd,rgb,n,r,g,b);
 }}
 
@@ -904,13 +973,11 @@ int sonylook_metal_geo_front_spatial(const uint16_t *r,const uint16_t *g,const u
     for(NSUInteger i=0;i<bufs.count;i++)bind(e,bufs[i],i);
     [e setBytes:&a length:sizeof(a) atIndex:bufs.count];
     [e dispatchThreadgroups:MTLSizeMake((ow+63)/64,(oh+3)/4,1) threadsPerThreadgroup:MTLSizeMake(64,4,1)];[e endEncoding];
-    if(encode_spatial(cmd,ycc[0],ycc[1],ycc[2],ow,oh,args,ylut,patterns,coefs,rgb))return -1;
+    if(encode_spatial(cmd,ycc[0],ycc[1],ycc[2],ow,oh,args,ylut,patterns,coefs,rgb,R))return -1;
     return finish_rgb(cmd,rgb,n_out,R,G,B);
 }}
 
 typedef struct { uint32_t width,height,capacity; int32_t effect,conv,m_fwd[9],m_inv[9]; float t_r,t_b,c_hi[3],c_lo[3]; int32_t tone,shade,cw,ch; float g_hi[11],g_lo[11],d_hi[10],d_lo[10]; uint32_t diff_zero,lo_one; int32_t c10_one; } PostArgs;
-typedef struct { uint32_t width,height,w4,h4,n8w,n8h; int32_t m_fwd[9],m_inv[9]; int32_t thr_y,a_y,g20,g24,lo_l,hi_l,gate,g34,g38,g3c,g40; float f; int32_t inset;
-    int32_t lum_on,bnr,blk,nbw,nbh; uint32_t d0; int32_t cc,c8,c4,c0,bc,b8,b4,b0,ac,a8,l98,l90,l88,t7c,t80; int32_t up_t[4]; } MarbleArgs;
 typedef struct { MarbleArgs m; uint32_t shift; } MarblePackArgs;
 // ZcTaskMarble on whole planes: the luma path when lum_on, the chroma path when bnr.
 // tables: initial dec/enc, final dec/enc (0x4000 int16 each); upw: chroma upsample weights.
@@ -926,11 +993,35 @@ int sonylook_metal_marble(const uint16_t *r,const uint16_t *g,const uint16_t *b,
     a.w4=(w+3)&~3u;a.h4=(h+3)&~3u;a.n8w=(a.w4+7)>>3;a.n8h=(a.h4+7)>>3;
     if(a.bnr&&(a.blk!=4&&a.blk!=8))return fail(@"Marble chroma block size must be 4 or 8");
     a.nbw=(int32_t)((a.w4+a.blk-1)/(a.blk?a.blk:1));a.nbh=(int32_t)((a.h4+a.blk-1)/(a.blk?a.blk:1));
+    // The packed result may be written over r/g/b when they are the three
+    // consecutive planes of that same block (the decoder's ITP planes). The
+    // other passes read only Y/Cb/Cr, so just the border pixels the inset
+    // keeps are copied out first (marble_border_copy) and read from there.
+    int over=0;
+    if(packed){
+        uintptr_t P=(uintptr_t)packed,R=(uintptr_t)r,G=(uintptr_t)g,B=(uintptr_t)b,E=P+n*6;
+        int overlap=(R<E&&R+n*2>P)||(G<E&&G+n*2>P)||(B<E&&B+n*2>P);
+        if(overlap){
+            if(R!=P||G!=P+n*2||B!=P+n*4||w<32||h<32)return fail(@"Marble output overlaps its input other than as one plane block");
+            over=1;
+            if(a.inset)a.inset=2;
+        }
+    }
     size_t hn=(size_t)(a.w4/2)*a.h4;
     id rb=in_buf(r,n*2),gb=in_buf(g,n*2),bb=in_buf(b,n*2),ub=in_buf(upw,(size_t)upw_len*4);
     id t[4];const int16_t *tabs[4]={dec_in,enc_in,dec_out,enc_out};
     for(int i=0;i<4;i++){t[i]=in_buf(tabs[i],0x4000*2);if(!t[i])return fail(@"Metal Marble buffer allocation failed");}
-    NSArray *ycc=new_buffers(3,n*2,MTLResourceStorageModePrivate),*half=new_buffers(2,hn*2,MTLResourceStorageModePrivate),*rgb=packed?nil:out3(ro,go,bo,n*2);
+    // Y/Cb/Cr and half chroma already written by the spatial pass (see mb_req).
+    int stashed=mb_stash_ycc&&mb_stash_key==r&&mb_stash_w==w&&mb_stash_h==h&&!memcmp(mb_stash_fwd,a.m_fwd,sizeof(mb_stash_fwd))
+        &&!memcmp(mb_stash_dec,dec_in,sizeof(mb_stash_dec))&&!memcmp(mb_stash_enc,enc_in,sizeof(mb_stash_enc));
+    NSArray *ycc,*half;
+    if(stashed){
+        ycc=mb_stash_ycc;half=mb_stash_half;
+        @synchronized(buf_lock){[call_bufs addObjectsFromArray:ycc];[call_bufs addObjectsFromArray:half];if(mb_stash_bord)[call_bufs addObject:mb_stash_bord];}
+    } else {ycc=new_buffers(3,n*2,MTLResourceStorageModePrivate);half=new_buffers(2,hn*2,MTLResourceStorageModePrivate);}
+    id<MTLBuffer> stash_bord=stashed?mb_stash_bord:nil;
+    mb_drop();
+    NSArray *rgb=packed?nil:out3(ro,go,bo,n*2);
     id packed_buf=packed?out_buf(packed,n*6):nil;
     id<MTLBuffer> m=acquire((size_t)a.n8w*a.n8h*4,MTLResourceStorageModePrivate);
     id<MTLBuffer> q=acquire((size_t)(a.n8w+12)*(a.n8h+12)*4,MTLResourceStorageModePrivate);
@@ -949,7 +1040,19 @@ int sonylook_metal_marble(const uint16_t *r,const uint16_t *g,const uint16_t *b,
         if(!mab||!lb||!fb||!fib||!cb)return fail(@"Metal fused Post buffer allocation failed");
     }
     id<MTLCommandBuffer> cmd=command_buffer();
-    if(getenv("SONYLOOK_MARBLE_HALFC")&&strcmp(getenv("SONYLOOK_MARBLE_HALFC"),"0")!=0){   // separate passes, for comparison
+    id r0b=rb,g0b=gb,b0b=bb;
+    if(over&&a.inset){
+        // The border the spatial pass wrote with the stash, else a copy now.
+        size_t nb=(size_t)32*w+(size_t)(h-32)*32;
+        id<MTLBuffer> bord=stash_bord?stash_bord:acquire(nb*6,MTLResourceStorageModePrivate);
+        if(!bord)return fail(@"Metal Marble border allocation failed");
+        SLBuf *x=[SLBuf new],*y=[SLBuf new],*z=[SLBuf new];
+        x.buf=bord;x.off=0;y.buf=bord;y.off=nb*2;z.buf=bord;z.off=nb*4;
+        r0b=x;g0b=y;b0b=z;
+        if(!stash_bord)encode_grid(cmd,60,@[rb,gb,bb,x,y,z],&a,sizeof(a),(uint32_t)nb,1);
+    }
+    if(stashed){}
+    else if(getenv("SONYLOOK_MARBLE_HALFC")&&strcmp(getenv("SONYLOOK_MARBLE_HALFC"),"0")!=0){   // separate passes, for comparison
         encode_grid(cmd,27,[@[rb,gb,bb,t[0],t[1]] arrayByAddingObjectsFromArray:ycc],&a,sizeof(a),w,h);
         encode_grid(cmd,35,@[ycc[1],ycc[2],half[0],half[1]],&a,sizeof(a),a.w4/2,a.h4);
     } else encode_grid(cmd,55,[[@[rb,gb,bb,t[0],t[1]] arrayByAddingObjectsFromArray:ycc] arrayByAddingObjectsFromArray:half],&a,sizeof(a),a.w4/2,a.h4);
@@ -976,7 +1079,7 @@ int sonylook_metal_marble(const uint16_t *r,const uint16_t *g,const uint16_t *b,
     if(post) {
         // Packed: one interleaved output, bound in all three plane slots.
         NSArray *outs=packed?@[packed_buf,packed_buf,packed_buf]:rgb;
-        NSArray *buffers=[[[[[ycc arrayByAddingObjectsFromArray:@[q2,rb,gb,bb,t[2],t[3]]] arrayByAddingObjectsFromArray:hc]
+        NSArray *buffers=[[[[[ycc arrayByAddingObjectsFromArray:@[q2,r0b,g0b,b0b,t[2],t[3]]] arrayByAddingObjectsFromArray:hc]
                            arrayByAddingObject:mab]
                            arrayByAddingObjectsFromArray:@[pb[0],pb[1],pb[2],pb[3],lb]]
                           arrayByAddingObjectsFromArray:outs];
@@ -989,11 +1092,11 @@ int sonylook_metal_marble(const uint16_t *r,const uint16_t *g,const uint16_t *b,
         [e dispatchThreads:MTLSizeMake(w,h,1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];[e endEncoding];
     } else if(packed) {
         MarblePackArgs pa={a,shift};
-        NSArray *buffers=[[ycc arrayByAddingObjectsFromArray:@[q2,rb,gb,bb,t[2],t[3]]] arrayByAddingObjectsFromArray:@[packed_buf]];
+        NSArray *buffers=[[ycc arrayByAddingObjectsFromArray:@[q2,r0b,g0b,b0b,t[2],t[3]]] arrayByAddingObjectsFromArray:@[packed_buf]];
         buffers=[buffers arrayByAddingObjectsFromArray:hc];
         encode_grid(cmd,49,buffers,&pa,sizeof(pa),w,h);
     } else {
-        encode_grid(cmd,31,[[[ycc arrayByAddingObjectsFromArray:@[q2,rb,gb,bb,t[2],t[3]]] arrayByAddingObjectsFromArray:rgb] arrayByAddingObjectsFromArray:hc],&a,sizeof(a),w,h);
+        encode_grid(cmd,31,[[[ycc arrayByAddingObjectsFromArray:@[q2,r0b,g0b,b0b,t[2],t[3]]] arrayByAddingObjectsFromArray:rgb] arrayByAddingObjectsFromArray:hc],&a,sizeof(a),w,h);
     }
     int rc=submit_command(cmd);if(rc)return rc;
     if(packed)copy_back(packed_buf,packed,n*6);

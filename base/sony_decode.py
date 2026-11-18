@@ -86,23 +86,39 @@ def _abort_metal_batch_on_error(fn):
     def wrapped(*args, **kwargs):
         try:
             result = fn(*args, **kwargs)
-        except BaseException:
-            for job in _RAW_STREAMS:
-                job.release()
-            try:
-                import metal_itp
-                metal_itp.abort()
-            except Exception:
-                pass
-            for job in _RAW_STREAMS:
-                job._thread.join()
-            _RAW_STREAMS.clear()
+        except BaseException as exc:
+            if type(exc).__name__ == "PlaneReuseOverflow":
+                # Rare (metal_look.PlaneReuseOverflow): the final image was written
+                # over planes a rerun needs. Clean up, then decode without reusing them.
+                _cleanup_failed()
+                saved = os.environ.get("SONYLOOK_PLANE_REUSE")
+                os.environ["SONYLOOK_PLANE_REUSE"] = "0"
+                try:
+                    return wrapped(*args, **kwargs)
+                finally:
+                    if saved is None:
+                        os.environ.pop("SONYLOOK_PLANE_REUSE", None)
+                    else:
+                        os.environ["SONYLOOK_PLANE_REUSE"] = saved
+            _cleanup_failed()
             raise
         jobs = list(_RAW_STREAMS)
         _RAW_STREAMS.clear()
         for job in jobs:
             job.finish()
         return result
+
+    def _cleanup_failed():
+        for job in _RAW_STREAMS:
+            job.release()
+        try:
+            import metal_itp
+            metal_itp.abort()
+        except Exception:
+            pass
+        for job in _RAW_STREAMS:
+            job._thread.join()
+        _RAW_STREAMS.clear()
     return wrapped
 
 
@@ -332,9 +348,11 @@ def decode(arw, look=None, *, output="srgb", raw=None, nr=None, dro=None, marble
     if dro:
         if metal_dro:
             import metal_dro as MD
+            # Over the ITP planes: nothing else reads them.
             planes = list(MD.apply_prepared(
                 planes, dro_grid, dro_black, dro_curve,
-                origin=(ox, oy), raw_size=raw_dro.shape[::-1]))
+                origin=(ox, oy), raw_size=raw_dro.shape[::-1],
+                inplace=metal_itp and os.environ.get("SONYLOOK_PLANE_REUSE", "1") != "0"))
         elif use_rust and FR.available():
             metal_sync()
             G = DRO.build_grid(raw_dro, *dro_pts, black=dro_black, model=dro_model)
@@ -576,6 +594,9 @@ def main():
     img = decode(a.arw, kw.pop("look"), **kw)
     print(img.shape, img.dtype, int(img.min()), int(img.max()))
     if a.out:
+        MI = sys.modules.get("metal_itp")
+        if MI is not None:
+            MI.trim()          # one image: the idle pooled GPU buffers are not reused
         out = EXP.write_image(img, a.out, **write_kwargs(a, output_bits))
         print("->", out)
 
