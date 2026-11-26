@@ -64,25 +64,53 @@ Core Image and LibRaw apply their own demosaic and tone (Core Image also its own
 
 ## Install
 
+### Prebuilt Wheel (recommended, no Rust or Xcode needed)
+
+Download the platform `.whl` from GitHub Releases (macOS arm64 wheels bundle both the Rust core and the Metal bridge/shaders) or install a locally built wheel:
+
+```bash
+pip install sony_arw_decoder-*.whl
+# or with uv:
+uv tool install sony_arw_decoder-*.whl
+```
+
+This installs the `sony-decode` and `sony-batch` commands and the `sony_arw_decoder` Python package:
+
+```bash
+sony-decode photo.ARW --metal --out out.tif
+sony-batch ~/Pictures/2025 --out-dir out --format hif --metal
+```
+
+```python
+from sony_arw_decoder import decode, write_image
+
+image = decode("photo.ARW", metal=True, output_bits=16)
+write_image(image, "out.tif", input_bits=16)
+```
+
+### From source and building distributable wheels
+
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
 python3 -m pip install -r requirements.txt
 ```
 
-Build the Rust core:
+Build a distributable platform wheel (automatically compiles and bundles the Rust core and, on macOS, the Metal bridge and shaders):
+
+```bash
+uv build --wheel
+# or: python3 -m build --wheel --no-isolation --outdir dist
+```
+
+Or build the native libraries individually for running directly from a checkout:
 
 ```bash
 cargo build --release --manifest-path rust/sonylook_core/Cargo.toml
-```
-
-Build the Metal bridge on macOS:
-
-```bash
 ./metal/build.sh
 ```
 
-When the full Metal toolchain is available, the script precompiles `metal/shaders/shaders.metallib`; otherwise it builds the bridge and the runtime compiles the shader sources.
+When the full Metal toolchain is available, `./metal/build.sh` precompiles `metal/shaders/shaders.metallib` (default `MACOSX_DEPLOYMENT_TARGET=13.0`); if a host cannot load the precompiled library, the runtime automatically falls back to compiling the bundled `.metal` sources.
 
 ## Decode
 

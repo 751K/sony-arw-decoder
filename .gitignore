@@ -14,3 +14,8 @@ chart/*.npy
 rust/sonylook_core/target/
 metal/libsonylook_metal.dylib
 metal/shaders/shaders.metallib
+build/
+dist/
+*.egg-info/
+sony_arw_decoder/_base/
+sony_arw_decoder/_native/

@@ -51,13 +51,14 @@ def fcvtzs(x):
 
 
 import ctypes as _ct
-_libm = _ct.CDLL("/usr/lib/libSystem.B.dylib")
+import _native as _nat
+_libm = _nat.load_libm()
 _libm.fma.argtypes = (_ct.c_double, _ct.c_double, _ct.c_double)
 _libm.fma.restype = _ct.c_double
 
 
 def fma64(a, b, c):
-    """IEEE double fused multiply-add (C99 fma from libSystem)."""
+    """IEEE double fused multiply-add (C99 fma from libm)."""
     return _libm.fma(a, b, c)
 
 

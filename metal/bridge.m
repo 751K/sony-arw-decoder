@@ -296,7 +296,7 @@ int sonylook_metal_init(const char *path) { @autoreleasepool {
     id<MTLLibrary> library=nil;
     if([[NSFileManager defaultManager] fileExistsAtPath:compiled]) {
         library=[d newLibraryWithURL:[NSURL fileURLWithPath:compiled] error:&err];
-        if(!library)return fail(err.description);
+        if(!library) err=nil;   // fall back to runtime shader compilation if SDK versions differ
     }
     if(!library) {
         for(NSString *name in @[@"itp",@"dro",@"geo",@"sscs",@"look",@"spatial",@"marble",@"post",@"nr"]){

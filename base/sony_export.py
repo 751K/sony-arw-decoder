@@ -65,8 +65,8 @@ HEIF_EXTS = (".hif", ".heif", ".heic")
 @lru_cache(maxsize=1)
 def _heif_lib():
     import ctypes
-    import os
-    path = os.environ.get("SONYLOOK_METAL_LIB") or str(Path(__file__).resolve().parents[1] / "metal" / "libsonylook_metal.dylib")
+    import _native
+    path = str(_native.metal_lib_path())
     try:
         lib = ctypes.CDLL(path)
         fn = lib.sonylook_heif_write

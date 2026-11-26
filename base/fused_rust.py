@@ -187,12 +187,8 @@ class SscsConfig:
 
 
 def _lib_path() -> Path:
-    env = os.environ.get("SONYLOOK_RUST_LIB")
-    if env:
-        return Path(env)
-    root = Path(__file__).resolve().parent.parent
-    name = "libsonylook_core.dylib" if os.uname().sysname == "Darwin" else "libsonylook_core.so"
-    return root / "rust" / "sonylook_core" / "target" / "release" / name
+    import _native
+    return _native.rust_lib_path()
 
 
 _lib = None

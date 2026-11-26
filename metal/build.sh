@@ -3,6 +3,7 @@ set -eu
 
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 SHADERS="$ROOT/metal/shaders"
+MIN_MACOS="${MACOSX_DEPLOYMENT_TARGET:-13.0}"
 TMP="$(mktemp -t sonylook-shaders).metal"
 AIR="$(mktemp -t sonylook-shaders).air"
 trap 'rm -f "$TMP" "$AIR"' EXIT
@@ -12,7 +13,7 @@ if xcrun --find metal >/dev/null 2>&1 && xcrun --find metallib >/dev/null 2>&1; 
         cat "$SHADERS/$name.metal" >> "$TMP"
     done
     # Match the runtime's MTLMathModeSafe path: no relaxed IEEE arithmetic.
-    xcrun -sdk macosx metal -fno-fast-math -c "$TMP" -o "$AIR"
+    xcrun -sdk macosx metal -mmacosx-version-min="$MIN_MACOS" -fno-fast-math -c "$TMP" -o "$AIR"
     xcrun -sdk macosx metallib "$AIR" -o "$SHADERS/shaders.metallib"
 else
     # Never let a stale metallib mask edited shader sources on a machine
@@ -21,7 +22,7 @@ else
     printf '%s\n' 'Metal compiler unavailable; the runtime will compile the shader sources.'
 fi
 
-clang -O2 -fobjc-arc -dynamiclib -framework Foundation -framework Metal \
+clang -O2 -mmacosx-version-min="$MIN_MACOS" -fobjc-arc -dynamiclib -framework Foundation -framework Metal \
     -framework CoreImage -framework ImageIO -framework CoreGraphics \
     "$ROOT/metal/bridge.m" "$ROOT/metal/heif.m" -o "$ROOT/metal/libsonylook_metal.dylib"
 

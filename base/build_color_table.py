@@ -41,7 +41,8 @@ def div(a,b):
 
 # Native C99 fmaf computes a single rounding of the exact product plus addend.
 # It is used only where the ARM64 instruction stream actually contains FMA.
-_libsystem = ctypes.CDLL('/usr/lib/libSystem.B.dylib')
+import _native as _nat
+_libsystem = _nat.load_libm()
 _fmaf = _libsystem.fmaf
 _fmaf.argtypes = (ctypes.c_float,ctypes.c_float,ctypes.c_float)
 _fmaf.restype = ctypes.c_float

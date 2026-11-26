@@ -21,7 +21,8 @@ _lib = None
 def _load():
     global _lib
     if _lib is None:
-        lib = ctypes.CDLL(os.environ.get("SONYLOOK_METAL_LIB") or str(_DIR / "libsonylook_metal.dylib"))
+        import _native
+        lib = ctypes.CDLL(str(_native.metal_lib_path()))
         lib.sonylook_metal_error.restype = ctypes.c_char_p
         lib.sonylook_metal_init.argtypes = [ctypes.c_char_p]
         lib.sonylook_metal_itp_debug.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
@@ -54,7 +55,7 @@ def _load():
         lib.sonylook_metal_raw_stream_begin.restype = ctypes.c_uint64
         lib.sonylook_metal_raw_release.argtypes = [ctypes.c_uint64]
         lib.sonylook_metal_raw_release.restype = None
-        if lib.sonylook_metal_init(str(_DIR / "shaders").encode()):
+        if lib.sonylook_metal_init(str(_native.metal_shaders_dir()).encode()):
             raise RuntimeError(lib.sonylook_metal_error().decode())
         _lib = lib
     return _lib

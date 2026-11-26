@@ -65,25 +65,53 @@ Core Image 和 LibRaw 用的是各自的去马赛克和色调（Core Image 还�
 
 ## 安装
 
+### 安装预编译 Wheel（推荐，无需 Rust / Xcode）
+
+从 GitHub Releases 下载对应平台的 `.whl` 文件（macOS arm64 已内置 Rust 与 Metal 加速库和着色器），或本地构建后直接安装：
+
+```bash
+pip install sony_arw_decoder-*.whl
+# 或使用 uv：
+uv tool install sony_arw_decoder-*.whl
+```
+
+安装后可直接运行全局命令 `sony-decode` 和 `sony-batch`，或在 Python 中导入：
+
+```bash
+sony-decode photo.ARW --metal --out out.tif
+sony-batch ~/Pictures/2025 --out-dir out --format hif --metal
+```
+
+```python
+from sony_arw_decoder import decode, write_image
+
+image = decode("photo.ARW", metal=True, output_bits=16)
+write_image(image, "out.tif", input_bits=16)
+```
+
+### 从源码安装与构建分发包
+
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
 python3 -m pip install -r requirements.txt
 ```
 
-构建 Rust 内核：
+构建当前平台的可分发 Wheel（自动编译并打包 Rust 内核，macOS 同时打包 Metal 动态库与着色器）：
+
+```bash
+python3 -m pip install build wheel setuptools
+python3 -m build --wheel --no-isolation --outdir dist
+```
+
+也可以仅按需单独构建原生内核供源码目录运行：
 
 ```bash
 cargo build --release --manifest-path rust/sonylook_core/Cargo.toml
-```
-
-在 macOS 上构建 Metal 桥接层：
-
-```bash
 ./metal/build.sh
 ```
 
-完整 Metal 工具链可用时，脚本会预编译 `metal/shaders/shaders.metallib`；否则生成动态库，并让运行时从 shader 源码编译。
+完整 Metal 工具链可用时，`./metal/build.sh` 会预编译 `metal/shaders/shaders.metallib`（默认 `MACOSX_DEPLOYMENT_TARGET=13.0`）；若在旧版 macOS 上无法加载预编译库，运行时会自动回退到内置 `.metal` 源码编译。
 
 ## 解码
 

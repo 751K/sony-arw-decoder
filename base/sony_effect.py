@@ -32,7 +32,8 @@ import numpy as np
 
 from sony_look import fma32
 
-_libm = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+import _native as _nat
+_libm = _nat.load_libm()
 _libm.powf.argtypes = (ctypes.c_float, ctypes.c_float)
 _libm.powf.restype = ctypes.c_float
 

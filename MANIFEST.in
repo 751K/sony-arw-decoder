@@ -1,0 +1,8 @@
+include LICENSE README.md README.zh-CN.md pyproject.toml setup.py
+recursive-include sony_arw_decoder *.py
+recursive-include base *.py *.json
+exclude base/edit_binary.py
+recursive-include rust/sonylook_core Cargo.toml Cargo.lock *.rs
+recursive-include metal build.sh *.m
+recursive-include metal/shaders *.metal
+global-exclude __pycache__ *.pyc *.pyo .DS_Store
