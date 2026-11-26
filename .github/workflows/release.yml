@@ -18,7 +18,7 @@ jobs:
       matrix:
         include:
           - name: macos-arm64
-            os: macos-14
+            os: macos-15
             env:
               MACOSX_DEPLOYMENT_TARGET: "13.0"
           - name: linux-x86_64

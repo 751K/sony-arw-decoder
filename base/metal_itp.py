@@ -83,9 +83,9 @@ def empty(shape, dtype=np.uint16):
 def resident(a):
     """True when `a` is a C-contiguous array in GPU-resident memory (empty()), so
     Metal stages read and write it in place."""
-    if not (isinstance(a, np.ndarray) and a.flags.c_contiguous and a.flags.writeable and a.size):
+    if _lib is None or not (isinstance(a, np.ndarray) and a.flags.c_contiguous and a.flags.writeable and a.size):
         return False
-    lib = _load()
+    lib = _lib
     lib.sonylook_metal_resident.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
     return bool(lib.sonylook_metal_resident(a.ctypes.data, a.nbytes))
 
@@ -104,7 +104,8 @@ def lut_u16(data, lut):
 
 def trim():
     """Release the idle buffers held by the Metal buffer pool."""
-    _load().sonylook_metal_trim()
+    if _lib is not None:
+        _lib.sonylook_metal_trim()
 
 
 def begin():
@@ -123,7 +124,8 @@ def end():
 
 def abort():
     """Discard a shared command buffer without submitting it."""
-    _load().sonylook_metal_abort()
+    if _lib is not None:
+        _lib.sonylook_metal_abort()
 
 
 def flush():
