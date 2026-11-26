@@ -144,7 +144,7 @@ class RawStream(ctypes.Structure):
 
 def active():
     """True while a shared command buffer is open."""
-    return bool(_load().sonylook_metal_is_active())
+    return _lib is not None and bool(_lib.sonylook_metal_is_active())
 
 
 def debug_stage(raw, black, gains, scale, params, stage):

@@ -12,11 +12,11 @@ Sharpness (between ChromaSuppress and YGamma; Y on 0..32767):
   Y' = clamp(Y + k*e, 0, 32767), truncated
   thr = dev214 + 25, s0/s1 = (dev20c/dev210 + 100)/100, s9 = dev2c4*0.015 - 0.5 (dev2c4 <= 50),
   k = look+0x1060 * 0.02 * (dev208 + 100) * (dev2c4*0.02) * s11 (obj+0x2277c == 1 -> s11 = 1).
-Spica (after YGamma/YNR, before YCC2RGB; srsettings0000.tbl from Edit.app/Contents/Resources):
-  9-pixel cross census -> pattern (0..255) -> (coefficient set, tap step dx, dy) -> 25-tap diamond
-  filter f (x512). d = (f - 512 Y) * s; gain = 2 * min(g1(d/128), g2(max-min), g3((max+min)/2))
-  t = trunc(d * gain / 512^2) + Y  (clamped 0..16383), then Y' = Y + k2 (t - Y), k2 = 0.5*0.0002*
-  (dev208+100)*(100-dev2c4). The output region shrinks by 3 (filter) / 4 (task).
+Spica (after YGamma/YNR, before YCC2RGB; standalone analytic directional 25-tap filter bank):
+  9-pixel cross census -> symmetry-folded pattern (0..255 -> 100 canonical orbits, tap step dx, dy)
+  -> 25-tap diamond filter f (x512). d = (f - 512 Y) * s; gain = 2 * min(g1(d/128), g2(max-min),
+  g3((max+min)/2)). t = trunc(d * gain / 512^2) + Y (clamped 0..16383), then Y' = Y + k2 (t - Y),
+  k2 = 0.5*0.0002*(dev208+100)*(100-dev2c4). The output region shrinks by 3 (filter) / 4 (task).
 """
 import struct
 from functools import lru_cache
@@ -27,8 +27,7 @@ import numpy as np
 from sony_look import fma32
 
 f32 = np.float32
-import edit_binary  # noqa: E402
-SRSETTINGS = edit_binary.resources_path() / "srsettings0000.tbl"     # from the user's Edit install
+SRSETTINGS = None     # None = use the standalone analytic filter bank (no Edit install needed)
 
 # ------------------------------------------------------------------------------------------------
 # Sharpness
@@ -106,10 +105,81 @@ def sharpness(Y, region, P):
 # ------------------------------------------------------------------------------------------------
 # Spica
 
+@lru_cache(maxsize=1)
+def _default_spica_table():
+    """Standalone analytic 25-tap directional sharpening filter bank for Spica.
+
+    Folds the 256 9-point cross census codes under the 4-element reflection group
+    (dx, dy) in {+1, -1}^2 into their exact 100 canonical orbits, then derives an
+    anisotropic high-boost diamond kernel for each orbit from its cross gradient
+    (smoothing along the edge tangent and sharpening across the edge normal, with
+    exact DC gain 512). Requires no external .tbl file."""
+    idx_of = {pt: i for i, pt in enumerate(CROSS)}
+
+    def flip_code(code, sx, sy):
+        bits = [(code >> i) & 1 for i in range(8)] + [0]
+        nbits = [bits[idx_of[(sx * x, sy * y)]] for x, y in CROSS]
+        if nbits[8]:
+            nbits = [1 - b for b in nbits]
+        return sum(nbits[i] << i for i in range(8))
+
+    orbit_map = {}
+    patterns = np.zeros((256, 3), dtype=np.int64)
+    canon_codes = []
+    for c in range(256):
+        rep, sx, sy = min(((flip_code(c, sx, sy), sx, sy)
+                           for sx in (1, -1) for sy in (1, -1)), key=lambda t: t[0])
+        if rep not in orbit_map:
+            orbit_map[rep] = len(canon_codes)
+            canon_codes.append(rep)
+        patterns[c] = (orbit_map[rep], sx, sy)
+
+    assert len(canon_codes) == 100
+    coefs = np.zeros((100, 26), dtype=f32)
+    for ci, code in enumerate(canon_codes):
+        b = np.array([1.0 if ((code >> i) & 1) else -1.0 for i in range(8)] + [-1.0])
+        # CROSS order: (0,-2),(0,-1),(-2,0),(-1,0),(0,0),(1,0),(2,0),(0,1),(0,2)
+        gx = 2.0 * (b[5] - b[3]) + 1.0 * (b[6] - b[2])
+        gy = 2.0 * (b[7] - b[1]) + 1.0 * (b[8] - b[0])
+        gnorm = float(np.hypot(gx, gy))
+        if ci == 0 or gnorm < 1e-6:
+            ux, uy, aniso = 1.0, 0.0, 0.0
+        else:
+            ux, uy = gx / gnorm, gy / gnorm
+            aniso = min(gnorm / 6.0, 1.0)
+        # Oriented Gaussian low-pass (wider along the edge tangent) turned into a
+        # high-boost filter: delta + alpha * (delta - G_oriented), scaled to sum 512.
+        sig_n = 0.85
+        sig_t = 0.85 + 0.55 * aniso
+        alpha = 0.70 if ci == 0 else (0.95 + 0.45 * aniso)
+        w_lp = np.empty(25, dtype=np.float64)
+        for k, (a, bb) in enumerate(TAPS):
+            dn = a * ux + bb * uy
+            dt = -a * uy + bb * ux
+            w_lp[k] = np.exp(-0.5 * ((dn / sig_n) ** 2 + (dt / sig_t) ** 2))
+        w_lp /= w_lp.sum()
+        outer = np.round(-alpha * w_lp * 512.0).astype(f32)
+        acc = f32(0.0)
+        for k in range(25):
+            if k == 12:
+                continue
+            coefs[ci, 1 + k] = outer[k]
+            acc = f32(acc + outer[k])
+        coefs[ci, 1 + 12] = f32(512.0) - acc
+
+    patterns.flags.writeable = False
+    coefs.flags.writeable = False
+    return dict(patterns=patterns, coefs=coefs)
+
+
 def load_srsettings(path=SRSETTINGS, weights=(2048.0,) + (0.0,) * 9):
-    """FUN_1000e4cb0 (+e4ddc/e4fe4/e51ec/ffeac): pattern table and 25-tap coefficient sets.
-    `weights` are struct+0x10..0x34 at load time (mode-2 block 0x1002ecc04: 2048, 0 ...).
-    Built once per (file version, weights); the returned arrays are read-only."""
+    """Return the Spica pattern table and 25-tap coefficient sets.
+
+    When `path` is None (the default), uses the standalone analytic directional
+    filter bank with no external file dependency. When an explicit `.tbl` path is
+    passed, parses that binary table directly."""
+    if path is None:
+        return dict(_default_spica_table())
     import sr2
     return dict(_load_srsettings(sr2.file_key(path), tuple(float(v) for v in weights)))
 

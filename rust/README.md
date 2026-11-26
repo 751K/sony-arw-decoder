@@ -66,8 +66,8 @@ img = decode("A7M5.ARW", rust=True)
   time of `render`; the parent entry is the wall time.
 - MainGamma and the four Effect tables are built in Rust (`tables.rs`).
   LinearMatrix16 and YGamma stay in Python but are cached in-process and on
-  disk (`~/.cache/sonylook`), keyed by the look blob, slider values, the Edit
-  binary SHA and a cache version.  `SONYLOOK_CACHE=0` disables the disk cache;
+  disk (`~/.cache/sonylook`), keyed by the look blob, slider values and a cache
+  version (no Edit binary required).  `SONYLOOK_CACHE=0` disables the disk cache;
   `SONYLOOK_CACHE_DIR` moves it.  Measured `Look` construction (M6): 0.15 s with
   the Python builders, 0.03 s with the Rust ones, 0.01 s from a warm cache.
 - Pointwise/LUT-grid renders (`Look.render(pointwise=True)`), float input and

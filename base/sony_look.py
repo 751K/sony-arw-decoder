@@ -11,27 +11,82 @@ Covers the two stages that consume Creative Look data stored in the ARW:
 Float32 rounding follows the ARM64 instruction order; FMA appears exactly where
 the original uses FMADD. All functions operate on numpy arrays.
 """
+from functools import lru_cache
 import struct
 from pathlib import Path
 
 import numpy as np
 
-HUE_ATAN_TABLE = 0x100234730      # float32[512], atan ratio -> 0..128 (1/8 turn)
-CONTRAST_FAMILY = 0x100246790     # int32[37][1025], curve 18 is identity
+HUE_ATAN_TABLE = 0x100234730      # float32[512], atan ratio -> 0..128 (1/8 turn); see hue_atan_table()
+CONTRAST_FAMILY = 0x100246790     # int32[37][1025], curve 18 is identity; see contrast_family()
 
 f32 = np.float32
 
 
-def _read_va(va, n):
-    # constant tables are read from the user's own Edit install (edit_binary.py)
-    import edit_binary
-    return edit_binary.read_va(va, n)
+@lru_cache(maxsize=1)
+def hue_atan_table():
+    """Edit's HUE_ATAN_TABLE, generated: round(atan(i / 512) * 512 / pi) for i < 512 (the
+    1/8-turn hue angle in 1/1024 turns of the ratio i/512). Identical to Edit's table at
+    every entry; no value lies within 5e-5 of a rounding tie."""
+    i = np.arange(512, dtype=np.float64)
+    out = np.round(np.arctan(i / 512) * 512 / np.pi).astype(np.float32)
+    out.flags.writeable = False
+    return out
+
+
+def _sigmoid_power(u, a, b, c):
+    """Monotone S-curve on [0, 1] fixing 0 and 1: u^a / (u^a + c * (1 - u)^b)."""
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ua = np.where(u > 0.0, np.power(u, a), 0.0)
+        ub = np.where(u < 1.0, np.power(1.0 - u, b), 0.0)
+        v = ua / (ua + c * ub)
+    return np.where(u <= 0.0, 0.0, np.where(u >= 1.0, 1.0, v))
+
+
+@lru_cache(maxsize=1)
+def contrast_family():
+    """Analytic 37 x 1025 contrast/highlight/shadow curve family (int32, 0..65535).
+
+    Row 18 is the exact identity min(64 * i, 65535), so default decodes (contrast =
+    highlight = shadow = 0, including all camera-original ARWs whose in-camera sliders
+    are already baked into tags 0x7805/0x7806) match Edit bit for bit. Non-zero Edit
+    sliders interpolate smoothly from row 18 toward the soft (row 0) and high-contrast
+    (row 36) analytic S-curves anchored at 18% middle grey (i = 471 -> 30144)."""
+    pivot = 471
+    mid = pivot * 64.0          # 30144
+    top = 65535.0
+    ident = np.minimum(np.arange(1025, dtype=np.float64) * 64.0, top)
+    u_lo = np.arange(pivot + 1, dtype=np.float64) / pivot
+    u_hi = np.arange(1025 - pivot, dtype=np.float64) / (1024.0 - pivot)
+
+    soft = np.empty(1025, dtype=np.float64)
+    soft[:pivot + 1] = mid * _sigmoid_power(u_lo, 0.7279, 0.8080, 0.5770)
+    soft[pivot:] = mid + (top - mid) * _sigmoid_power(u_hi, 1.3217, 0.7403, 1.3084)
+
+    hard = np.empty(1025, dtype=np.float64)
+    hard[:pivot + 1] = mid * _sigmoid_power(u_lo, 2.7198, 0.7961, 0.7903)
+    hard[pivot:] = mid + (top - mid) * _sigmoid_power(u_hi, 0.9497, 1.6104, 0.6276)
+
+    fam = np.empty((37, 1025), dtype=np.int32)
+    for r in range(37):
+        if r < 18:
+            t = (18 - r) / 18.0
+            curve = ident + t * (soft - ident)
+        elif r > 18:
+            t = (r - 18) / 18.0
+            curve = ident + t * (hard - ident)
+        else:
+            curve = ident
+        fam[r] = np.clip(np.round(curve), 0, 65535).astype(np.int32)
+    fam[:, 0] = 0
+    fam[:, pivot] = int(mid)
+    fam[:, 1024] = 65535
+    fam.flags.writeable = False
+    return fam
 
 
 def load_static_tables():
-    atan = np.frombuffer(_read_va(HUE_ATAN_TABLE, 2048), "<f4").copy()
-    family = np.frombuffer(_read_va(CONTRAST_FAMILY, 37 * 0x1004), "<i4").reshape(37, 1025).copy()
-    return atan, family
+    return hue_atan_table(), contrast_family()
 
 
 # ---------------------------------------------------------------- float helpers

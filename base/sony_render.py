@@ -9,8 +9,8 @@
     Look also supports optional Sharpness/Spica, Marble, ToneCurve and ShadeCorrection.
     The full decoder wires RawNR and ITP before this chain; spatial stages never enter LUTs.
 
-All look parameters come from the ARW itself (arw_looks.py); constant tables from the user's own
-Imaging Edge Edit install (edit_binary.py).
+All look parameters come from the ARW itself (arw_looks.py); all constant tables are
+generated mathematically with no external Imaging Edge Edit dependency.
 The preview front end block-averages CFA samples instead of running ITP demosaicing.
 SSCS is the ported Sony stage and runs when its parameters are supplied to Look.
 The full decoder includes ITP and SSCS; see docs/pipeline.md. YNR and the YCC NR
@@ -54,17 +54,8 @@ LOOK_IDS = {"Standard": 2, "ST": 2, "Vivid": 4, "Neutral": 7, "Portrait": 8, "BW
 # rows, so Edit renders those two with Fade 0 while the camera uses 1.
 CAMERA_FADE = {"IN": 3, "SH": 6, "FL2": 1, "FL3": 1}
 
-_EDIT_SHA = None
-
-
-def _edit_sha():
-    """SHA-256 of the Edit arm64 slice, for cache keys of Edit-derived tables."""
-    global _EDIT_SHA
-    if _EDIT_SHA is None:
-        import hashlib
-        import edit_binary
-        _EDIT_SHA = hashlib.sha256(edit_binary.arm64_slice()).hexdigest()
-    return _EDIT_SHA
+# Cache tag for the formula-derived LinearMatrix16 space-conversion matrices.
+_LM16_MATRIX_TAG = "std-primaries-v1"
 
 
 def ints(s):
@@ -211,7 +202,7 @@ class Look:
         equal spaces none."""
         blob = base64.b64decode(b64.removeprefix("base64:"))
         return TCACHE.load_or_build(
-            "lm16", (blob, self.output_mode, param8, _edit_sha()),
+            "lm16", (blob, self.output_mode, param8, _LM16_MATRIX_TAG),
             lambda: np.array(BT.build_table(D.decode_blob(blob), output_mode=self.output_mode,
                                             param8=param8, correction_matrix=None), np.float32),
             (1024, 18), np.float32)

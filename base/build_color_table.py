@@ -78,11 +78,34 @@ def read_constants(target=None):
     return result,{'path':str(target),'sha256':sha,
                    'segments':segments,'matrices':result}
 
+def standard_constants():
+    """Derive the four 3x3 colour-space matrices from the standard CIE primaries
+    (sRGB, Adobe RGB 1998, and Wide Gamut RGB at D65), rounded to 4 decimal places.
+    Matches Edit's four constant matrices at every float32 bit without reading Edit."""
+    import numpy as np
+    import color_spaces as CS
+
+    m_srgb = CS.rgb_to_xyz(CS.SRGB)
+    m_adobe = CS.rgb_to_xyz(CS.ADOBE)
+    m_wide = CS.rgb_to_xyz(CS.WORKING)
+
+    def _entry(mat):
+        arr = (np.round(mat, 4) + 0.0).astype(np.float32).ravel()
+        return {'values': [float(v) for v in arr]}
+
+    return {
+        'mode1_param8_zero': _entry(np.linalg.inv(m_adobe) @ m_srgb),
+        'mode0_param8_nonzero': _entry(np.linalg.inv(m_srgb) @ m_adobe),
+        'mode2_param8_zero': _entry(np.linalg.inv(m_wide) @ m_srgb),
+        'mode2_param8_nonzero': _entry(np.linalg.inv(m_wide) @ m_adobe),
+    }
+
+
 _CONSTANTS = None
 def constants():
     global _CONSTANTS
     if _CONSTANTS is None:
-        _CONSTANTS = read_constants()[0]
+        _CONSTANTS = standard_constants()
     return _CONSTANTS
 
 def select_matrix(output_mode,param8):

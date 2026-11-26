@@ -106,7 +106,7 @@ export_image = decode("photo.ARW", metal=True, output_bits=16)
 
 `decode()` 默认返回形状为 `(height, width, 3)`、范围 0–16383 的 `uint16` 数组。`output_bits=16` 返回 Edit 的 16 位 TIFF 编码，即每个值严格等于 14 位结果左移两位；Metal 路径在最终交错 kernel 中直接完成这一步。命令行导出 16 位 TIFF 时自动采用该路径。
 
-`--color-space`（Python 中为 `output=`）可选 `srgb`（默认）、`adobe`、`p3`、`prophoto`。Edit 只提供前两种。Display P3 和 ProPhoto RGB 按 Edit 构造 Adobe RGB 的方式实现：在 LinearMatrix16 表中多乘一个矩阵（这张表作用在相机 RGB 上，所以 sRGB 之外的颜色能保留下来），并给 Marble 和 BW/Sepia 效果配上对应的矩阵；ProPhoto 最后重新编码为 gamma 1.8。ICC 配置文件由代码生成。这两种没有 Edit 导出图可以对照，各后端之间逐位一致。Marble 和效果会截到 Edit 的工作色域，它包含 Display P3，但不能完整包含 ProPhoto。细节见 docs/pipeline.md §9.2。ProPhoto 建议输出 16 位 TIFF。
+`--color-space`（Python 中为 `output=`）可选 `srgb`（默认）、`adobe`、`p3`、`prophoto`。Edit 只提供前两种。Display P3 和 ProPhoto RGB 按 Edit 构造 Adobe RGB 的方式实现：在 LinearMatrix16 表中多乘一个矩阵（这张表作用在相机 RGB 上，所以 sRGB 之外的颜色能保留下来），并给 Marble 和 BW/Sepia 效果配上对应的矩阵；ProPhoto 最后重新编码为 gamma 1.8。四种 ICC 配置文件都按标准原色和曲线由代码生成；sRGB 和 Adobe RGB 的曲线与 Edit 自带的配置文件完全相同，原色相差在 ΔE 0.05 以内。这两种没有 Edit 导出图可以对照，各后端之间逐位一致。Marble 和效果会截到 Edit 的工作色域，它包含 Display P3，但不能完整包含 ProPhoto。细节见 docs/pipeline.md §9.2。ProPhoto 建议输出 16 位 TIFF。
 
 `--highlights`（Python 中为 `highlights=`）可选 `camera`（默认）或 `edit`。相机直出的 JPEG 和 HEIF 不做 Edit 的近饱和色彩抑制（SSCS）和 ChromaSuppress。若做这两步，G 通道已饱和的亮色会偏白：色卡曝光包围中，+2 EV 与相机 HEIF 的 ΔE2000 为 1.93，不做时为 0.43。`edit` 保留这两步，与 Edit 导出逐位一致。细节见 docs/pipeline.md §10.3。
 
@@ -136,6 +136,7 @@ python3 tests/verify_metal_geo_sscs.py photo.ARW
 python3 tests/verify_metal_batch.py photo.ARW
 python3 tests/verify_batch.py photo.ARW [more.ARW ...]
 python3 tests/verify_color_spaces.py photo.ARW
+python3 tests/verify_generated_tables.py
 python3 tests/verify_heif.py photo.ARW
 python3 tests/verify_metal_export.py photo.ARW
 python3 tests/verify_metal_sscs.py photo.ARW
@@ -163,4 +164,4 @@ Rust 与 Metal 输出与 NumPy 逐位一致。例外是 Metal ITP 在随机的�
 
 ## 许可与兼容性
 
-源码使用 MIT 许可证。本项目与 Sony 无关联，不包含 Sony 二进制或专有应用数据。
+源码使用 MIT 许可证。本项目为完全独立运行的解码器，无需安装 Sony Imaging Edge Edit；本项目与 Sony 无关联，锐化等阶段仅借鉴了相关处理思路。

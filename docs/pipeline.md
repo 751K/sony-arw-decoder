@@ -60,7 +60,7 @@ RawNR → ITP → [DRO/Vatr] → [GeoCorr] → SSCS
 | AreaComp | 格式码 ≥ 0x3233，`&0xf000 == 0x3000`，≠ 0x3fff（`0x1000b7b20`）。参数：格式码 > 0x33ff 且有 0x780f 时用新参数，否则用旧参数（`FUN_1000b3db8`，旗标 0） |
 | 3DLut | dev+0x248（0x8026）≠ 0 |
 | HueSaturation | dev+0x204 或 dev+0x1fc ≠ 0 |
-| Spica | `srsettings0000.tbl` 能加载（在 Edit.app/Contents/Resources 中） |
+| Spica | 默认使用内置数学解析方向锐化核（不依赖 Edit 的 `srsettings0000.tbl`） |
 | Marble | (dev+0x218 = 1 且 look+0x109c ≠ 0) 或 dev+0x2c0（清晰度）≠ 0 |
 | Effect | look+0x34 & ~1 == 0x10（BW、Sepia） |
 | ToneCurve | 4 条曲线中任意一条不是恒等 |
@@ -281,7 +281,7 @@ YCC2RGB 是固定的 BT.601 逆变换（1/10000 整数，向零截断，截到 0
 
 ### 5.2 Spica（`0x100100b60`，YGamma 之后、YCC2RGB 之前）
 
-类 RAISR 的细节增强。表来自 `srsettings0000.tbl`（运行时从本机 Edit 读取）：256 个模式项（系数组号、dx、dy），每组 25 抽头，中心抽头 = 512 − 其余之和。
+类 RAISR 的方向自适应细节增强。解码器默认使用独立生成的解析滤波器组（无需本机安装 Edit 或读取 `srsettings0000.tbl`）：按 4 重翻转对称群把 256 个 9 点十字 census 码折叠为精确 100 个规范轨道（系数组号、dx、dy），再由各轨道的十字梯度解析构造 25 抽头各向异性菱形锐化核（沿边缘切向平滑、垂直边缘法向增强，中心抽头 = 512 − 其余之和）。若显式传入 `.tbl` 路径，`load_srsettings(path)` 仍支持读取外部表文件。
 
 1. 十字 9 点普查得到 8 位类别（max − min < 8 归为第 0 类）。
 2. 按类别取系数组和方向，做 25 抽头菱形滤波（FMA 链）。
@@ -439,7 +439,7 @@ RAW → [RawNR] → ITP → [DRO] → [GeoCorr] → SSCS → LinearMatrix16 → 
 - **色彩空间**：`output="srgb" | "adobe"`（另有本项目新增的 `"p3"` 和 `"prophoto"`，见下文）。同一个 render+0x44 同时传给 LinearMatrix16、Marble 和 Effect。
 - **HEIF（`.hif`/`.heic`，本项目新增）**：`metal/heif.m` 用 Core Image 的 `writeHEIF10Representation` 写出（Apple 硬件 HEVC 编码），输入为 16 位尺度的值（14 位 << 2），默认 10 位，可选 8 位，嵌入输出空间的 ICC。同一图像两次写出的字节相同。DSC03591 质量 95：10 位约 8 MB、PSNR 51 dB，8 位约 8.8 MB、45.6 dB。
 - **位深**：Edit 的 16 位 TIFF 是 14 位值 << 2（最大 65532）；8 位是 14 位值 >> 6，直接截断。Metal 的 16 位路径在最终交错 kernel 中完成移位，不建立全图中间副本。
-- **ICC**：Edit 只在 AdobeRGB 时嵌入 `Sony_AdobeRGB_1998.icc`（EXIF ColorSpace = 0xFFFF），sRGB 导出不嵌（ColorSpace = 1）。本实现两种都嵌，配置文件运行时从本机 Edit 安装目录读取。
+- **ICC**：Edit 只在 AdobeRGB 时嵌入 `Sony_AdobeRGB_1998.icc`（EXIF ColorSpace = 0xFFFF），sRGB 导出不嵌（ColorSpace = 1）。本实现两种都嵌，配置文件按标准原色和曲线自行生成（`color_spaces.icc_profile`），不读 Edit 的文件：曲线与 Edit 自带的 `Sony_sRGB.icc` / `Sony_AdobeRGB_1998.icc` 逐点相同，原色 XYZ 相差不超过 10/65536（ΔE76 < 0.05），`tests/verify_generated_tables.py` 检查。
 - **Display P3 和 ProPhoto（本项目新增，Edit 没有）**：`output="p3" | "prophoto"`，即 `output_mode` 3 / 4，照 AdobeRGB 的做法构造（`color_spaces.py`）：
   - LinearMatrix16 乘 sRGB → P3（D65）或 sRGB → ProPhoto（Bradford D65 → D50）线性矩阵。该表作用在白平衡后的相机 RGB 上，所以 sRGB 装不下的颜色在这一步不会被截掉。
   - Marble 和 BW/Sepia 效果会先转进 Edit 的宽色域工作空间 W 再处理（sRGB → W 就是 mode 2 的矩阵）。新模式所需的 13 位定点矩阵由同一常量推出，每行和为 8192；用同样的方法推 Edit 自己的 sRGB/AdobeRGB 矩阵，误差不超过 2/8192。W 的红原色与 ProPhoto 相同，几乎包含整个 P3，但不包含 ProPhoto 的绿、蓝两角，超出 W 的颜色在这两步会被截断。

@@ -5,17 +5,15 @@ The decoder image is 14-bit encoded (0..16383).  Edit's 16-bit TIFF stores exact
 `value << 2` (every sample of the reference export is a multiple of 4; the 16-bit
 maximum is 65532), so the 8-bit value is `value >> 6`.  No rounding is involved.
 
-The ICC profiles are the ones bundled with Edit, read from the user's own
-installation (SONY_EDIT_RESOURCES, default /Applications/Imaging Edge/Edit.app/
-Contents/Resources):
-
-    sRGB      Sony_sRGB.icc            sRGB primaries, 1024-point sRGB TRC
-    AdobeRGB  Sony_AdobeRGB_1998.icc   Adobe RGB primaries, gamma 2.19921875
+The ICC profiles are generated (color_spaces.icc_profile): for sRGB and AdobeRGB
+they have the same curves as Edit's bundled Sony_sRGB.icc / Sony_AdobeRGB_1998.icc
+(sRGB's 1024-point TRC, gamma 2.19921875) and colorants within 10/65536 of them
+(dE76 < 0.05), with their own description; nothing is read from Edit.
 
 TIFF gets tag 34675, JPEG an APP2 marker, PNG an iCCP chunk.  Edit itself embeds
-the profile only for AdobeRGB (byte-identical to Sony_AdobeRGB_1998.icc, EXIF
-ColorSpace 0xFFFF); its sRGB TIFFs carry none (ColorSpace 1).  Both are embedded
-here, so the file is self-describing.  Checked on DSC03591 (AdobeRGB 16-bit and
+a profile only for AdobeRGB (its Sony_AdobeRGB_1998.icc, EXIF ColorSpace 0xFFFF);
+its sRGB TIFFs carry none (ColorSpace 1).  Both are embedded here, so the file is
+self-describing.  Checked on DSC03591 (AdobeRGB 16-bit and
 8-bit exports): 8-bit = 16-bit >> 8 for all but a few pixels.
 """
 from __future__ import annotations
@@ -25,7 +23,6 @@ from pathlib import Path
 
 import numpy as np
 
-SPACES = {"srgb": "Sony_sRGB.icc", "adobe": "Sony_AdobeRGB_1998.icc"}
 ALIASES = {"srgb": "srgb", "adobergb": "adobe", "adobergb1998": "adobe", "adobe": "adobe",
            "p3": "p3", "displayp3": "p3", "prophoto": "prophoto", "prophotorgb": "prophoto",
            "romm": "prophoto", "rommrgb": "prophoto"}
@@ -41,19 +38,9 @@ def normalize_space(space="srgb"):
 
 @lru_cache(maxsize=4)
 def icc_profile(space="srgb"):
-    """Bytes of the profile for this output space: Edit's bundled one for sRGB and
-    AdobeRGB, a generated ICC v2 profile for Display P3 and ProPhoto (color_spaces.py)."""
-    space = normalize_space(space)
-    if space not in SPACES:
-        import color_spaces as CS
-        return CS.icc_profile(CS.MODES[space])
-    import edit_binary
-    name = SPACES[space]
-    p = edit_binary.resources_path() / name
-    if not p.exists():
-        raise FileNotFoundError(
-            f"{p} not found; install Imaging Edge Edit or set SONY_EDIT_RESOURCES")
-    return p.read_bytes()
+    """Bytes of the generated ICC v2 profile for this output space (color_spaces.py)."""
+    import color_spaces as CS
+    return CS.icc_profile(CS.MODES[normalize_space(space)])
 
 
 def to_16bit(img):

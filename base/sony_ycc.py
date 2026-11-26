@@ -13,9 +13,10 @@ when R>=G, [2]/[3] same for the negative side, [4]/[6] Cb gain for Cb>=0/<0,
 [5]/[7] Cr gain for Cr>=0/<0. Shear = sign-extended (v>>2)&0x1ff / 256,
 gain = ((v>>3)&0xff)/64, chroma additionally scaled by 0.5.
 """
+import math
 import numpy as np
 
-from sony_look import fma32, _read_va
+from sony_look import fma32
 
 SAT_TABLE = 0x1002e6950
 
@@ -28,7 +29,15 @@ def i16(v):
 
 
 def sat_table():
-    return np.frombuffer(_read_va(SAT_TABLE, 19 * 8), "<f8").copy()
+    """19-entry saturation scale table for sat in -9..9 (step 1/16, rounded to 0.01
+    half-up for sat >= 0 and truncated for sat < 0, stored via float32 -> float64).
+    Identical to Edit's table at every entry."""
+    vals = []
+    for s in range(-9, 10):
+        v = 1.0 + s / 16.0
+        r = math.floor(v * 100.0) / 100.0 if s < 0 else math.floor(v * 100.0 + 0.5) / 100.0
+        vals.append(float(np.float32(r)))
+    return np.array(vals, dtype=np.float64)
 
 
 def descale_gains(arr, sat, table=None):

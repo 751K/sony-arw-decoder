@@ -36,6 +36,8 @@ D65 = (0.3127, 0.3290)
 D50 = (0.3457, 0.3585)
 PRIMARIES = {
     SRGB: ((0.64, 0.33), (0.30, 0.60), (0.15, 0.06), D65),
+    ADOBE: ((0.64, 0.33), (0.21, 0.71), (0.15, 0.06), D65),
+    WORKING: ((0.7347, 0.2653), (0.1152, 0.8264), (0.1566, 0.0177), D65),   # Wide Gamut RGB (D65)
     DISPLAY_P3: ((0.680, 0.320), (0.265, 0.690), (0.150, 0.060), D65),
     PROPHOTO: ((0.7347, 0.2653), (0.1596, 0.8404), (0.0366, 0.0001), D50),
 }
@@ -170,6 +172,8 @@ def _desc(text):
 def _curve(mode):
     if mode == PROPHOTO:
         return b"curv" + b"\0" * 4 + struct.pack(">IH", 1, 461)
+    if mode == ADOBE:                               # 563/256, Adobe RGB (1998)'s gamma
+        return b"curv" + b"\0" * 4 + struct.pack(">IH", 1, 563)
     x = np.arange(1024) / 1023
     y = np.where(x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4)
     vals = np.round(y * 65535).astype(">u2")
@@ -178,8 +182,14 @@ def _curve(mode):
 
 @lru_cache(maxsize=None)
 def icc_profile(mode):
-    """ICC v2 display profile bytes for DISPLAY_P3 or PROPHOTO."""
-    name = {DISPLAY_P3: "Display P3 (sonylook)", PROPHOTO: "ProPhoto RGB (sonylook)"}[mode]
+    """ICC v2 display profile bytes for SRGB, ADOBE, DISPLAY_P3 or PROPHOTO, built from
+    the standard primaries and curves (Bradford to the D50 PCS).
+
+    For sRGB and AdobeRGB these carry the same curves as the profiles bundled with
+    Edit (sRGB's 1024 points and gamma 563/256 identical) and colorants within
+    10/65536 of Edit's (dE76 < 0.05), so no file is taken from Edit."""
+    name = {SRGB: "sRGB (sonylook)", ADOBE: "Adobe RGB (1998) compatible (sonylook)",
+            DISPLAY_P3: "Display P3 (sonylook)", PROPHOTO: "ProPhoto RGB (sonylook)"}[mode]
     w = PRIMARIES[mode][3]
     m = adapt(w, D50) @ rgb_to_xyz(mode)        # columns: primaries in the D50 PCS
     curve = _curve(mode)

@@ -105,7 +105,7 @@ export_image = decode("photo.ARW", metal=True, output_bits=16)
 
 `decode()` returns a `uint16` array shaped `(height, width, 3)` with values 0–16383 by default. `output_bits=16` returns Edit's 16-bit TIFF encoding, exactly the 14-bit result shifted left by two; the Metal path performs that shift in the final interleave kernel. Command-line 16-bit TIFF export selects this path automatically.
 
-`--color-space` (`output=` in Python) is `srgb` (default), `adobe`, `p3` or `prophoto`. Edit offers only the first two. Display P3 and ProPhoto RGB are built the way Edit builds Adobe RGB: an extra matrix in the LinearMatrix16 table, which works on camera RGB so colors outside sRGB survive, plus matching matrices for Marble and the BW/Sepia effect. ProPhoto is re-encoded to gamma 1.8 at the end. The ICC profiles are generated. There is no Edit export to compare these two against; all backends agree bit for bit. Marble and the effect clip to Edit's working gamut, which holds Display P3 but not all of ProPhoto. Details: docs/pipeline.md §9.2. ProPhoto is best written as 16-bit TIFF.
+`--color-space` (`output=` in Python) is `srgb` (default), `adobe`, `p3` or `prophoto`. Edit offers only the first two. Display P3 and ProPhoto RGB are built the way Edit builds Adobe RGB: an extra matrix in the LinearMatrix16 table, which works on camera RGB so colors outside sRGB survive, plus matching matrices for Marble and the BW/Sepia effect. ProPhoto is re-encoded to gamma 1.8 at the end. All four ICC profiles are generated from the standard primaries and curves; for sRGB and Adobe RGB they match the curves of the profiles Edit bundles exactly and their colorants to within ΔE 0.05. There is no Edit export to compare these two against; all backends agree bit for bit. Marble and the effect clip to Edit's working gamut, which holds Display P3 but not all of ProPhoto. Details: docs/pipeline.md §9.2. ProPhoto is best written as 16-bit TIFF.
 
 `--highlights` (`highlights=` in Python) is `camera` (default) or `edit`. The camera's own JPEG and HEIF skip Edit's near-saturation colour suppression (SSCS) and ChromaSuppress. With them, bright colours whose green channel has clipped turn white: in a chart exposure bracket, +2 EV is 1.93 ΔE2000 from the camera HEIF with them and 0.43 without. `edit` keeps both and reproduces Edit's export bit for bit. Details: docs/pipeline.md §10.3.
 
@@ -135,6 +135,7 @@ python3 tests/verify_metal_geo_sscs.py photo.ARW
 python3 tests/verify_metal_batch.py photo.ARW
 python3 tests/verify_batch.py photo.ARW [more.ARW ...]
 python3 tests/verify_color_spaces.py photo.ARW
+python3 tests/verify_generated_tables.py
 python3 tests/verify_heif.py photo.ARW
 python3 tests/verify_metal_export.py photo.ARW
 python3 tests/verify_metal_sscs.py photo.ARW
@@ -161,4 +162,4 @@ Rust and Metal outputs are bit-identical to NumPy. The exception is Metal ITP on
 
 ## License and compatibility
 
-The source is released under the MIT license. This project is not affiliated with Sony and contains no Sony binaries or proprietary application data.
+The source is released under the MIT license. This decoder runs completely standalone without Sony Imaging Edge Edit installed; it is not affiliated with Sony and only draws on the sharpening and processing design ideas.

@@ -1,9 +1,9 @@
 """Small in-process + on-disk cache for the one-time look tables.
 
 The tables are deterministic functions of the ARW look tags, the slider values
-and (for the LinearMatrix16 table) the Edit binary constants.  Keys hash all of
-those inputs plus CACHE_VERSION, so a stale file is never used.  Corrupt or
-unreadable files simply fall back to the builder.
+and the standard colour-space matrices.  Keys hash all of those inputs plus
+CACHE_VERSION, so a stale file is never used.  Corrupt or unreadable files
+simply fall back to the builder.
 
 Disable with SONYLOOK_CACHE=0; override the directory with
 SONYLOOK_CACHE_DIR (default ~/.cache/sonylook).

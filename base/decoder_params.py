@@ -30,11 +30,12 @@ import sr2
 
 _TYPES = {1: ("B", 1), 3: ("H", 2), 4: ("I", 4), 8: ("h", 2), 9: ("i", 4), 13: ("I", 4)}
 
-# Edit 4.0.00.10312 arm64: address, entry count, index of value 0.
+# Slider step mappings for Sony MakerNote tags 0x2005/2006/2032..2036
+# (matching Edit's FUN_1000be0c8/be0f0/be110/be138/be158 tables bit for bit).
 _TABLE_SPEC = {
     "be0c8": (0x100237504, 19, -9),   # -45..45 step 5
     "be0f0": (0x1002375dc, 10, 0),    # 0..90 step 10
-    "be110": (0x100237550, 19, -9),   # -55..55
+    "be110": (0x100237550, 19, -9),   # -55..55 (step 10 near 0, step 5 outside)
     "be138": (0x10023759c, 10, 0),    # -40..50 step 10
     "be158": (0x1002375c4, 6, 0),     # 20..70 step 10
 }
@@ -112,9 +113,20 @@ def _maker_ifd(buf: bytes, exif: dict) -> tuple[dict, int]:
 
 @lru_cache(maxsize=1)
 def _tables() -> dict:
-    import edit_binary as EB          # reads the user's own Edit installation
-    return {name: (struct.unpack_from("<%di" % n, EB.read_va(addr, 4 * n)), base)
-            for name, (addr, n, base) in _TABLE_SPEC.items()}
+    def sat_step(x: int) -> int:
+        if x == 0:
+            return 0
+        a = abs(x)
+        v = 10 * a if a <= 2 else 5 * a + 10
+        return -v if x < 0 else v
+
+    return {
+        "be0c8": (tuple(5 * x for x in range(-9, 10)), -9),
+        "be0f0": (tuple(10 * x for x in range(10)), 0),
+        "be110": (tuple(sat_step(x) for x in range(-9, 10)), -9),
+        "be138": (tuple(10 * x - 40 for x in range(10)), 0),
+        "be158": (tuple(10 * x + 20 for x in range(6)), 0),
+    }
 
 
 def _lookup(name: str, x: int) -> int:

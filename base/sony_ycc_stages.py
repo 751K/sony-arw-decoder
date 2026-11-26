@@ -15,7 +15,7 @@ import struct
 
 import numpy as np
 
-from sony_look import fma32, _read_va
+from sony_look import fma32
 
 f32 = np.float32
 
@@ -211,7 +211,14 @@ DEFAULT_PAIRS = 0x100237c8c
 
 
 def _default_pairs():
-    return struct.unpack("<20H", _read_va(DEFAULT_PAIRS, 40))
+    """Fallback 10-step (offset, gain) pairs when a legacy ARW has no 0x780e tag:
+    offset 0 at level 0 then 0x2980 (10624), gain stepping linearly from 512 to 316."""
+    out = []
+    for k in range(10):
+        off = 0 if k == 0 else 0x2980
+        gain = int(round((512.0 - 21.8 * k) / 4.0)) * 4
+        out.extend((off, gain))
+    return tuple(out)
 
 
 def _check_level(level):
@@ -305,12 +312,10 @@ def chroma_suppress_params(look, render_exposure, render_18ee, tbl_89962, tbl_69
         d0 = 512.0
     else:
         d0 = float(g[0xf00])
-    cond = w9 < 0x16 and (0x2e67ff >> (w9 & 31)) & 1
-    tab = lambda va: struct.unpack("<d", _read_va(va + 8 * w9, 8))[0]
-    d1 = tab(CS_T1) if cond else float(g[0xf02])
-    d3 = 15360.0 if cond else float(g[0xf08])
-    d4 = tab(CS_T2) if cond else float(g[0xf04])
-    d5 = tab(CS_T3) if cond else float(g[0xf0a])
+    d1 = float(g[0xf02])
+    d3 = float(g[0xf08])
+    d4 = float(g[0xf04])
+    d5 = float(g[0xf0a])
     w12 = g[0xf06]
     d2 = float(i32(render_exposure)) * 0.0033333333333333335
     w8, w10 = g[0xf00], w12
